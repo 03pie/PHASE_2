@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "dabench run-task (调试单个任务)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+            "module": "data_agent_baseline.cli",
+            "args": [
+                "run-task",
+                "${input:taskId}",
+                "--config", "${workspaceFolder}/configs/react_baseline.example.yaml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}\\.env",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}\\src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ],
+    "inputs": [
+        {
+            "id": "taskId",
+            "type": "promptString",
+            "description": "Task ID, for example task_1",
+            "default": "task_1"
+        }
+    ]
+}
