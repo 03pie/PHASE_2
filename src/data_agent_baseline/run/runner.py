@@ -110,7 +110,7 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
         writer = csv.writer(handle)
         writer.writerow(columns)
         for row in rows:
-            writer.writerow(row)
+            writer.writerow(["NULL" if value is None else value for value in row])
         handle.flush()
         os.fsync(handle.fileno())
     temp_path.replace(path)
@@ -306,12 +306,10 @@ def _write_task_outputs(
     prediction_csv_path: Path | None = None
     answer = run_result.get("answer")
     if isinstance(answer, dict):
+        columns = list(answer.get("columns", []))
+        rows = [list(row) for row in answer.get("rows", [])]
         prediction_csv_path = task_output_dir / "prediction.csv"
-        _write_csv(
-            prediction_csv_path,
-            list(answer.get("columns", [])),
-            [list(row) for row in answer.get("rows", [])],
-        )
+        _write_csv(prediction_csv_path, columns, rows)
 
     return TaskRunArtifacts(
         task_id=task_id,

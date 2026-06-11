@@ -67,7 +67,10 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
                 tool_calls=[
                     {
                         "name": "answer",
-                        "args": {"columns": ["value"], "rows": [["one"]]},
+                        "args": {
+                            "columns": ["value"],
+                            "rows": [["one"], [None]],
+                        },
                         "id": "answer-output",
                         "type": "tool_call",
                     }
@@ -97,16 +100,25 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
     assert artifact.succeeded
     assert artifact.prediction_csv_path is not None
     with artifact.prediction_csv_path.open(newline="", encoding="utf-8") as handle:
-        assert list(csv.reader(handle)) == [["value"], ["one"]]
+        assert list(csv.reader(handle)) == [["value"], ["one"], ["NULL"]]
+    assert not (artifact.task_output_dir / "prediction_display.csv").exists()
 
     trace = json.loads(artifact.trace_path.read_text(encoding="utf-8"))
     assert trace["task_id"] == "task_1"
-    assert trace["answer"] == {"columns": ["value"], "rows": [["one"]]}
+    assert trace["answer"] == {
+        "columns": ["value"],
+        "rows": [["one"], [None]],
+    }
     assert [step["action"] for step in trace["steps"][:3]] == [
         "system_prompt",
         "user_prompt",
         "analyze_plan",
     ]
+    assert all("request" not in step["action_input"] for step in trace["steps"])
+    llm_steps = [step for step in trace["steps"] if "llm" in step["action_input"]]
+    assert llm_steps
+    assert all("messages" not in step["action_input"]["llm"] for step in llm_steps)
+    assert all("system_message" not in step["action_input"]["llm"] for step in llm_steps)
     tool_calls = [
         tool_call
         for step in trace["steps"]
