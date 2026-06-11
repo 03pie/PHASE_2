@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from data_agent_baseline.benchmark.schema import AnswerTable
@@ -12,19 +12,13 @@ class StepRecord:
     thought: str
     action: str
     action_input: dict[str, Any]
-    raw_response: str
+    tool_call_id: str | None
+    raw_response: dict[str, Any]
     observation: dict[str, Any]
     ok: bool
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-
-@dataclass(slots=True)
-class AgentRuntimeState:
-    steps: list[StepRecord] = field(default_factory=list)
-    answer: AnswerTable | None = None
-    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

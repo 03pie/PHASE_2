@@ -10,7 +10,7 @@
             "args": [
                 "run-task",
                 "${input:taskId}",
-                "--config", "${workspaceFolder}/configs/react_baseline.example.yaml"
+                "--config", "${workspaceFolder}/configs/deepagent_baseline.example.yaml"
             ],
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}\\.env",
