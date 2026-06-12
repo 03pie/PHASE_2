@@ -1,7 +1,4 @@
 {
     "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-    "python.terminal.activateEnvironment": true,
-    "workbench.editorAssociations": {
-        "*.csv": "default"
-    }
+    "python.terminal.activateEnvironment": true
 }
