@@ -12,7 +12,7 @@ from langchain_core.outputs import ChatResult
 
 from data_agent_baseline.config import AgentConfig, AppConfig, DatasetConfig, RunConfig
 from data_agent_baseline.run.runner import _run_single_task_with_timeout, run_single_task
-from tests.test_deep_agent import ScriptedChatModel
+from tests.test_deep_agent import ScriptedChatModel, _answer_response
 
 
 class TraceInspectingModel(ScriptedChatModel):
@@ -65,17 +65,13 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
     )
 
     model = ScriptedChatModel(
+        request_quote="Return one row.",
+        knowledge_quote="Use the source value exactly.",
         responses=[
-            AIMessage(
-                content="Ready.",
-                tool_calls=[
-                    {
-                        "name": "answer",
-                        "args": {"columns": ["value"], "rows": [["one"]]},
-                        "id": "answer-output",
-                        "type": "tool_call",
-                    }
-                ],
+            _answer_response(
+                columns=["value"],
+                rows=[["one"]],
+                tool_call_id="answer-output",
             )
         ]
     )
@@ -155,6 +151,8 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
     trace_path = run_output_dir / "task_1" / "trace.json"
     model = TraceInspectingModel(
         trace_path=trace_path,
+        request_quote="Inspect and return one row.",
+        knowledge_quote="Use the source value exactly.",
         responses=[
             AIMessage(
                 content="Inspecting.",
@@ -167,16 +165,10 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
                     }
                 ],
             ),
-            AIMessage(
-                content="Ready.",
-                tool_calls=[
-                    {
-                        "name": "answer",
-                        "args": {"columns": ["value"], "rows": [["one"]]},
-                        "id": "answer-after-read",
-                        "type": "tool_call",
-                    }
-                ],
+            _answer_response(
+                columns=["value"],
+                rows=[["one"]],
+                tool_call_id="answer-after-read",
             ),
         ],
     )

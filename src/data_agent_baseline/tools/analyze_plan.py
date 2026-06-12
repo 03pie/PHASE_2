@@ -5,9 +5,111 @@ from typing import Annotated, Literal
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from typing_extensions import TypedDict
 
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
+
+KnowledgeStatus = Literal[
+    "authoritative",
+    "unavailable",
+    "invalid",
+    "insufficient",
+]
+RequirementType = Literal[
+    "entity",
+    "measure",
+    "filter",
+    "time_range",
+    "grouping",
+    "ordering",
+    "limit",
+    "output",
+    "output_column",
+    "calculation",
+    "deduplication",
+    "reshape",
+]
+KnowledgeRuleType = Literal["semantic", "filter", "calculation", "output"]
+TransformationOperation = Literal[
+    "filter",
+    "aggregate",
+    "derive",
+    "sort",
+    "limit",
+    "deduplicate",
+    "reshape",
+]
+
+
+class IntentRequirement(TypedDict):
+    statement: str
+    requirement_type: RequirementType
+    quote: str
+
+
+class IntentSpec(TypedDict):
+    requirements: list[IntentRequirement]
+    unresolved: list[str]
+
+
+class OutputColumn(TypedDict):
+    name: str
+    source_fields: list[str]
+
+
+class TransformationAuthorization(TypedDict):
+    source: Literal["user", "knowledge"]
+    quote: str
+
+
+class TransformationSpec(TypedDict):
+    operation: TransformationOperation
+    description: str
+    authorization: TransformationAuthorization
+
+
+class SortKey(TypedDict):
+    field: str
+    direction: Literal["ascending", "descending"]
+
+
+class OutputSpec(TypedDict):
+    columns: list[OutputColumn]
+    row_grain: str
+    row_policy: Literal["preserve", "transform"]
+    transformations: list[TransformationSpec]
+    ordering: Literal["source", "specified", "unspecified"]
+    sort_keys: list[SortKey]
+    null_policy: Literal["preserve", "drop", "fill"]
+    expected_row_count: int | None
+
+
+class KnowledgeRule(TypedDict):
+    rule_type: KnowledgeRuleType
+    quote: str
+    source_path: str
+
+
+class ContextSource(TypedDict):
+    path: str
+    observations: list[str]
+
+
+class EvidenceSpec(TypedDict):
+    knowledge_status: KnowledgeStatus
+    knowledge_rules: list[KnowledgeRule]
+    knowledge_issue: str
+    context_sources: list[ContextSource]
+    cross_validated_inference: str
+
+
+class RevisionSpec(TypedDict):
+    version: int
+    reason: str
+    evidence_changes: list[str]
+    changed_fields: list[str]
 
 
 def _error(content: str, tool_call_id: str) -> ToolMessage:
@@ -19,117 +121,198 @@ def _error(content: str, tool_call_id: str) -> ToolMessage:
     )
 
 
-def _clean(items: list[str]) -> list[str]:
-    return [item.strip() for item in items if item.strip()]
+def _clean_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _clean_texts(items: list[str]) -> list[str]:
+    return [text for item in items if (text := _clean_text(item))]
 
 
 @tool("analyze_plan")
 def analyze_plan_tool(
-    intent: str,
-    output_spec: str,
-    knowledge_status: Literal[
-        "authoritative",
-        "unavailable",
-        "invalid",
-        "insufficient",
-    ],
-    knowledge_findings: list[str],
-    knowledge_issue: str,
-    context_sources: list[str],
-    context_evidence: list[str],
-    cross_validated_inference: str,
-    uncertainties: list[str],
+    intent: IntentSpec,
+    output_spec: OutputSpec,
+    evidence: EvidenceSpec,
+    revision: RevisionSpec,
     steps: list[str],
-    delegation_candidates: list[str],
+    original_request: Annotated[str, InjectedState("original_request")],
     tool_call_id: Annotated[str, InjectedToolCallId],
+    schema_version: Literal["1.0"] = "1.0",
+    delegation_candidates: list[str] | None = None,
 ) -> Command[BenchmarkDeepAgentState] | ToolMessage:
-    """Create or revise a plan after inspecting knowledge and relevant task data."""
+    """Create or revise a traceable plan after inspecting knowledge and task data."""
 
-    if not intent.strip() or not output_spec.strip():
-        return _error("intent and output_spec must be non-empty.", tool_call_id)
-
-    normalized_knowledge = _clean(knowledge_findings)
-    normalized_sources = _clean(context_sources)
-    normalized_context = _clean(context_evidence)
-    if not normalized_sources:
+    requirements = [
+        {
+            "statement": _clean_text(item["statement"]),
+            "requirement_type": item["requirement_type"],
+            "quote": _clean_text(item["quote"]),
+        }
+        for item in intent["requirements"]
+    ]
+    if not requirements or any(
+        not item["statement"] or not item["quote"] for item in requirements
+    ):
         return _error(
-            "context_sources must identify the inspected source paths.",
+            "intent.requirements must contain statements with user quotes.",
             tool_call_id,
         )
-    if not normalized_context:
+
+    columns = [
+        {
+            "name": _clean_text(item["name"]),
+            "source_fields": _clean_texts(item["source_fields"]),
+        }
+        for item in output_spec["columns"]
+    ]
+    column_names = [item["name"] for item in columns]
+    if not columns or any(not name for name in column_names):
         return _error(
-            "context_evidence must cite observed schema or data findings.",
+            "output_spec.columns must contain non-empty output names.",
+            tool_call_id,
+        )
+    if len(set(column_names)) != len(column_names):
+        return _error("output_spec column names must be unique.", tool_call_id)
+
+    expected_row_count = output_spec["expected_row_count"]
+    if expected_row_count is not None and expected_row_count < 0:
+        return _error(
+            "output_spec.expected_row_count cannot be negative.",
             tool_call_id,
         )
 
-    normalized_issue = knowledge_issue.strip()
-    normalized_inference = cross_validated_inference.strip()
+    transformations = [
+        {
+            "operation": item["operation"],
+            "description": _clean_text(item["description"]),
+            "authorization": {
+                "source": item["authorization"]["source"],
+                "quote": _clean_text(item["authorization"]["quote"]),
+            },
+        }
+        for item in output_spec["transformations"]
+    ]
+    if any(
+        not item["description"] or not item["authorization"]["quote"]
+        for item in transformations
+    ):
+        return _error(
+            "Each transformation requires a description and authorization quote.",
+            tool_call_id,
+        )
+
+    context_sources = [
+        {
+            "path": _clean_text(item["path"]).replace("\\", "/"),
+            "observations": _clean_texts(item["observations"]),
+        }
+        for item in evidence["context_sources"]
+    ]
+    if not context_sources or any(
+        not item["path"] or not item["observations"] for item in context_sources
+    ):
+        return _error(
+            "evidence.context_sources must include inspected paths and observations.",
+            tool_call_id,
+        )
+
+    knowledge_rules = [
+        {
+            "rule_type": item["rule_type"],
+            "quote": _clean_text(item["quote"]),
+            "source_path": _clean_text(item["source_path"]).replace("\\", "/"),
+        }
+        for item in evidence["knowledge_rules"]
+    ]
+    knowledge_issue = _clean_text(evidence["knowledge_issue"])
+    cross_validated_inference = _clean_text(
+        evidence["cross_validated_inference"]
+    )
+    knowledge_status = evidence["knowledge_status"]
     if knowledge_status == "authoritative":
-        if not normalized_knowledge:
+        if not knowledge_rules:
             return _error(
-                (
-                    "knowledge_findings must cite the binding rules when "
-                    "knowledge_status is authoritative."
-                ),
+                "Authoritative knowledge requires at least one quoted rule.",
                 tool_call_id,
             )
-        if normalized_issue or normalized_inference:
-            return _error(
-                (
-                    "Authoritative knowledge cannot be replaced by an inferred rule; "
-                    "knowledge_issue and cross_validated_inference must be empty."
-                ),
-                tool_call_id,
-            )
+        knowledge_issue = ""
+        cross_validated_inference = ""
     else:
-        if not normalized_issue:
+        if not knowledge_issue:
             return _error(
-                (
-                    "knowledge_issue must explain why knowledge is unavailable, "
-                    "invalid, or insufficient."
-                ),
+                "Non-authoritative knowledge requires an explicit knowledge_issue.",
                 tool_call_id,
             )
-        if len(set(normalized_sources)) < 2:
+        if len({item["path"] for item in context_sources}) < 2:
             return _error(
                 (
                     "Non-authoritative knowledge requires at least two distinct "
-                    "context_sources for cross-validation."
+                    "context sources for cross-validation."
                 ),
                 tool_call_id,
             )
-        if not normalized_inference:
+        if not cross_validated_inference:
             return _error(
                 (
-                    "cross_validated_inference is required when knowledge is "
-                    "non-authoritative."
+                    "Non-authoritative knowledge requires a "
+                    "cross_validated_inference."
                 ),
                 tool_call_id,
             )
 
-    normalized_steps = _clean(steps)
+    normalized_steps = _clean_texts(steps)
     if not normalized_steps:
+        return _error("steps must contain at least one plan step.", tool_call_id)
+    if revision["version"] < 1 or not _clean_text(revision["reason"]):
         return _error(
-            "steps must contain at least one non-empty plan step.",
+            "revision.version must be positive and revision.reason is required.",
             tool_call_id,
         )
 
     plan = {
-        "intent": intent.strip(),
-        "output_spec": output_spec.strip(),
-        "knowledge_status": knowledge_status,
-        "knowledge_findings": normalized_knowledge,
-        "knowledge_issue": normalized_issue,
-        "context_sources": normalized_sources,
-        "context_evidence": normalized_context,
-        "cross_validated_inference": normalized_inference,
-        "uncertainties": _clean(uncertainties),
+        "schema_version": schema_version,
+        "original_request": original_request,
+        "intent": {
+            "requirements": requirements,
+            "unresolved": _clean_texts(intent["unresolved"]),
+        },
+        "output_spec": {
+            "columns": columns,
+            "row_grain": _clean_text(output_spec["row_grain"]),
+            "row_policy": output_spec["row_policy"],
+            "transformations": transformations,
+            "ordering": output_spec["ordering"],
+            "sort_keys": [
+                {
+                    "field": _clean_text(item["field"]),
+                    "direction": item["direction"],
+                }
+                for item in output_spec["sort_keys"]
+            ],
+            "null_policy": output_spec["null_policy"],
+            "expected_row_count": expected_row_count,
+        },
+        "evidence": {
+            "knowledge_status": knowledge_status,
+            "knowledge_rules": knowledge_rules,
+            "knowledge_issue": knowledge_issue,
+            "context_sources": context_sources,
+            "cross_validated_inference": cross_validated_inference,
+        },
+        "revision": {
+            "version": revision["version"],
+            "reason": _clean_text(revision["reason"]),
+            "evidence_changes": _clean_texts(revision["evidence_changes"]),
+            "changed_fields": _clean_texts(revision["changed_fields"]),
+        },
         "steps": normalized_steps,
-        "delegation_candidates": _clean(delegation_candidates),
+        "delegation_candidates": _clean_texts(delegation_candidates or []),
     }
     return Command(
         update={
             "analysis_plan": plan,
+            "todos": [],
             "messages": [
                 ToolMessage(
                     content=json.dumps(plan, ensure_ascii=False),

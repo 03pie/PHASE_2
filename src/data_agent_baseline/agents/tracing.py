@@ -33,9 +33,9 @@ def serialize_tool_definition(value: BaseTool | dict[str, Any]) -> dict[str, Any
     if isinstance(value, dict):
         return json_safe(value)
     args_schema: dict[str, Any] | None = None
-    if value.args_schema is not None:
+    if value.tool_call_schema is not None:
         try:
-            args_schema = json_safe(value.args_schema.model_json_schema())
+            args_schema = json_safe(value.tool_call_schema.model_json_schema())
         except (AttributeError, TypeError, ValueError):
             args_schema = None
     return {

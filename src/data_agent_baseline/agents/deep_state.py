@@ -33,6 +33,8 @@ class DeepAgentConfig:
 class BenchmarkDeepAgentState(DeepAgentState):
     """在 DeepAgents 默认状态上扩展基准任务专用字段。"""
 
+    original_request: NotRequired[str]
     answer: NotRequired[AnswerTable | None]
+    prepared_answer: NotRequired[AnswerTable | None]
     analysis_plan: NotRequired[dict[str, Any]]
     todos: NotRequired[list[dict[str, str]]]

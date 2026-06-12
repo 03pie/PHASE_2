@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 
-from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.agents.deep_state import (
+    BenchmarkDeepAgentState,
+    DeepAgentConfig,
+)
+from data_agent_baseline.tools.answer import validate_prepared_answer
 
 
 def _build_shell_environment() -> dict[str, str]:
@@ -94,15 +101,90 @@ def _rewrite_virtual_python_paths(code: str, workspace: Path) -> str:
     return ast.unparse(rewritten)
 
 
+def _answer_helper_source(result_path: Path) -> str:
+    """向隔离脚本注入结果提交函数，完整数据只写入临时工作区。"""
+
+    return f"""
+import json as __answer_json
+import math as __answer_math
+from pathlib import Path as __AnswerPath
+
+def __normalize_answer_value(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if __answer_math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {{str(key): __normalize_answer_value(item) for key, item in value.items()}}
+    if isinstance(value, (list, tuple)):
+        return [__normalize_answer_value(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return __normalize_answer_value(value.item())
+        except (TypeError, ValueError):
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+def set_answer(columns, rows):
+    payload = {{
+        "columns": [str(column) for column in columns],
+        "rows": __normalize_answer_value(list(rows)),
+    }}
+    __AnswerPath({str(result_path)!r}).write_text(
+        __answer_json.dumps(payload, ensure_ascii=False, allow_nan=False),
+        encoding="utf-8",
+    )
+"""
+
+
+def _load_prepared_answer(
+    result_path: Path,
+    analysis_plan: dict[str, Any] | None,
+) -> tuple[Any | None, str | None]:
+    if not result_path.exists():
+        return None, None
+    if analysis_plan is None:
+        return None, "set_answer requires a successful analysis_plan first."
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"set_answer produced an unreadable result: {exc}"
+    columns = payload.get("columns")
+    rows = payload.get("rows")
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return None, "set_answer requires list columns and list rows."
+    normalized_columns = [str(column) for column in columns]
+    if all(isinstance(row, dict) for row in rows):
+        normalized_rows = [
+            [row.get(column) for column in normalized_columns]
+            for row in rows
+        ]
+    elif all(isinstance(row, list) for row in rows):
+        normalized_rows = [list(row) for row in rows]
+    else:
+        return None, "set_answer rows must contain only row lists or row objects."
+    return validate_prepared_answer(
+        normalized_columns,
+        normalized_rows,
+        analysis_plan,
+    )
+
+
 def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """创建绑定到当前临时工作区的 execute_python 模型工具。"""
 
     @tool("execute_python")
     def execute_python(
         code: str,
+        state: Annotated[dict[str, Any], InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
-    ) -> ToolMessage:
-        """Execute Python source directly without a shell or persistent script file."""
+    ) -> ToolMessage | Command[BenchmarkDeepAgentState]:
+        """Execute Python; call set_answer(columns, rows) to submit computed data."""
 
         if not code.strip():
             return ToolMessage(
@@ -122,6 +204,8 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                 status="error",
             )
 
+        result_path = workspace / "scratch" / f"prepared-answer-{tool_call_id}.json"
+        executable_code = f"{_answer_helper_source(result_path)}\n{executable_code}"
         try:
             completed = subprocess.run(
                 [sys.executable, "-X", "utf8", "-I", "-B", "-"],
@@ -162,6 +246,40 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
             exit_code=completed.returncode,
             max_output_bytes=config.max_output_bytes,
         )
+        if completed.returncode == 0:
+            prepared_answer, answer_error = _load_prepared_answer(
+                result_path,
+                state.get("analysis_plan"),
+            )
+            if answer_error is not None:
+                return ToolMessage(
+                    content=f"{content}\n\n{answer_error}",
+                    name="execute_python",
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+            if prepared_answer is not None:
+                summary = json.dumps(
+                    {
+                        "status": "prepared",
+                        "column_count": len(prepared_answer.columns),
+                        "row_count": len(prepared_answer.rows),
+                    },
+                    ensure_ascii=False,
+                )
+                return Command(
+                    update={
+                        "prepared_answer": prepared_answer,
+                        "messages": [
+                            ToolMessage(
+                                content=f"{content}\n\n{summary}",
+                                name="execute_python",
+                                tool_call_id=tool_call_id,
+                                status="success",
+                            )
+                        ],
+                    }
+                )
         return ToolMessage(
             content=content,
             name="execute_python",

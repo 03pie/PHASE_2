@@ -159,7 +159,10 @@ class DeepAgent:
 
             try:
                 for state in graph.stream(
-                    {"messages": [HumanMessage(content=build_task_prompt(task))]},
+                    {
+                        "original_request": task.question,
+                        "messages": [HumanMessage(content=build_task_prompt(task))],
+                    },
                     config={"recursion_limit": max(100, self.config.max_steps * 8)},
                     stream_mode="values",
                 ):
@@ -211,11 +214,11 @@ class DeepAgent:
             )
             if limit_reached or model_call_count >= self.config.max_steps:
                 failure_reason = (
-                    f"Agent did not submit an answer within "
+                    f"Agent did not prepare an answer within "
                     f"{self.config.max_steps} model calls."
                 )
             else:
-                failure_reason = "Agent completed without calling the answer tool."
+                failure_reason = "Agent completed without preparing an answer."
 
         run_result = AgentRunResult(
             task_id=task.task_id,
