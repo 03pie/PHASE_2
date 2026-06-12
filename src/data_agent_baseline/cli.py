@@ -14,6 +14,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from data_agent_baseline.benchmark.context import list_context_tree
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import load_app_config
 from data_agent_baseline.run.runner import (
@@ -22,7 +23,6 @@ from data_agent_baseline.run.runner import (
     run_benchmark,
     run_single_task,
 )
-from data_agent_baseline.tools.filesystem import list_context_tree
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = PROJECT_ROOT / "configs"

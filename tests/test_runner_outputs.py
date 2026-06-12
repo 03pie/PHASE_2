@@ -32,7 +32,7 @@ class TraceInspectingModel(ScriptedChatModel):
             self.initial_trace_seen = (
                 initial_trace["status"] == "running" and initial_trace["steps"] == []
             )
-        elif self.call_count == 3:
+        elif self.call_count == 5:
             self.incremental_trace = json.loads(self.trace_path.read_text(encoding="utf-8"))
 
         return super()._generate(
@@ -59,6 +59,10 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     context_dir.joinpath("data.txt").write_text("value\n", encoding="utf-8")
+    context_dir.joinpath("knowledge.md").write_text(
+        "Use the source value exactly.\n",
+        encoding="utf-8",
+    )
 
     model = ScriptedChatModel(
         responses=[
@@ -102,9 +106,11 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
     trace = json.loads(artifact.trace_path.read_text(encoding="utf-8"))
     assert trace["task_id"] == "task_1"
     assert trace["answer"] == {"columns": ["value"], "rows": [["one"]]}
-    assert [step["action"] for step in trace["steps"][:3]] == [
+    assert [step["action"] for step in trace["steps"][:5]] == [
         "system_prompt",
         "user_prompt",
+        "read_file",
+        "read_file",
         "analyze_plan",
     ]
     tool_calls = [
@@ -113,6 +119,8 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
         for tool_call in step["observation"].get("tool_calls", [])
     ]
     assert [tool_call["tool_call_id"] for tool_call in tool_calls] == [
+        "knowledge-call",
+        "schema-call",
         "plan-call",
         "todos-call",
         "answer-output",
@@ -138,6 +146,10 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     context_dir.joinpath("data.txt").write_text("value\n", encoding="utf-8")
+    context_dir.joinpath("knowledge.md").write_text(
+        "Use the source value exactly.\n",
+        encoding="utf-8",
+    )
 
     run_output_dir = tmp_path / "run"
     trace_path = run_output_dir / "task_1" / "trace.json"
@@ -192,9 +204,11 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
     incremental_actions = [
         step["action"] for step in model.incremental_trace["steps"]
     ]
-    assert incremental_actions[:3] == [
+    assert incremental_actions[:5] == [
         "system_prompt",
         "user_prompt",
+        "read_file",
+        "read_file",
         "analyze_plan",
     ]
     incremental_tool_calls = [
@@ -203,11 +217,13 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
         for tool_call in step["observation"].get("tool_calls", [])
     ]
     assert [tool_call["name"] for tool_call in incremental_tool_calls] == [
+        "read_file",
+        "read_file",
         "analyze_plan",
         "write_todos",
         "read_file",
     ]
-    assert incremental_tool_calls[2]["tool_call_id"] == "read-before-answer"
+    assert incremental_tool_calls[4]["tool_call_id"] == "read-before-answer"
 
 
 def _send_large_subprocess_result(

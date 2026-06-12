@@ -16,7 +16,8 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
-from data_agent_baseline.agents.react import DeepAgent, DeepAgentConfig
+from data_agent_baseline.agents.deep_agent import DeepAgent
+from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.agents.runtime import AgentRunResult
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
