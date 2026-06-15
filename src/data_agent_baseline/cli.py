@@ -28,7 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = PROJECT_ROOT / "configs"
 DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-ARTIFACT_RUNS_DIR = ARTIFACTS_DIR / "runs"
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -97,7 +96,11 @@ def status(
     table.add_row("data_dir", str(DATA_DIR), _status_value(DATA_DIR))
     table.add_row("configs_dir", str(CONFIGS_DIR), _status_value(CONFIGS_DIR))
     table.add_row("artifacts_dir", str(ARTIFACTS_DIR), _status_value(ARTIFACTS_DIR))
-    table.add_row("runs_dir", str(ARTIFACT_RUNS_DIR), _status_value(ARTIFACT_RUNS_DIR))
+    table.add_row(
+        "run_output_dir",
+        str(app_config.run.output_dir),
+        _status_value(app_config.run.output_dir),
+    )
     table.add_row(
         "dataset_root",
         str(app_config.dataset.root_path),

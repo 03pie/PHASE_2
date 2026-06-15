@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Annotated, Literal
 
 from langchain_core.messages import ToolMessage
@@ -182,17 +183,29 @@ def analyze_plan_tool(
             tool_call_id,
         )
 
-    transformations = [
-        {
-            "operation": item["operation"],
-            "description": _clean_text(item["description"]),
-            "authorization": {
-                "source": item["authorization"]["source"],
-                "quote": _clean_text(item["authorization"]["quote"]),
-            },
-        }
-        for item in output_spec["transformations"]
-    ]
+    transformations = []
+    for item in output_spec["transformations"]:
+        if not isinstance(item, Mapping):
+            return _error(
+                "Each transformation must be an object.",
+                tool_call_id,
+            )
+        authorization = item.get("authorization")
+        if not isinstance(authorization, Mapping):
+            return _error(
+                "Each transformation authorization must be an object.",
+                tool_call_id,
+            )
+        transformations.append(
+            {
+                "operation": item.get("operation"),
+                "description": _clean_text(item.get("description")),
+                "authorization": {
+                    "source": authorization.get("source"),
+                    "quote": _clean_text(authorization.get("quote")),
+                },
+            }
+        )
     if any(
         not item["description"] or not item["authorization"]["quote"]
         for item in transformations

@@ -7,14 +7,55 @@ from typing import Any
 
 import yaml
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _strip_inline_comment(value: str) -> str:
+    in_single_quote = False
+    in_double_quote = False
+    for index, character in enumerate(value):
+        if character == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+        elif character == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+        elif character == "#" and not in_single_quote and not in_double_quote:
+            return value[:index].rstrip()
+    return value
+
+
+def _parse_env_value(raw_value: str) -> str:
+    value = _strip_inline_comment(raw_value.strip())
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _load_project_dotenv() -> None:
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.is_file():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        os.environ.setdefault(key, _parse_env_value(raw_value))
+
+
+_load_project_dotenv()
+
 API_KEY = os.environ.get("API_KEY")
 API_BASE = os.environ.get("API_BASE")
 MODEL = os.environ.get("MODEL")
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR")
 INPUT_DIR = os.environ.get("INPUT_DIR")
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _default_dataset_root() -> Path:
@@ -36,10 +77,13 @@ class AgentConfig:
     model: str | None = MODEL
     api_base: str | None = API_BASE
     api_key: str | None = API_KEY
+    max_retries: int = 3
     max_steps: int = 16
     temperature: float = 0.0
     execute_timeout_seconds: int = 30
     max_output_bytes: int = 100_000
+    model_call_interval_seconds: float = 0.0
+    question_structure_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +140,19 @@ def _optional_string(value: Any) -> str | None:
     return normalized or None
 
 
+def _bool_value(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def load_app_config(config_path: Path) -> AppConfig:
     payload = yaml.safe_load(config_path.read_text()) or {}
     dataset_defaults = DatasetConfig()
@@ -116,6 +173,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         model=_optional_string(agent_payload.get("model", agent_defaults.model)),
         api_base=_optional_string(agent_payload.get("api_base", agent_defaults.api_base)),
         api_key=_optional_string(agent_payload.get("api_key", agent_defaults.api_key)),
+        max_retries=int(agent_payload.get("max_retries", agent_defaults.max_retries)),
         max_steps=int(agent_payload.get("max_steps", agent_defaults.max_steps)),
         temperature=float(agent_payload.get("temperature", agent_defaults.temperature)),
         execute_timeout_seconds=int(
@@ -126,6 +184,19 @@ def load_app_config(config_path: Path) -> AppConfig:
         ),
         max_output_bytes=int(
             agent_payload.get("max_output_bytes", agent_defaults.max_output_bytes)
+        ),
+        model_call_interval_seconds=float(
+            agent_payload.get(
+                "model_call_interval_seconds",
+                agent_defaults.model_call_interval_seconds,
+            )
+        ),
+        question_structure_enabled=_bool_value(
+            agent_payload.get(
+                "question_structure_enabled",
+                agent_defaults.question_structure_enabled,
+            ),
+            agent_defaults.question_structure_enabled,
         ),
     )
     raw_run_id = run_payload.get("run_id")

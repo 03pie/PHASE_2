@@ -4,10 +4,12 @@ import csv
 import json
 import multiprocessing
 import os
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import StringIO
 from multiprocessing.connection import Connection
 from pathlib import Path
 from time import perf_counter
@@ -21,6 +23,8 @@ from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.agents.runtime import AgentRunResult
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
+
+_REPLACE_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,19 +86,51 @@ def build_chat_model(config: AppConfig) -> ChatOpenAI:
         api_key=config.agent.api_key,
         temperature=config.agent.temperature,
         timeout=1800.0,
-        max_retries=1,
+        max_retries=config.agent.max_retries,
         max_tokens=8192,
     )
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
+def _temporary_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+
+
+def _replace_with_retry(temp_path: Path, path: Path) -> None:
+    last_error: PermissionError | None = None
+    for delay_seconds in (*_REPLACE_RETRY_DELAYS_SECONDS, 0.0):
+        try:
+            temp_path.replace(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+
+
+def _write_text_file(path: Path, content: str, *, fallback_direct: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_path = _temporary_path(path)
     temp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        content,
         encoding="utf-8",
     )
-    temp_path.replace(path)
+    try:
+        _replace_with_retry(temp_path, path)
+    except PermissionError:
+        if not fallback_direct:
+            raise
+        path.write_text(content, encoding="utf-8")
+        temp_path.unlink(missing_ok=True)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    _write_text_file(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        fallback_direct=True,
+    )
 
 
 def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
@@ -106,15 +142,11 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
     if any(len(row) != len(columns) for row in rows):
         raise ValueError("Prediction CSV rows must match the number of columns.")
 
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temp_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(columns)
-        for row in rows:
-            writer.writerow(row)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temp_path.replace(path)
+    buffer = StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(columns)
+    writer.writerows(rows)
+    _write_text_file(path, buffer.getvalue(), fallback_direct=False)
 
 
 def _failure_run_result_payload(
@@ -169,6 +201,8 @@ def _run_single_task_core(
             max_steps=config.agent.max_steps,
             execute_timeout_seconds=config.agent.execute_timeout_seconds,
             max_output_bytes=config.agent.max_output_bytes,
+            model_call_interval_seconds=config.agent.model_call_interval_seconds,
+            question_structure_enabled=config.agent.question_structure_enabled,
         ),
     )
     started_at = perf_counter()
@@ -397,14 +431,13 @@ def run_benchmark(
 
     task_artifacts: list[TaskRunArtifacts]
     if effective_workers == 1:
-        shared_model = model or build_chat_model(config)
         task_artifacts = []
         for task_id in task_ids:
             artifact = run_single_task(
                 task_id=task_id,
                 config=config,
                 run_output_dir=run_output_dir,
-                model=shared_model,
+                model=model,
             )
             task_artifacts.append(artifact)
             if progress_callback is not None:

@@ -20,6 +20,8 @@ class DeepAgentConfig:
     max_steps: int = 16
     execute_timeout_seconds: int = 30
     max_output_bytes: int = 100_000
+    model_call_interval_seconds: float = 0.0
+    question_structure_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -28,12 +30,16 @@ class DeepAgentConfig:
             raise ValueError("execute_timeout_seconds must be at least 1.")
         if self.max_output_bytes < 1:
             raise ValueError("max_output_bytes must be at least 1.")
+        if self.model_call_interval_seconds < 0:
+            raise ValueError("model_call_interval_seconds cannot be negative.")
 
 
 class BenchmarkDeepAgentState(DeepAgentState):
     """在 DeepAgents 默认状态上扩展基准任务专用字段。"""
 
     original_request: NotRequired[str]
+    question_structure: NotRequired[dict[str, Any]]
+    question_structure_enforced: NotRequired[bool]
     answer: NotRequired[AnswerTable | None]
     prepared_answer: NotRequired[AnswerTable | None]
     analysis_plan: NotRequired[dict[str, Any]]

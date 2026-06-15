@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 from deepagents.middleware.filesystem import FilesystemPermission
@@ -19,8 +21,22 @@ from langgraph.types import Command
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
 from data_agent_baseline.tools.analyze_plan import analyze_plan_tool
 
-_SOURCE_DISCOVERY_TOOLS = frozenset({"execute_python", "grep", "read_file"})
+_SOURCE_DISCOVERY_TOOLS = frozenset(
+    {
+        "execute_python",
+        "grep_file",
+        "inspect_sqlite",
+        "query_schema",
+        "read_csv",
+        "read_doc",
+        "read_json",
+    }
+)
 _CONTEXT_PATH_PATTERN = re.compile(r"""["'](/context/[^"']+)["']""")
+_INJECTED_KNOWLEDGE_PATTERN = re.compile(
+    r"<context_knowledge>\s*(.*?)\s*</context_knowledge>",
+    re.DOTALL,
+)
 _USER_TRANSFORMATION_REQUIREMENT_TYPES = {
     "filter": frozenset({"filter"}),
     "aggregate": frozenset({"calculation"}),
@@ -39,12 +55,69 @@ _KNOWLEDGE_TRANSFORMATION_RULE_TYPES = {
     "deduplicate": frozenset({"output"}),
     "reshape": frozenset({"output"}),
 }
+_OUTPUT_COLUMN_REQUIREMENT_TYPES = frozenset(
+    {
+        "calculation",
+        "measure",
+        "output_column",
+    }
+)
+_TRANSFORMATION_CONDITION_KEYS = {
+    "aggregate": "calculations",
+    "derive": "calculations",
+    "filter": "filters",
+    "sort": "orderings",
+    "limit": "limits",
+}
+_EXPLICIT_REQUIREMENT_PATTERNS = {
+    "calculation": re.compile(
+        (
+            r"(求和|合计|汇总|加总|总和|总额|平均|均值|最大|最高|最小|最低|"
+            r"增长率|同比|环比|占比|比例|计算|算出|sum|average|mean|max|min|"
+            r"total|calculate|aggregate|growth|ratio)"
+        ),
+        re.IGNORECASE,
+    ),
+    "ordering": re.compile(
+        r"(排序|升序|降序|顺序|从高到低|从低到高|最高|最低|top|order|sort|ascending|descending)",
+        re.IGNORECASE,
+    ),
+    "output_column": re.compile(
+        (
+            r"(列|字段|维度|包含|包括|显示|输出|返回|日期|年份|时间|省份|地区|城市|"
+            r"column|field|dimension|include|show|return|date|year|province|region|city)"
+        ),
+        re.IGNORECASE,
+    ),
+}
 _REVISION_FIELDS = (
     "intent",
     "output_spec",
     "evidence",
     "steps",
     "delegation_candidates",
+)
+_UNSUPPORTED_MEDIA_SUFFIXES = frozenset(
+    {
+        ".aac",
+        ".avi",
+        ".bmp",
+        ".flac",
+        ".gif",
+        ".jpeg",
+        ".jpg",
+        ".m4a",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".ogg",
+        ".pdf",
+        ".png",
+        ".tif",
+        ".tiff",
+        ".wav",
+        ".webp",
+    }
 )
 
 
@@ -59,7 +132,7 @@ class _DiscoveryState:
 
     @property
     def knowledge_ready(self) -> bool:
-        return not self.knowledge_present or self.knowledge_checked
+        return True
 
     @property
     def context_ready(self) -> bool:
@@ -69,11 +142,9 @@ class _DiscoveryState:
     def tool_policy(self) -> tuple[set[str], str | None]:
         """根据已掌握的信息决定下一轮可见工具及是否强制调用。"""
 
-        if not self.knowledge_ready:
-            return {"read_file"}, "read_file"
         if not self.context_ready:
             return set(_SOURCE_DISCOVERY_TOOLS), None
-        return set(_SOURCE_DISCOVERY_TOOLS) | {"analyze_plan"}, None
+        return {"analyze_plan"}, "analyze_plan"
 
 
 def tool_name(value: Any) -> str:
@@ -137,6 +208,63 @@ def _tool_error(request: ToolCallRequest, content: str) -> ToolMessage:
     )
 
 
+def _unsupported_media_read_error(request: ToolCallRequest) -> ToolMessage | None:
+    if str(request.tool_call.get("name") or "") != "read_file":
+        return None
+    arguments = request.tool_call.get("args") or {}
+    if not isinstance(arguments, Mapping):
+        return None
+    file_path = str(
+        arguments.get("file_path")
+        or arguments.get("path")
+        or ""
+    ).replace("\\", "/")
+    suffix = PurePosixPath(file_path).suffix.casefold()
+    if suffix not in _UNSUPPORTED_MEDIA_SUFFIXES:
+        return None
+    return _tool_error(
+        request,
+        (
+            f"Direct read_file for {suffix or 'binary'} files is disabled for "
+            "this model endpoint because it returns multimodal file blocks. "
+            "Use read_doc for text/PDF files, or specialized structured-data "
+            "tools for CSV, JSON, and SQLite sources instead."
+        ),
+    )
+
+
+def _decode_json_like_argument(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in {"{", "["}:
+            try:
+                return _decode_json_like_argument(json.loads(stripped))
+            except json.JSONDecodeError:
+                return value
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _decode_json_like_argument(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_decode_json_like_argument(item) for item in value]
+    return value
+
+
+def _normalize_tool_call_arguments(request: ToolCallRequest) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    normalized_arguments = _decode_json_like_argument(arguments)
+    if normalized_arguments is arguments or not isinstance(normalized_arguments, Mapping):
+        return request
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": dict(normalized_arguments),
+        }
+    )
+
+
 def _message_text(message: BaseMessage) -> str:
     content = message.content
     if isinstance(content, str):
@@ -148,6 +276,20 @@ def _message_text(message: BaseMessage) -> str:
         for block in content
         if isinstance(block, dict) and block.get("type") in {"text", "output_text"}
     )
+
+
+def _injected_knowledge_content(messages: list[BaseMessage]) -> str | None:
+    for message in messages:
+        if not isinstance(message, HumanMessage):
+            continue
+        match = _INJECTED_KNOWLEDGE_PATTERN.search(_message_text(message))
+        if match is None:
+            continue
+        content = match.group(1).strip()
+        if content in {"", "<missing>", "<empty>"} or content.startswith("<unreadable:"):
+            return None
+        return content
+    return None
 
 
 def _normalized_quote_text(value: str) -> str:
@@ -187,8 +329,14 @@ def _canonicalize_plan_quotes(
 ) -> ToolCallRequest:
     """将可唯一定位的 knowledge 引用替换成真实原文后再校验和落盘。"""
 
-    arguments = dict(request.tool_call.get("args") or {})
-    evidence = dict(arguments.get("evidence") or {})
+    raw_arguments = request.tool_call.get("args") or {}
+    if not isinstance(raw_arguments, Mapping):
+        return request
+    arguments = dict(raw_arguments)
+    raw_evidence = arguments.get("evidence") or {}
+    if not isinstance(raw_evidence, Mapping):
+        return request
+    evidence = dict(raw_evidence)
     normalized_rules: list[Any] = []
     changed = False
     for rule in evidence.get("knowledge_rules") or []:
@@ -221,13 +369,23 @@ def _canonicalize_plan_quotes(
 def _context_sources(tool: str, arguments: dict[str, Any]) -> set[str]:
     """从成功的探索调用中提取实际检查过的上下文来源。"""
 
-    if tool in {"read_file", "grep"}:
+    if tool in {
+        "grep_file",
+        "inspect_sqlite",
+        "read_csv",
+        "read_doc",
+        "read_json",
+    }:
         path = str(
             arguments.get("file_path")
             or arguments.get("path")
             or ""
         ).replace("\\", "/")
-        if path.startswith("/context/") and not path.lower().endswith("/knowledge.md"):
+        if path in {"", ".", "/context", "context"}:
+            return set()
+        if not path.startswith("/context/"):
+            path = f"/context/{path.removeprefix('context/').lstrip('/')}"
+        if not path.lower().endswith("/knowledge.md"):
             return {path}
         return set()
     if tool == "execute_python":
@@ -244,14 +402,11 @@ def _discovery_state(messages: list[BaseMessage]) -> _DiscoveryState:
     """汇总计划前已经检查的 knowledge 和独立数据来源。"""
 
     tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
-    knowledge_present = any(
-        isinstance(message, HumanMessage)
-        and "/context/knowledge.md" in _message_text(message)
-        for message in messages
-    )
-    knowledge_checked = False
-    knowledge_available = False
-    knowledge_contents: list[str] = []
+    injected_knowledge = _injected_knowledge_content(messages)
+    knowledge_present = injected_knowledge is not None
+    knowledge_checked = knowledge_present
+    knowledge_available = knowledge_present
+    knowledge_contents: list[str] = [injected_knowledge] if injected_knowledge else []
     context_sources: set[str] = set()
     needs_cross_validation = False
 
@@ -273,7 +428,7 @@ def _discovery_state(messages: list[BaseMessage]) -> _DiscoveryState:
             continue
         current_tool_name, arguments = tool_call
 
-        if current_tool_name == "read_file":
+        if current_tool_name == "read_doc":
             file_path = str(
                 arguments.get("file_path")
                 or arguments.get("path")
@@ -282,12 +437,12 @@ def _discovery_state(messages: list[BaseMessage]) -> _DiscoveryState:
             if file_path.lower().endswith("/knowledge.md"):
                 knowledge_checked = True
                 knowledge_available = getattr(message, "status", "success") != "error"
-                if knowledge_available:
+                if knowledge_available and injected_knowledge is None:
                     knowledge_contents.append(_message_text(message))
                 continue
 
         if (
-            current_tool_name in {"execute_python", "grep"}
+            current_tool_name in {"execute_python", "grep_file"}
             and getattr(message, "status", "success") != "error"
         ):
             inspected_text = str(
@@ -300,7 +455,7 @@ def _discovery_state(messages: list[BaseMessage]) -> _DiscoveryState:
                 knowledge_checked = True
                 knowledge_available = True
                 observed_content = _message_text(message)
-                if observed_content:
+                if observed_content and injected_knowledge is None:
                     knowledge_contents.append(observed_content)
 
         if (
@@ -336,6 +491,32 @@ def _plan_error(
     return _tool_error(request, f"Invalid analysis plan: {content}")
 
 
+def _question_structure_conditions(state: Mapping[str, Any]) -> dict[str, list[Any]] | None:
+    if not state.get("question_structure_enforced"):
+        return None
+    structure = state.get("question_structure")
+    if not isinstance(structure, Mapping):
+        return None
+    conditions = structure.get("conditions")
+    if not isinstance(conditions, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in conditions.items()
+        if isinstance(value, list)
+    }
+
+
+def _question_structure_target_count(state: Mapping[str, Any]) -> int | None:
+    if not state.get("question_structure_enforced"):
+        return None
+    structure = state.get("question_structure")
+    if not isinstance(structure, Mapping):
+        return None
+    targets = structure.get("targets")
+    return len(targets) if isinstance(targets, list) else 0
+
+
 def _validate_plan_contract(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
@@ -343,11 +524,15 @@ def _validate_plan_contract(
     """用可核验的引用和状态约束计划，不推断自然语言语义。"""
 
     arguments = request.tool_call.get("args") or {}
+    if not isinstance(arguments, Mapping):
+        return _plan_error(request, "tool arguments must be a JSON object.")
     original_request = str(request.state.get("original_request") or "")
     if not original_request:
         return _plan_error(request, "original_request is missing from agent state.")
 
     intent = arguments.get("intent") or {}
+    if not isinstance(intent, Mapping):
+        return _plan_error(request, "intent must be a JSON object.")
     requirements = intent.get("requirements") or []
     requirement_types_by_quote = {
         str(item.get("quote") or "").strip(): str(
@@ -364,8 +549,22 @@ def _validate_plan_contract(
             request,
             "every intent requirement quote must occur verbatim in original_request.",
         )
+    for quote, requirement_type in requirement_types_by_quote.items():
+        explicit_pattern = _EXPLICIT_REQUIREMENT_PATTERNS.get(requirement_type)
+        if explicit_pattern is None or explicit_pattern.search(quote):
+            continue
+        return _plan_error(
+            request,
+            (
+                f"{requirement_type} requirements must quote an explicit "
+                f"{requirement_type} instruction from the original request; "
+                f"{quote!r} is not sufficient."
+            ),
+        )
 
     evidence = arguments.get("evidence") or {}
+    if not isinstance(evidence, Mapping):
+        return _plan_error(request, "evidence must be a JSON object.")
     knowledge_status = str(evidence.get("knowledge_status") or "")
     context_sources = evidence.get("context_sources") or []
     requested_sources = {
@@ -413,6 +612,42 @@ def _validate_plan_contract(
         rule_quotes_by_type.setdefault(rule_type, set()).add(quote)
 
     output_spec = arguments.get("output_spec") or {}
+    if not isinstance(output_spec, Mapping):
+        return _plan_error(request, "output_spec must be a JSON object.")
+    output_columns = output_spec.get("columns") or []
+    if not isinstance(output_columns, list):
+        return _plan_error(request, "output_spec.columns must be a list.")
+    output_column_capacity = sum(
+        1
+        for requirement_type in requirement_types_by_quote.values()
+        if requirement_type in _OUTPUT_COLUMN_REQUIREMENT_TYPES
+    )
+    if len(output_columns) > output_column_capacity:
+        return _plan_error(
+            request,
+            (
+                "each output column must be backed by a distinct measure, "
+                "calculation, or explicit output_column requirement; got "
+                f"{len(output_columns)} columns but {output_column_capacity} "
+                "output-bearing requirements."
+            ),
+        )
+    question_conditions = _question_structure_conditions(request.state)
+    question_target_count = _question_structure_target_count(request.state)
+    if question_conditions is not None and question_target_count is not None:
+        explicit_output_columns = len(question_conditions.get("output_columns", []))
+        question_output_capacity = question_target_count + explicit_output_columns
+        if len(output_columns) > question_output_capacity:
+            return _plan_error(
+                request,
+                (
+                    "output_spec.columns exceeds the isolated question structure: "
+                    f"{len(output_columns)} columns requested by the plan, but the "
+                    f"question structure supports {question_target_count} target "
+                    f"column(s) plus {explicit_output_columns} explicit output "
+                    "column(s)."
+                ),
+            )
     transformations = output_spec.get("transformations") or []
     row_policy = str(output_spec.get("row_policy") or "")
     if transformations and row_policy != "transform":
@@ -447,6 +682,8 @@ def _validate_plan_contract(
             return _plan_error(request, "transformations must be structured objects.")
         operation = str(transformation.get("operation") or "")
         authorization = transformation.get("authorization") or {}
+        if not isinstance(authorization, Mapping):
+            continue
         source = str(authorization.get("source") or "")
         quote = str(authorization.get("quote") or "").strip()
         if source == "user":
@@ -460,6 +697,20 @@ def _validate_plan_contract(
                     (
                         f"user authorization for {operation!r} must cite an explicit "
                         f"requirement typed as one of {sorted(allowed_types)}."
+                    ),
+                )
+            condition_key = _TRANSFORMATION_CONDITION_KEYS.get(operation)
+            if (
+                question_conditions is not None
+                and condition_key is not None
+                and not question_conditions.get(condition_key)
+            ):
+                return _plan_error(
+                    request,
+                    (
+                        f"user authorization for {operation!r} conflicts with the "
+                        "isolated question structure: "
+                        f"conditions.{condition_key} is empty."
                     ),
                 )
         if source == "knowledge":
@@ -487,6 +738,8 @@ def _validate_plan_contract(
             )
 
     revision = arguments.get("revision") or {}
+    if not isinstance(revision, Mapping):
+        return _plan_error(request, "revision must be a JSON object.")
     version = revision.get("version")
     reported_changes = {
         str(field).strip()
@@ -599,6 +852,8 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
         current_tool_name = str(request.tool_call.get("name") or "")
+        if current_tool_name == "analyze_plan":
+            request = _normalize_tool_call_arguments(request)
         plan = request.state.get("analysis_plan")
         discovery = (
             _discovery_state(request.state["messages"])
@@ -612,19 +867,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                     request,
                     "Only discovery tools are available before analyze_plan.",
                 )
-            requested_path = str(
-                request.tool_call.get("args", {}).get("file_path")
-                or request.tool_call.get("args", {}).get("path")
-                or ""
-            ).replace("\\", "/")
-            if not discovery.knowledge_ready and (
-                current_tool_name != "read_file"
-                or not requested_path.lower().endswith("/knowledge.md")
-            ):
-                return _tool_error(
-                    request,
-                    "Read /context/knowledge.md before inspecting other sources.",
-                )
 
         if current_tool_name == "analyze_plan":
             assert discovery is not None
@@ -632,8 +874,8 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                 return _tool_error(
                     request,
                     (
-                        "Complete discovery before analyze_plan: read knowledge.md when "
-                        "present and inspect the minimum required independent data sources."
+                        "Complete discovery before analyze_plan: inspect the minimum "
+                        "required independent data sources."
                     ),
                 )
             request = _canonicalize_plan_quotes(request, discovery)
@@ -664,10 +906,34 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
         return handler(request)
 
 
+class TextOnlyReadFileMiddleware(AgentMiddleware[Any, None, Any]):
+    """Return text errors for media files instead of multimodal content blocks."""
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        unsupported_media_error = _unsupported_media_read_error(request)
+        if unsupported_media_error is not None:
+            return unsupported_media_error
+        return handler(request)
+
+
 class HideUnavailableToolsMiddleware(AgentMiddleware[Any, None, Any]):
     """隐藏基准环境不允许模型调用的通用文件和 shell 工具。"""
 
-    hidden_tools = frozenset({"execute", "ls", "write_file", "edit_file"})
+    hidden_tools = frozenset(
+        {
+            "edit_file",
+            "execute",
+            "glob",
+            "grep",
+            "ls",
+            "read_file",
+            "write_file",
+        }
+    )
 
     def wrap_model_call(
         self,

@@ -15,11 +15,27 @@ from pydantic import Field
 
 from data_agent_baseline.agents.deep_agent import DeepAgent
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.agents.filesystem import Utf8FilesystemBackend
 from data_agent_baseline.agents.middleware import _canonical_knowledge_quote
 from data_agent_baseline.agents.middleware import _discovery_state
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
 from data_agent_baseline.tools.analyze_plan import analyze_plan_tool
 from data_agent_baseline.tools.execute_python import create_execute_python_tool
+from data_agent_baseline.tools.inspect_sqlite import create_inspect_sqlite_tool
+from data_agent_baseline.tools.read_doc import create_read_doc_tool
+from data_agent_baseline.tools.read_json import create_read_json_tool
+
+DISCOVERY_TOOLS = {
+    "execute_python",
+    "grep_file",
+    "inspect_sqlite",
+    "query_schema",
+    "read_csv",
+    "read_doc",
+    "read_json",
+}
+PLAN_TOOLS = DISCOVERY_TOOLS | {"analyze_plan"}
+PLAN_ONLY_TOOLS = {"analyze_plan"}
 
 
 def _plan_args(
@@ -123,14 +139,8 @@ class ScriptedChatModel(BaseChatModel):
             return
         discovery_and_plan = [
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
-                "knowledge-call",
-                content="Read the authoritative task knowledge first.",
-            ),
-            _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "schema-call",
                 content="Inspect a relevant candidate data source.",
             ),
@@ -242,11 +252,50 @@ def _answer_response(
     )
 
 
+def _question_structure_response(
+    *,
+    target_quote: str = "Return the observed value.",
+) -> AIMessage:
+    return AIMessage(
+        content=json.dumps(
+            {
+                "schema_version": "1.0",
+                "original_question": target_quote,
+                "targets": [
+                    {
+                        "quote": target_quote,
+                        "name": "observed value",
+                        "target_type": "measure",
+                        "description": "Return the observed value.",
+                    }
+                ],
+                "target_constraints": [],
+                "conditions": {
+                    "filters": [],
+                    "time_ranges": [],
+                    "groupings": [],
+                    "orderings": [],
+                    "limits": [],
+                    "calculations": [],
+                    "output_columns": [],
+                },
+                "output": {
+                    "row_grain_hint": "source_records",
+                    "requested_columns": [],
+                    "preserve_source_rows": "true",
+                },
+                "ambiguities": [],
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def _llm_steps(result: Any) -> list[Any]:
     return [
         step
         for step in result.steps
-        if "request" in step.action_input
+        if "message" in step.raw_response
     ]
 
 
@@ -298,8 +347,8 @@ def test_reads_context_and_submits_answer(public_task: PublicTask) -> None:
     model = ScriptedChatModel(
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "read-call",
             ),
             _answer_response(columns=["value"], rows=[["hello from context"]]),
@@ -317,34 +366,24 @@ def test_reads_context_and_submits_answer(public_task: PublicTask) -> None:
     assert [step.action for step in result.steps[:4]] == [
         "system_prompt",
         "user_prompt",
-        "read_file",
-        "read_file",
+        "read_doc",
+        "analyze_plan",
     ]
-    assert result.steps[4].action == "analyze_plan"
+    assert result.steps[4].action == "write_todos"
     tool_calls = _tool_calls(result)
     assert [tool_call["name"] for _, tool_call in tool_calls] == [
-        "read_file",
-        "read_file",
+        "read_doc",
         "analyze_plan",
         "write_todos",
-        "read_file",
+        "read_doc",
         "execute_python",
     ]
     assert [tool_call["tool_call_id"] for _, tool_call in tool_calls] == [
-        "knowledge-call",
         "schema-call",
         "plan-call",
         "todos-call",
         "read-call",
         "answer-call",
-    ]
-    assert [step.action_input["llm_call_index"] for step, _ in tool_calls] == [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
     ]
     system_prompt_steps = [
         step
@@ -354,13 +393,207 @@ def test_reads_context_and_submits_answer(public_task: PublicTask) -> None:
     ]
     assert len(system_prompt_steps) == 1
     assert all(
-        "system_message" not in step.action_input["request"]
+        set(step.action_input) == {"message"}
+        and set(step.raw_response) == {"message"}
+        and "request" not in step.action_input
+        and "tools" not in step.action_input
         for step in _llm_steps(result)
     )
     user_prompt = next(step for step in result.steps if step.action == "user_prompt")
     prompt_content = user_prompt.action_input["message"]["content"]
     assert "sample.sqlite" in prompt_content
-    assert "[tables: metrics, observations]" in prompt_content
+    assert "SQLite tables: metrics, observations" in prompt_content
+
+
+def test_question_structure_node_is_isolated_and_injected(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(target_quote="Return the observed value."),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "structured-source",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "structured-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "structured-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["hello from context"]],
+                tool_call_id="structured-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(public_task)
+
+    assert result.succeeded
+    question_step = result.steps[0]
+    assert question_step.action == "question_structure"
+    assert question_step.action_input == {"question": "Return the observed value."}
+    assert "context" not in json.dumps(question_step.action_input)
+    assert question_step.observation["structure"]["targets"][0]["quote"] == (
+        "Return the observed value."
+    )
+    user_prompt = next(step for step in result.steps if step.action == "user_prompt")
+    prompt_text = user_prompt.action_input["message"]["content"]
+    assert "<question_structure>" in prompt_text
+    assert '"target_type": "measure"' in prompt_text
+
+
+def test_question_structure_limits_plan_output_columns(
+    public_task: PublicTask,
+) -> None:
+    invalid_plan = _plan_args(
+        columns=[
+            ("value", ["value"]),
+            ("observed_at", ["observed_at"]),
+        ]
+    )
+    invalid_plan["intent"]["requirements"].append(
+        {
+            "statement": "Try to add an extra output column.",
+            "requirement_type": "output_column",
+            "quote": "Return",
+        }
+    )
+    valid_plan = _plan_args(columns=[("value", ["value"])])
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(target_quote="Return the observed value."),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "limited-source",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "limited-invalid-plan"),
+            _tool_response("analyze_plan", valid_plan, "limited-valid-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "limited-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["hello from context"]],
+                tool_call_id="limited-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["value"]
+    _, invalid_call = _tool_call(result, "limited-invalid-plan")
+    _, valid_call = _tool_call(result, "limited-valid-plan")
+    assert invalid_call["status"] == "pending"
+    assert valid_call["ok"] is True
+
+
+def test_question_structure_blocks_unlisted_user_calculation(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_total"
+    context_dir = task_dir / "context"
+    context_dir.mkdir(parents=True)
+    context_dir.joinpath("data.txt").write_text("value\n1\n2\n", encoding="utf-8")
+    context_dir.joinpath("knowledge.md").write_text(
+        "Use the observed source value exactly.\n",
+        encoding="utf-8",
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id="task_total",
+            difficulty="easy",
+            question="Return the total observed value.",
+        ),
+        assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+    )
+    invalid_plan = _plan_args(
+        requirement_quote="total",
+        columns=[("value", ["value"])],
+    )
+    invalid_plan["intent"]["requirements"][0] = {
+        "statement": "Aggregate the observed value.",
+        "requirement_type": "calculation",
+        "quote": "total",
+    }
+    invalid_plan["output_spec"]["row_policy"] = "transform"
+    invalid_plan["output_spec"]["transformations"] = [
+        {
+            "operation": "aggregate",
+            "description": "Aggregate the observed values.",
+            "authorization": {"source": "user", "quote": "total"},
+        }
+    ]
+    valid_plan = _plan_args(
+        requirement_quote="Return the total observed value.",
+        columns=[("value", ["value"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(target_quote="Return the total observed value."),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "calculation-source",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "calculation-invalid-plan"),
+            _tool_response("analyze_plan", valid_plan, "calculation-valid-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "calculation-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["1"]],
+                tool_call_id="calculation-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(task)
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "calculation-invalid-plan")
+    _, valid_call = _tool_call(result, "calculation-valid-plan")
+    assert invalid_call["status"] == "pending"
+    assert valid_call["ok"] is True
 
 
 def test_parallel_tool_calls_are_correlated_by_id(public_task: PublicTask) -> None:
@@ -376,8 +609,8 @@ def test_parallel_tool_calls_are_correlated_by_id(public_task: PublicTask) -> No
                         "type": "tool_call",
                     },
                     {
-                        "name": "read_file",
-                        "args": {"file_path": "/context/data.txt"},
+                        "name": "read_doc",
+                        "args": {"path": "/context/data.txt"},
                         "id": "parallel-read",
                         "type": "tool_call",
                     },
@@ -396,7 +629,7 @@ def test_parallel_tool_calls_are_correlated_by_id(public_task: PublicTask) -> No
     assert "data.txt" in json.dumps(parallel_ls["result"])
     assert "hello from context" in json.dumps(parallel_read["result"])
     assert parallel_ls["name"] == "ls"
-    assert parallel_read["name"] == "read_file"
+    assert parallel_read["name"] == "read_doc"
 
 
 def test_analyze_plan_is_unavailable_before_discovery(
@@ -410,12 +643,10 @@ def test_analyze_plan_is_unavailable_before_discovery(
 
     assert result.succeeded
     assert "analyze_plan" not in model.bound_tool_sets[0]
-    assert "analyze_plan" not in model.bound_tool_sets[1]
-    assert "analyze_plan" in model.bound_tool_sets[2]
-    assert {"execute_python", "grep", "read_file"}.issubset(
-        model.bound_tool_sets[2]
-    )
-    assert model.bound_tool_choices[2] is None
+    assert model.bound_tool_sets[0] == DISCOVERY_TOOLS
+    assert "analyze_plan" in model.bound_tool_sets[1]
+    assert model.bound_tool_sets[1] == PLAN_ONLY_TOOLS
+    assert model.bound_tool_choices[1] == "analyze_plan"
     _, plan_call = _tool_call(result, "plan-call")
     assert plan_call["args"]["evidence"]["knowledge_status"] == "authoritative"
     assert plan_call["args"]["evidence"]["knowledge_rules"] == [
@@ -474,13 +705,13 @@ def test_plan_rejects_quote_not_present_in_original_request(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "quote-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "quote-source",
             ),
             _tool_response(
@@ -514,6 +745,104 @@ def test_plan_rejects_quote_not_present_in_original_request(
     assert valid_plan["ok"] is True
 
 
+def test_invalid_transformation_authorization_can_be_corrected(
+    public_task: PublicTask,
+) -> None:
+    invalid_plan = _plan_args(
+        transformations=[
+            {
+                "operation": "aggregate",
+                "description": "Aggregate without structured authorization.",
+                "authorization": "user",
+            }
+        ]
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/knowledge.md"},
+                "auth-knowledge",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "auth-source",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "invalid-auth-plan"),
+            _tool_response("analyze_plan", _plan_args(), "valid-auth-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "auth-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "invalid-auth-plan")
+    _, valid_call = _tool_call(result, "valid-auth-plan")
+    assert invalid_call["ok"] is False
+    assert "authorization" in json.dumps(invalid_call["result"])
+    assert valid_call["ok"] is True
+
+
+def test_stringified_plan_arguments_are_decoded(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args()
+    stringified_plan = {
+        **plan,
+        "intent": json.dumps(plan["intent"], ensure_ascii=False),
+        "output_spec": json.dumps(plan["output_spec"], ensure_ascii=False),
+        "evidence": json.dumps(plan["evidence"], ensure_ascii=False),
+        "revision": json.dumps(plan["revision"], ensure_ascii=False),
+        "steps": json.dumps(plan["steps"], ensure_ascii=False),
+    }
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/knowledge.md"},
+                "stringified-knowledge",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "stringified-source",
+            ),
+            _tool_response("analyze_plan", stringified_plan, "stringified-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "stringified-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "stringified-plan")
+    assert plan_call["ok"] is True
+
+
 def test_markdown_knowledge_quote_is_canonicalized(
     public_task: PublicTask,
 ) -> None:
@@ -525,13 +854,13 @@ def test_markdown_knowledge_quote_is_canonicalized(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "markdown-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "markdown-source",
             ),
             _tool_response(
@@ -612,13 +941,13 @@ def test_invalid_plan_tool_json_is_retried(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "retry-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "retry-source",
             ),
             AIMessage(
@@ -675,13 +1004,13 @@ def test_semantic_knowledge_cannot_authorize_aggregation(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "semantic-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "semantic-source",
             ),
             _tool_response("analyze_plan", invalid_plan, "semantic-aggregate"),
@@ -727,13 +1056,13 @@ def test_generic_output_requirement_cannot_authorize_aggregation(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "output-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "output-source",
             ),
             _tool_response("analyze_plan", invalid_plan, "output-aggregate"),
@@ -755,12 +1084,7 @@ def test_generic_output_requirement_cannot_authorize_aggregation(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    assert model.bound_tool_sets[3] == {
-        "analyze_plan",
-        "execute_python",
-        "grep",
-        "read_file",
-    }
+    assert model.bound_tool_sets[3] == PLAN_ONLY_TOOLS
     _, preserve_plan = _tool_call(result, "output-preserve")
     assert preserve_plan["ok"] is True
 
@@ -795,13 +1119,13 @@ def test_explicit_user_requirement_can_authorize_transformation(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "maximum-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "maximum-source",
             ),
             _tool_response("analyze_plan", plan, "maximum-plan"),
@@ -855,13 +1179,13 @@ def test_invalid_knowledge_reopens_only_required_cross_validation(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "knowledge-check",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "first-source",
             ),
             _tool_response(
@@ -874,8 +1198,8 @@ def test_invalid_knowledge_reopens_only_required_cross_validation(
                 "invalid-plan",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/sample.csv"},
+                "read_csv",
+                {"path": "/context/sample.csv"},
                 "second-source",
             ),
             _tool_response(
@@ -908,53 +1232,39 @@ def test_invalid_knowledge_reopens_only_required_cross_validation(
 
     assert result.succeeded
     assert model.bound_tool_sets[:6] == [
-        {"read_file"},
-        {"execute_python", "grep", "read_file"},
-        {"analyze_plan", "execute_python", "grep", "read_file"},
-        {"execute_python", "grep", "read_file"},
-        {"analyze_plan", "execute_python", "grep", "read_file"},
+        DISCOVERY_TOOLS,
+        DISCOVERY_TOOLS,
+        PLAN_ONLY_TOOLS,
+        DISCOVERY_TOOLS,
+        PLAN_ONLY_TOOLS,
         {"write_todos"},
     ]
-    assert model.bound_tool_choices[4] is None
+    assert model.bound_tool_choices[4] == "analyze_plan"
     _, invalid_plan = _tool_call(result, "invalid-plan")
     assert invalid_plan["name"] == "analyze_plan"
-    assert model.bound_tool_sets[3] == {"execute_python", "grep", "read_file"}
+    assert model.bound_tool_sets[3] == DISCOVERY_TOOLS
 
 
-def test_discovery_remains_model_driven_after_targeted_checks(
+def test_discovery_forces_plan_after_context_is_ready(
     public_task: PublicTask,
 ) -> None:
     model = ScriptedChatModel(
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "budget-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "budget-source-1",
-            ),
-            _tool_response(
-                "read_file",
-                {"file_path": "/context/sample.csv"},
-                "budget-source-2",
-            ),
-            _tool_response(
-                "read_file",
-                {"file_path": "/context/sample.json"},
-                "budget-source-3",
             ),
             _tool_response(
                 "analyze_plan",
                 _plan_args(
-                    context_paths=[
-                        "/context/data.txt",
-                        "/context/sample.csv",
-                        "/context/sample.json",
-                    ],
+                    context_paths=["/context/data.txt"],
                     steps=["Validate", "Submit"],
                 ),
                 "budget-plan",
@@ -976,15 +1286,8 @@ def test_discovery_remains_model_driven_after_targeted_checks(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    assert model.bound_tool_sets[2] == {
-        "analyze_plan",
-        "execute_python",
-        "grep",
-        "read_file",
-    }
-    assert model.bound_tool_sets[3] == model.bound_tool_sets[2]
-    assert model.bound_tool_sets[4] == model.bound_tool_sets[2]
-    assert model.bound_tool_choices[4] is None
+    assert model.bound_tool_sets[2] == PLAN_ONLY_TOOLS
+    assert model.bound_tool_choices[2] == "analyze_plan"
 
 
 def test_invalid_answer_returns_tool_error_and_can_be_corrected(
@@ -1000,7 +1303,7 @@ def test_invalid_answer_returns_tool_error_and_can_be_corrected(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    assert model.call_count == 6
+    assert model.call_count == 5
     invalid_step, invalid_call = _tool_call(result, "invalid-answer")
     assert invalid_call["name"] == "execute_python"
     assert invalid_call["ok"] is False
@@ -1032,13 +1335,13 @@ def test_expected_answer_row_count_is_enforced(public_task: PublicTask) -> None:
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "row-count-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/data.txt"},
+                "read_doc",
+                {"path": "/context/data.txt"},
                 "row-count-source",
             ),
             _tool_response("analyze_plan", plan, "row-count-plan"),
@@ -1072,6 +1375,49 @@ def test_expected_answer_row_count_is_enforced(public_task: PublicTask) -> None:
     assert wrong_step.ok is False
     assert wrong_call["ok"] is False
     assert "expected_row_count=2" in json.dumps(wrong_call["result"])
+
+
+def test_unrequested_output_columns_are_rejected(public_task: PublicTask) -> None:
+    invalid_plan = _plan_args(
+        columns=[
+            ("value", ["value"]),
+            ("observed_at", ["observed_at"]),
+        ]
+    )
+    valid_plan = _plan_args(columns=[("value", ["value"])])
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "extra-column-source",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "extra-column-plan"),
+            _tool_response("analyze_plan", valid_plan, "single-column-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "single-column-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["hello from context"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["value"]
+    _, invalid_call = _tool_call(result, "extra-column-plan")
+    _, valid_call = _tool_call(result, "single-column-plan")
+    assert invalid_call["status"] == "pending"
+    assert valid_call["ok"] is True
 
 
 def test_task_2_preserves_source_rows_without_aggregation() -> None:
@@ -1120,13 +1466,13 @@ def test_task_2_preserves_source_rows_without_aggregation() -> None:
         auto_discovery_plan=False,
         responses=[
             _tool_response(
-                "read_file",
-                {"file_path": "/context/knowledge.md"},
+                "read_doc",
+                {"path": "/context/knowledge.md"},
                 "task-2-knowledge",
             ),
             _tool_response(
-                "read_file",
-                {"file_path": "/context/json/ed_grossdomesticproduct.json", "limit": 40},
+                "read_json",
+                {"path": "/context/json/ed_grossdomesticproduct.json", "max_items": 40},
                 "task-2-source",
             ),
             _tool_response("analyze_plan", plan, "task-2-plan"),
@@ -1180,7 +1526,7 @@ def test_successful_answer_stops_before_another_model_call(public_task: PublicTa
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    assert model.call_count == 5
+    assert model.call_count == 4
 
 
 def test_plain_text_completion_is_not_a_valid_answer(public_task: PublicTask) -> None:
@@ -1253,7 +1599,7 @@ def test_default_subagent_does_not_receive_answer_tool(public_task: PublicTask) 
         if step.action_input.get("scope") == "subagent:general-purpose"
     ]
     assert any(step.action == "system_prompt" for step in subagent_steps)
-    assert any("request" in step.action_input for step in subagent_steps)
+    assert any("message" in step.action_input for step in subagent_steps)
 
 
 def test_model_call_limit_returns_failure(public_task: PublicTask) -> None:
@@ -1361,6 +1707,206 @@ def test_python_virtual_scratch_path_is_mapped(public_task: PublicTask) -> None:
     assert "完成" in output
 
 
+def test_eve_data_tools_are_callable(public_task: PublicTask) -> None:
+    model = ScriptedChatModel(
+        responses=[
+            _tool_response(
+                "read_csv",
+                {"path": "/context/sample.csv", "max_rows": 1},
+                "eve-read-csv",
+            ),
+            _tool_response(
+                "read_json",
+                {"path": "/context/sample.json"},
+                "eve-read-json",
+            ),
+            _tool_response(
+                "inspect_sqlite",
+                {"path": "/context/sample.sqlite", "sample_rows": 1},
+                "eve-inspect-sqlite",
+            ),
+            _tool_response(
+                "query_schema",
+                {"field": "value"},
+                "eve-query-schema",
+            ),
+            _tool_response(
+                "execute_sql",
+                {
+                    "path": "/context/sample.sqlite",
+                    "sql": "SELECT COUNT(*) FROM metrics",
+                    "max_rows": 5,
+                },
+                "eve-execute-sql",
+            ),
+            _tool_response(
+                "grep_file",
+                {
+                    "path": "/context/data.txt",
+                    "pattern": "hello",
+                    "output_mode": "content",
+                },
+                "eve-grep-file",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt", "max_lines": 5},
+                "eve-read-doc",
+            ),
+            _answer_response(columns=["value"], rows=[["ok"]]),
+        ]
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    for tool_call_id in [
+        "eve-read-csv",
+        "eve-read-json",
+        "eve-inspect-sqlite",
+        "eve-query-schema",
+        "eve-execute-sql",
+        "eve-grep-file",
+        "eve-read-doc",
+    ]:
+        _, call = _tool_call(result, tool_call_id)
+        assert call["ok"] is True
+    _, csv_call = _tool_call(result, "eve-read-csv")
+    assert "sample.csv" in json.dumps(csv_call["result"])
+    assert "value" in json.dumps(csv_call["result"])
+    _, sql_call = _tool_call(result, "eve-execute-sql")
+    assert "COUNT(*)" in json.dumps(sql_call["result"])
+
+
+def test_read_json_returns_paged_functional_view(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    context_dir.mkdir(parents=True)
+    context_dir.joinpath("records.json").write_text(
+        json.dumps(
+            {
+                "table": "demo",
+                "records": [
+                    {"id": 1, "value": 10},
+                    {"id": 2, "value": None},
+                    {"id": 3, "other": "x"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    tool = create_read_json_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    result = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "read_json",
+            "id": "paged-json",
+            "args": {"path": "/context/records.json", "max_items": 2},
+        }
+    )
+
+    assert result.status == "success"
+    payload = json.loads(result.content)
+    assert payload["selected_path"] == "records"
+    assert payload["total_items"] == 3
+    assert payload["returned_items"] == 2
+    assert payload["has_more"] is True
+    assert payload["items"] == [{"id": 1, "value": 10}, {"id": 2, "value": None}]
+    assert payload["metadata"] == {"table": "demo"}
+    assert "data" not in payload
+    assert "records" not in payload
+    assert payload["schema"]["fields"]["value"]["types"] == ["int", "null"]
+
+
+def test_read_doc_defaults_to_paged_window(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context" / "doc"
+    context_dir.mkdir(parents=True)
+    context_dir.joinpath("large.md").write_text(
+        "\n".join(f"line {index}" for index in range(1, 201)),
+        encoding="utf-8",
+    )
+    tool = create_read_doc_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    result = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "read_doc",
+            "id": "paged-doc",
+            "args": {"path": "/context/doc/large.md"},
+        }
+    )
+
+    assert result.status == "success"
+    payload = json.loads(result.content)
+    assert payload["returned_lines"] == 120
+    assert payload["total_lines"] == 200
+    assert payload["has_more"] is True
+    assert payload["truncated"] is True
+    assert "   120->line 120" in payload["content"]
+    assert "   121->line 121" not in payload["content"]
+
+
+def test_inspect_sqlite_overview_omits_sample_rows(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    db_dir = workspace / "context" / "db"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "sample.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE metrics (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)")
+        connection.executemany(
+            "INSERT INTO metrics (value) VALUES (?)",
+            [("alpha",), ("beta",)],
+        )
+    tool = create_inspect_sqlite_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    overview = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "inspect_sqlite",
+            "id": "sqlite-overview",
+            "args": {"path": "/context/db/sample.sqlite"},
+        }
+    )
+    detail = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "inspect_sqlite",
+            "id": "sqlite-detail",
+            "args": {
+                "path": "/context/db/sample.sqlite",
+                "table": "metrics",
+                "sample_rows": 1,
+            },
+        }
+    )
+
+    assert overview.status == "success"
+    overview_payload = json.loads(overview.content)
+    assert overview_payload["mode"] == "database_overview"
+    assert overview_payload["table_count"] == 2
+    assert set(overview_payload["tables"]) == {"metrics", "notes"}
+    assert "sample_rows" not in overview_payload["tables"]["metrics"]
+
+    assert detail.status == "success"
+    detail_payload = json.loads(detail.content)
+    assert detail_payload["mode"] == "table_detail"
+    assert detail_payload["tables"]["metrics"]["sample_rows"] == [
+        {"id": 1, "value": "alpha"}
+    ]
+
+
 def test_python_tool_schema_keeps_answer_rows_out_of_model_input(
     tmp_path: Path,
 ) -> None:
@@ -1459,22 +2005,26 @@ def test_unavailable_tools_are_hidden_from_main_and_subagent(public_task: Public
 
     assert result.succeeded
     assert model.bound_tool_sets
-    assert model.bound_tool_sets[0] == {"read_file"}
-    assert model.bound_tool_choices[0] == "read_file"
-    assert model.bound_tool_sets[1] == {"execute_python", "grep", "read_file"}
-    assert model.bound_tool_choices[1] is None
-    assert model.bound_tool_sets[2] == {
-        "analyze_plan",
-        "execute_python",
+    assert model.bound_tool_sets[0] == DISCOVERY_TOOLS
+    assert model.bound_tool_choices[0] is None
+    assert model.bound_tool_sets[1] == PLAN_ONLY_TOOLS
+    assert model.bound_tool_choices[1] == "analyze_plan"
+    assert model.bound_tool_sets[2] == {"write_todos"}
+    assert model.bound_tool_choices[2] == "write_todos"
+    hidden_tools = {
+        "edit_file",
+        "execute",
+        "glob",
         "grep",
+        "list_context",
+        "list_videos",
+        "ls",
         "read_file",
+        "write_file",
     }
-    assert model.bound_tool_choices[2] is None
-    assert model.bound_tool_sets[3] == {"write_todos"}
-    assert model.bound_tool_choices[3] == "write_todos"
-    for tool_names in model.bound_tool_sets[4:]:
-        assert {"execute", "ls", "write_file", "edit_file"}.isdisjoint(tool_names)
-    assert all("execute_python" in tool_names for tool_names in model.bound_tool_sets[4:])
+    for tool_names in model.bound_tool_sets[3:]:
+        assert hidden_tools.isdisjoint(tool_names)
+    assert all("execute_python" in tool_names for tool_names in model.bound_tool_sets[3:])
 
 
 def test_python_output_is_utf8(public_task: PublicTask) -> None:
@@ -1498,6 +2048,67 @@ def test_python_output_is_utf8(public_task: PublicTask) -> None:
     assert "�" not in output
 
 
+def test_binary_context_read_is_returned_as_text_error(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/knowledge.md"},
+                "binary-knowledge",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "binary-source",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/sample.pdf"},
+                "binary-read",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "binary-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "binary-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, read_call = _tool_call(result, "binary-read")
+    assert read_call["ok"] is False
+    assert "Failed to read document" in json.dumps(read_call["result"])
+
+
+def test_utf8_filesystem_backend_grep_handles_chinese(tmp_path: Path) -> None:
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    context_dir.joinpath("data.txt").write_text(
+        "北京 上海 全国\n",
+        encoding="utf-8",
+    )
+    backend = Utf8FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+
+    result = backend.grep("全国", "/context")
+
+    assert result.error is None
+    assert result.matches == [
+        {"path": "/context/data.txt", "line": 1, "text": "北京 上海 全国"}
+    ]
+
+
 def test_builtin_write_is_denied_for_context(public_task: PublicTask) -> None:
     model = ScriptedChatModel(
         responses=[
@@ -1518,3 +2129,4 @@ def test_builtin_write_is_denied_for_context(public_task: PublicTask) -> None:
     assert blocked_call["ok"] is False
     assert "permission" in json.dumps(blocked_call["result"]).lower()
     assert not public_task.context_dir.joinpath("new.txt").exists()
+

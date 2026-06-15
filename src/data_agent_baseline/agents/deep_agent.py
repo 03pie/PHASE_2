@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent
-from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -18,16 +17,25 @@ from data_agent_baseline.agents.deep_state import (
     DeepAgentConfig,
     TraceCallback,
 )
+from data_agent_baseline.agents.filesystem import Utf8FilesystemBackend
 from data_agent_baseline.agents.middleware import (
     AnswerMiddleware,
     HideUnavailableToolsMiddleware,
     PlanningMiddleware,
+    TextOnlyReadFileMiddleware,
     workspace_permissions,
+)
+from data_agent_baseline.agents.question_structure import (
+    fallback_question_structure,
+    format_question_structure,
+    structure_question,
 )
 from data_agent_baseline.agents.runtime import AgentRunResult
 from data_agent_baseline.agents.tracing import (
     LlmTraceMiddleware,
+    ModelCallRateLimiter,
     TraceEventCollector,
+    serialize_message,
     visible_text,
 )
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
@@ -36,7 +44,14 @@ from data_agent_baseline.prompts.loader import (
     load_main_agent_prompt,
     load_subagent_prompt,
 )
+from data_agent_baseline.tools.execute_sql import create_execute_sql_tool
 from data_agent_baseline.tools.execute_python import create_execute_python_tool
+from data_agent_baseline.tools.grep_file import create_grep_file_tool
+from data_agent_baseline.tools.inspect_sqlite import create_inspect_sqlite_tool
+from data_agent_baseline.tools.query_schema import create_query_schema_tool
+from data_agent_baseline.tools.read_csv import create_read_csv_tool
+from data_agent_baseline.tools.read_doc import create_read_doc_tool
+from data_agent_baseline.tools.read_json import create_read_json_tool
 
 
 def _normalize_answer(value: Any) -> AnswerTable | None:
@@ -97,14 +112,24 @@ class DeepAgent:
         workspace: Path,
         collector: TraceEventCollector,
     ) -> Any:
-        backend = FilesystemBackend(
+        backend = Utf8FilesystemBackend(
             root_dir=workspace,
             virtual_mode=True,
         )
         execute_python_tool = create_execute_python_tool(workspace, self.config)
+        data_tools = [
+            create_read_csv_tool(workspace, self.config),
+            create_read_json_tool(workspace, self.config),
+            create_read_doc_tool(workspace, self.config),
+            create_inspect_sqlite_tool(workspace, self.config),
+            create_execute_sql_tool(workspace, self.config),
+            create_grep_file_tool(workspace, self.config),
+            create_query_schema_tool(workspace, self.config),
+        ]
+        rate_limiter = ModelCallRateLimiter(self.config.model_call_interval_seconds)
         return create_deep_agent(
             model=self.model,
-            tools=[execute_python_tool],
+            tools=[*data_tools, execute_python_tool],
             system_prompt=self.system_prompt,
             backend=backend,
             permissions=workspace_permissions(),
@@ -117,13 +142,15 @@ class DeepAgent:
                         "and unresolved issues; it cannot submit the final answer."
                     ),
                     "system_prompt": load_subagent_prompt(),
-                    "tools": [execute_python_tool],
+                    "tools": [*data_tools, execute_python_tool],
                     "middleware": [
                         HideUnavailableToolsMiddleware(),
                         LlmTraceMiddleware(
                             collector,
                             scope="subagent:general-purpose",
+                            rate_limiter=rate_limiter,
                         ),
+                        TextOnlyReadFileMiddleware(),
                     ],
                 }
             ],
@@ -135,7 +162,12 @@ class DeepAgent:
                     run_limit=self.config.max_steps,
                     exit_behavior="end",
                 ),
-                LlmTraceMiddleware(collector, scope="main"),
+                LlmTraceMiddleware(
+                    collector,
+                    scope="main",
+                    rate_limiter=rate_limiter,
+                ),
+                TextOnlyReadFileMiddleware(),
             ],
             state_schema=BenchmarkDeepAgentState,
             name="dabench_deep_agent",
@@ -149,6 +181,10 @@ class DeepAgent:
         result: dict[str, Any] = {}
         last_partial_signature: str | None = None
         collector = TraceEventCollector()
+        question_structure, question_structure_enforced = self._structure_question(
+            task,
+            collector,
+        )
 
         # 每个任务复制到独立临时目录，保证上下文只读且任务之间互不污染。
         with tempfile.TemporaryDirectory(prefix=f"dabench-{task.task_id}-") as temp_dir:
@@ -161,7 +197,18 @@ class DeepAgent:
                 for state in graph.stream(
                     {
                         "original_request": task.question,
-                        "messages": [HumanMessage(content=build_task_prompt(task))],
+                        "question_structure": question_structure,
+                        "question_structure_enforced": question_structure_enforced,
+                        "messages": [
+                            HumanMessage(
+                                content=build_task_prompt(
+                                    task,
+                                    question_structure=format_question_structure(
+                                        question_structure
+                                    ),
+                                )
+                            )
+                        ],
                     },
                     config={"recursion_limit": max(100, self.config.max_steps * 8)},
                     stream_mode="values",
@@ -229,3 +276,46 @@ class DeepAgent:
         if trace_callback is not None:
             trace_callback(run_result, "completed" if run_result.succeeded else "failed")
         return run_result
+
+    def _structure_question(
+        self,
+        task: PublicTask,
+        collector: TraceEventCollector,
+    ) -> tuple[dict[str, Any], bool]:
+        if not self.config.question_structure_enabled:
+            return (
+                fallback_question_structure(
+                    task.question,
+                    "Question structuring node is disabled.",
+                ),
+                False,
+            )
+        try:
+            structure, response = structure_question(self.model, task.question)
+            collector.add(
+                action="question_structure",
+                scope="question_structure",
+                action_input={"question": task.question},
+                raw_response={"message": serialize_message(response)},
+                observation={"status": "completed", "structure": structure},
+                ok=True,
+            )
+            return structure, True
+        except Exception as exc:
+            structure = fallback_question_structure(
+                task.question,
+                f"Question structuring failed: {type(exc).__name__}: {exc}",
+            )
+            collector.add(
+                action="question_structure",
+                scope="question_structure",
+                action_input={"question": task.question},
+                observation={
+                    "status": "error",
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                    "structure": structure,
+                },
+                ok=False,
+            )
+            return structure, False

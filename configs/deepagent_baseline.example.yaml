@@ -1,10 +1,17 @@
+dataset:
+  root_path: data/public/input
+
 agent:
+  max_retries: 5
   max_steps: 30
   temperature: 0.0
   execute_timeout_seconds: 30
   max_output_bytes: 100000
+  model_call_interval_seconds: 0.0
+  question_structure_enabled: true
 
 run:
+  output_dir: artifacts/run
   run_id: 
-  max_workers: 8
+  max_workers: 1
   task_timeout_seconds: 600

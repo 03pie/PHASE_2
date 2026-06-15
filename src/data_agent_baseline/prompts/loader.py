@@ -31,7 +31,7 @@ def _sqlite_table_info(path: Path) -> str | None:
         return None
 
     table_names = [str(row[0]) for row in rows]
-    return f"tables: {', '.join(table_names) if table_names else '<none>'}"
+    return f"SQLite tables: {', '.join(table_names) if table_names else '<none>'}"
 
 
 # 文件信息钩子按后缀扩展，避免不同格式的探测逻辑堆积在清单循环中。
@@ -67,16 +67,33 @@ def _context_inventory(context_dir: Path) -> str:
         if hook is not None:
             extra_info = hook(path)
             if extra_info:
-                entry = f"{entry} [{extra_info}]"
+                entry = f"{entry}\n  - {extra_info}"
         entries.append(entry)
     return "\n".join(entries) if entries else "- <no context files>"
 
 
-def build_task_prompt(task: PublicTask) -> str:
-    """向任务模板注入用户问题和完整文件清单。"""
+def _knowledge_context(context_dir: Path) -> str:
+    knowledge_path = context_dir / "knowledge.md"
+    if not knowledge_path.is_file():
+        return "<missing>"
+    try:
+        content = knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError as exc:
+        return f"<unreadable: {exc}>"
+    return content or "<empty>"
+
+
+def build_task_prompt(
+    task: PublicTask,
+    *,
+    question_structure: str = "<not_run>",
+) -> str:
+    """向任务模板注入用户问题、固定 knowledge 上下文和完整文件清单。"""
 
     template = load_prompt("task.md")
     return template.format(
         question=task.question,
+        question_structure=question_structure,
         context_inventory=_context_inventory(task.context_dir),
+        knowledge_context=_knowledge_context(task.context_dir),
     )

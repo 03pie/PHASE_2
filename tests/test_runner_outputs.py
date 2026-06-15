@@ -32,7 +32,7 @@ class TraceInspectingModel(ScriptedChatModel):
             self.initial_trace_seen = (
                 initial_trace["status"] == "running" and initial_trace["steps"] == []
             )
-        elif self.call_count == 5:
+        elif self.call_count == 4:
             self.incremental_trace = json.loads(self.trace_path.read_text(encoding="utf-8"))
 
         return super()._generate(
@@ -105,9 +105,9 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
     assert [step["action"] for step in trace["steps"][:5]] == [
         "system_prompt",
         "user_prompt",
-        "read_file",
-        "read_file",
+        "read_doc",
         "analyze_plan",
+        "write_todos",
     ]
     tool_calls = [
         tool_call
@@ -115,7 +115,6 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
         for tool_call in step["observation"].get("tool_calls", [])
     ]
     assert [tool_call["tool_call_id"] for tool_call in tool_calls] == [
-        "knowledge-call",
         "schema-call",
         "plan-call",
         "todos-call",
@@ -158,8 +157,8 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
                 content="Inspecting.",
                 tool_calls=[
                     {
-                        "name": "read_file",
-                        "args": {"file_path": "/context/data.txt"},
+                        "name": "read_doc",
+                        "args": {"path": "/context/data.txt"},
                         "id": "read-before-answer",
                         "type": "tool_call",
                     }
@@ -199,9 +198,9 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
     assert incremental_actions[:5] == [
         "system_prompt",
         "user_prompt",
-        "read_file",
-        "read_file",
+        "read_doc",
         "analyze_plan",
+        "write_todos",
     ]
     incremental_tool_calls = [
         tool_call
@@ -209,13 +208,12 @@ def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
         for tool_call in step["observation"].get("tool_calls", [])
     ]
     assert [tool_call["name"] for tool_call in incremental_tool_calls] == [
-        "read_file",
-        "read_file",
+        "read_doc",
         "analyze_plan",
         "write_todos",
-        "read_file",
+        "read_doc",
     ]
-    assert incremental_tool_calls[4]["tool_call_id"] == "read-before-answer"
+    assert incremental_tool_calls[3]["tool_call_id"] == "read-before-answer"
 
 
 def _send_large_subprocess_result(

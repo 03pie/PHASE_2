@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
@@ -9,10 +10,11 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
-from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
 from data_agent_baseline.agents.runtime import StepRecord
+
+_MESSAGE_PREVIEW_CHARS = 700
 
 
 def json_safe(value: Any) -> Any:
@@ -21,28 +23,77 @@ def json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
+def _truncate_text(value: str, limit: int = _MESSAGE_PREVIEW_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
+def _content_preview(content: Any) -> str:
+    if isinstance(content, str):
+        return _truncate_text(content)
+    if isinstance(content, list):
+        text_parts = [
+            str(block.get("text"))
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") in {"text", "output_text"}
+            and isinstance(block.get("text"), str)
+        ]
+        if text_parts:
+            return _truncate_text("\n".join(text_parts))
+    return _truncate_text(json.dumps(json_safe(content), ensure_ascii=False))
+
+
 def serialize_message(message: BaseMessage) -> dict[str, Any]:
     """完整保留 LangChain 消息的可序列化字段。"""
 
     return json_safe(message.model_dump(mode="json", exclude_none=True))
 
 
-def serialize_tool_definition(value: BaseTool | dict[str, Any]) -> dict[str, Any]:
-    """统一序列化对象形式和字典形式的工具定义。"""
-
-    if isinstance(value, dict):
-        return json_safe(value)
-    args_schema: dict[str, Any] | None = None
-    if value.tool_call_schema is not None:
-        try:
-            args_schema = json_safe(value.tool_call_schema.model_json_schema())
-        except (AttributeError, TypeError, ValueError):
-            args_schema = None
-    return {
-        "name": value.name,
-        "description": value.description,
-        "args_schema": args_schema,
+def summarize_tool_call(tool_call: dict[str, Any], *, include_args: bool) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "name": str(tool_call.get("name") or ""),
+        "tool_call_id": str(tool_call.get("id") or "") or None,
     }
+    if include_args:
+        summary["args"] = json_safe(tool_call.get("args"))
+    return summary
+
+
+def summarize_message(message: BaseMessage, *, include_tool_args: bool = False) -> dict[str, Any]:
+    """记录消息摘要，避免每轮 trace 重复完整上下文和工具输出。"""
+
+    summary: dict[str, Any] = {
+        "type": str(getattr(message, "type", type(message).__name__)),
+    }
+    name = getattr(message, "name", None)
+    if name:
+        summary["name"] = str(name)
+    content_preview = _content_preview(message.content)
+    if content_preview:
+        summary["content_preview"] = content_preview
+
+    if isinstance(message, AIMessage):
+        if message.tool_calls:
+            summary["tool_calls"] = [
+                summarize_tool_call(tool_call, include_args=include_tool_args)
+                for tool_call in message.tool_calls
+            ]
+        if message.invalid_tool_calls:
+            summary["invalid_tool_calls"] = [
+                {
+                    "name": str(tool_call.get("name") or ""),
+                    "tool_call_id": str(tool_call.get("id") or "") or None,
+                    "error": str(tool_call.get("error") or ""),
+                }
+                for tool_call in message.invalid_tool_calls
+            ]
+    elif isinstance(message, ToolMessage):
+        summary["tool_call_id"] = str(message.tool_call_id or "") or None
+        summary["status"] = str(getattr(message, "status", "success"))
+
+    return json_safe(summary)
 
 
 def serialize_tool_result(value: ToolMessage | Command[Any]) -> dict[str, Any]:
@@ -163,7 +214,7 @@ class TraceEventCollector:
         *,
         scope: str,
         llm_call_index: int,
-        request_payload: dict[str, Any],
+        input_message: dict[str, Any],
     ) -> None:
         with self._lock:
             event = TraceEvent(
@@ -171,7 +222,7 @@ class TraceEventCollector:
                 scope=scope,
                 llm_call_index=llm_call_index,
                 thought="",
-                action_input={"request": request_payload},
+                action_input={"message": input_message},
                 raw_response={},
                 observation={"status": "requesting", "tool_calls": []},
                 ok=True,
@@ -183,7 +234,7 @@ class TraceEventCollector:
         self,
         *,
         llm_call_index: int,
-        response_payload: dict[str, Any],
+        output_message: dict[str, Any],
         messages: list[BaseMessage],
         visible_text: str,
     ) -> None:
@@ -193,7 +244,7 @@ class TraceEventCollector:
         with self._lock:
             event = self._llm_events[llm_call_index]
             event.thought = visible_text
-            event.raw_response = response_payload
+            event.raw_response = {"message": output_message}
             tool_names: list[str] = []
             for message in messages:
                 if not isinstance(message, AIMessage):
@@ -267,37 +318,71 @@ class TraceEventCollector:
 
         with self._lock:
             events = list(self._events)
-        return [
-            StepRecord(
-                step_index=index,
-                thought=event.thought,
-                action=event.action,
-                action_input={
+        records: list[StepRecord] = []
+        for index, event in enumerate(events, start=1):
+            action_input = dict(event.action_input)
+            if event.action in {"system_prompt", "user_prompt"}:
+                action_input = {
                     "scope": event.scope,
                     "llm_call_index": event.llm_call_index,
-                    **event.action_input,
-                },
-                tool_call_id=None,
-                raw_response=event.raw_response,
-                observation=event.observation,
-                ok=event.ok,
+                    **action_input,
+                }
+            records.append(
+                StepRecord(
+                    step_index=index,
+                    thought=event.thought,
+                    action=event.action,
+                    action_input=action_input,
+                    tool_call_id=None,
+                    raw_response=event.raw_response,
+                    observation=event.observation,
+                    ok=event.ok,
+                )
             )
-            for index, event in enumerate(events, start=1)
-        ]
+        return records
+
+
+class ModelCallRateLimiter:
+    """Serializes model request starts within one agent process."""
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        self.min_interval_seconds = max(float(min_interval_seconds), 0.0)
+        self._lock = Lock()
+        self._next_request_at = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval_seconds <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            delay = max(self._next_request_at - now, 0.0)
+            self._next_request_at = max(now, self._next_request_at) + (
+                self.min_interval_seconds
+            )
+        if delay > 0:
+            time.sleep(delay)
 
 
 class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
     """记录模型请求、模型响应，以及响应中工具调用的执行结果。"""
 
-    def __init__(self, collector: TraceEventCollector, *, scope: str) -> None:
+    def __init__(
+        self,
+        collector: TraceEventCollector,
+        *,
+        scope: str,
+        rate_limiter: ModelCallRateLimiter | None = None,
+    ) -> None:
         self.collector = collector
         self.scope = scope
+        self.rate_limiter = rate_limiter or ModelCallRateLimiter(0.0)
 
     def wrap_model_call(
         self,
         request: ModelRequest[None],
         handler: Callable[[ModelRequest[None]], ModelResponse[Any]],
     ) -> ModelResponse[Any]:
+        self.rate_limiter.wait()
         call_index = self.collector.next_llm_call_index()
         self.collector.initialize_scope(
             scope=self.scope,
@@ -305,24 +390,15 @@ class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
             messages=request.messages,
             llm_call_index=call_index,
         )
-        request_payload = {
-            "model": {
-                "class": type(request.model).__name__,
-                "identifier": str(
-                    getattr(request.model, "model_name", None)
-                    or getattr(request.model, "model", None)
-                    or ""
-                ),
-            },
-            "messages": [serialize_message(message) for message in request.messages],
-            "tools": [serialize_tool_definition(item) for item in request.tools],
-            "tool_choice": json_safe(request.tool_choice),
-            "model_settings": json_safe(request.model_settings),
-        }
+        input_message = request.messages[-1] if request.messages else None
         self.collector.start_llm_call(
             scope=self.scope,
             llm_call_index=call_index,
-            request_payload=request_payload,
+            input_message=(
+                summarize_message(input_message)
+                if input_message is not None
+                else {}
+            ),
         )
         try:
             response = handler(request)
@@ -333,7 +409,6 @@ class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
             )
             raise
 
-        serialized_result = [serialize_message(message) for message in response.result]
         response_text = "\n".join(
             visible_text(message)
             for message in response.result
@@ -343,10 +418,11 @@ class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
             llm_call_index=call_index,
             messages=response.result,
             visible_text=response_text,
-            response_payload={
-                "messages": serialized_result,
-                "structured_response": json_safe(response.structured_response),
-            },
+            output_message=(
+                summarize_message(response.result[-1], include_tool_args=True)
+                if response.result
+                else {}
+            ),
         )
         return response
 
@@ -384,6 +460,8 @@ def visible_text(message: AIMessage) -> str:
 
     if isinstance(message.content, str):
         return message.content
+    if not message.content:
+        return ""
     text_parts: list[str] = []
     for block in message.content:
         if not isinstance(block, dict):
