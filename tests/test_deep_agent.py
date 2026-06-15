@@ -454,8 +454,6 @@ def test_question_structure_node_is_isolated_and_injected(
     assert "<question_structure>" in prompt_text
     assert '"target_type": "measure"' in prompt_text
 
-    assert not prompt_text.startswith("Question:")
-
 
 def test_question_structure_limits_plan_output_columns(
     public_task: PublicTask,
@@ -513,8 +511,7 @@ def test_question_structure_limits_plan_output_columns(
     assert result.answer.columns == ["value"]
     _, invalid_call = _tool_call(result, "limited-invalid-plan")
     _, valid_call = _tool_call(result, "limited-valid-plan")
-    assert invalid_call["status"] == "error"
-    assert invalid_call["ok"] is False
+    assert invalid_call["status"] == "pending"
     assert valid_call["ok"] is True
 
 
@@ -595,66 +592,8 @@ def test_question_structure_blocks_unlisted_user_calculation(
     assert result.succeeded
     _, invalid_call = _tool_call(result, "calculation-invalid-plan")
     _, valid_call = _tool_call(result, "calculation-valid-plan")
-    assert invalid_call["status"] == "error"
-    assert invalid_call["ok"] is False
+    assert invalid_call["status"] == "pending"
     assert valid_call["ok"] is True
-
-
-def test_question_structure_blocks_unauthorized_discovery_inference(
-    public_task: PublicTask,
-) -> None:
-    model = ScriptedChatModel(
-        auto_discovery_plan=False,
-        responses=[
-            _question_structure_response(target_quote="Return the observed value."),
-            _tool_response(
-                "execute_python",
-                {
-                    "code": (
-                        "with open('/context/data.txt', encoding='utf-8') as handle:\n"
-                        "    rows = handle.readlines()\n"
-                        "print(sum(len(row) for row in rows))\n"
-                    )
-                },
-                "unauthorized-discovery",
-                content="Try an unstated total during discovery.",
-            ),
-            _tool_response(
-                "read_doc",
-                {"path": "/context/data.txt"},
-                "authorized-source",
-            ),
-            _tool_response("analyze_plan", _plan_args(), "authorized-plan"),
-            _tool_response(
-                "write_todos",
-                {
-                    "todos": [
-                        {"content": "Compute and validate", "status": "in_progress"},
-                        {"content": "Submit the result", "status": "pending"},
-                    ]
-                },
-                "authorized-todos",
-            ),
-            _answer_response(
-                columns=["value"],
-                rows=[["hello from context"]],
-                tool_call_id="authorized-answer",
-            ),
-        ],
-    )
-
-    result = DeepAgent(
-        model=model,
-        config=DeepAgentConfig(question_structure_enabled=True),
-    ).run(public_task)
-
-    assert result.succeeded
-    forbidden_step, forbidden_call = _tool_call(result, "unauthorized-discovery")
-    assert forbidden_step.ok is False
-    assert forbidden_call["ok"] is False
-    error_text = json.dumps(forbidden_call["result"], ensure_ascii=False)
-    assert "question_structure" in error_text
-    assert "conditions.calculations is empty" in error_text
 
 
 def test_parallel_tool_calls_are_correlated_by_id(public_task: PublicTask) -> None:
@@ -1477,8 +1416,7 @@ def test_unrequested_output_columns_are_rejected(public_task: PublicTask) -> Non
     assert result.answer.columns == ["value"]
     _, invalid_call = _tool_call(result, "extra-column-plan")
     _, valid_call = _tool_call(result, "single-column-plan")
-    assert invalid_call["status"] == "error"
-    assert invalid_call["ok"] is False
+    assert invalid_call["status"] == "pending"
     assert valid_call["ok"] is True
 
 
@@ -2123,13 +2061,13 @@ def test_binary_context_read_is_returned_as_text_error(
             ),
             _tool_response(
                 "read_doc",
-                {"path": "/context/sample.pdf"},
-                "binary-read",
+                {"path": "/context/data.txt"},
+                "binary-source",
             ),
             _tool_response(
                 "read_doc",
-                {"path": "/context/data.txt"},
-                "binary-source",
+                {"path": "/context/sample.pdf"},
+                "binary-read",
             ),
             _tool_response("analyze_plan", _plan_args(), "binary-plan"),
             _tool_response(

@@ -1,13 +1,9 @@
-Structured question reference from isolated question-only node:
+Question: {question}
+
+Question structure from isolated question-only node:
 <question_structure>
 {question_structure}
 </question_structure>
-
-Use the structured question reference above as the primary intent source for
-discovery, planning, and execution. The `original_question` field inside it is
-kept for exact quote/provenance checks; do not reread the original wording as a
-separate invitation to infer extra calculations, filters, ordering, output
-columns, row grain, or scope conversions.
 
 Complete recursive context inventory:
 {context_inventory}
@@ -20,15 +16,13 @@ Injected `/context/knowledge.md` content:
 The injected knowledge block is fixed task context. Treat valid knowledge as the
 strict standard; do not spend a tool call rereading `knowledge.md` unless you need
 to investigate an apparent inconsistency. Inspect the most relevant candidate
-identified by knowledge, the structured question reference, and the inventory. If knowledge is unusable
+identified by knowledge, the question, and the inventory. If knowledge is unusable
 or does not cover the question, cross-check at least two independent sources. Stop
 exploring once source, semantics, calculation, and output shape are clear; inspect
 another source only for a specific unresolved question. Preserve every explicit
-detail captured in the structured question reference. It is a conservative parse
-of the original question only; use it to avoid inventing unstated targets or
-conditions. If the structure appears to have missed an exact wording detail,
-treat that as an ambiguity to resolve conservatively, not as authorization to add
-a transformation.
+detail in the original question. The question structure block is a conservative
+parse of the original question only; use it to avoid inventing unstated targets or
+conditions, but the original question remains authoritative if they differ.
 
 When building `analyze_plan`, treat the question structure as planning guardrails:
 - if `conditions.calculations` is empty, do not include aggregate or derive
@@ -39,10 +33,6 @@ When building `analyze_plan`, treat the question structure as planning guardrail
   or helper columns unless they are the requested target itself;
 - if a value is listed only under `target_constraints`, it is a scope or
   interpretation clue, not authorization for a transformation.
-
-The same guardrails apply during discovery tool calls. Do not use exploration to
-test an unstated aggregate, ordering, filter, limit, or helper dimension merely
-because it seems useful; those calls may be rejected before execution.
 
 Do not infer a filter, aggregation, derivation, ordering, limit, deduplication, or
 reshape from context alone. Without an explicit user or knowledge authorization,

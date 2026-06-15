@@ -90,37 +90,6 @@ _EXPLICIT_REQUIREMENT_PATTERNS = {
         re.IGNORECASE,
     ),
 }
-_DISCOVERY_CALCULATION_INFERENCE_PATTERN = re.compile(
-    (
-        r"(sum\s*\(|\.sum\s*\(|groupby\s*\(|group\s+by|aggregate|aggregation|"
-        r"calculate|calculation|average|mean\s*\(|max\s*\(|min\s*\(|ratio|"
-        r"growth|total\s+(?:row|value|amount|sum|gdp|record)|"
-        r"求和|合计|汇总|加总|总和|总额|平均|均值|最大|最小|增长率|同比|环比|"
-        r"占比|比例|计算|算出|全国总计|全国合计|国家总计|国家合计)"
-    ),
-    re.IGNORECASE,
-)
-_DISCOVERY_ORDERING_INFERENCE_PATTERN = re.compile(
-    r"(\bsort(?:ed)?\s*\(|\.sort\s*\(|order\s+by|ascending|descending|排序|升序|降序)",
-    re.IGNORECASE,
-)
-_DISCOVERY_LIMIT_INFERENCE_PATTERN = re.compile(
-    r"(\blimit\s+\d+|\btop\s+\d+|head\s*\(\s*\d+|tail\s*\(\s*\d+|前\s*\d+\s*个|后\s*\d+\s*个)",
-    re.IGNORECASE,
-)
-_DISCOVERY_FILTER_INFERENCE_PATTERN = re.compile(
-    r"(\bwhere\b|\.query\s*\(|filter\s*\(|筛选|过滤|条件)",
-    re.IGNORECASE,
-)
-_DISCOVERY_DIMENSION_INFERENCE_PATTERN = re.compile(
-    (
-        r"((unique|distinct|values|list|enumerate|print)\W{0,40}"
-        r"(province|region|city|date|year|enddate|time|省份|地区|城市|日期|年份|时间))|"
-        r"((province|region|city|date|year|enddate|time|省份|地区|城市|日期|年份|时间)"
-        r"\W{0,40}(unique|distinct|values|list|enumerate|print))"
-    ),
-    re.IGNORECASE,
-)
 _REVISION_FIELDS = (
     "intent",
     "output_spec",
@@ -548,118 +517,6 @@ def _question_structure_target_count(state: Mapping[str, Any]) -> int | None:
     return len(targets) if isinstance(targets, list) else 0
 
 
-def _argument_text_values(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Mapping):
-        values: list[str] = []
-        for item in value.values():
-            values.extend(_argument_text_values(item))
-        return values
-    if isinstance(value, list):
-        values = []
-        for item in value:
-            values.extend(_argument_text_values(item))
-        return values
-    return []
-
-
-def _question_structure_has_condition(
-    conditions: Mapping[str, list[Any]],
-    *keys: str,
-) -> bool:
-    return any(bool(conditions.get(key)) for key in keys)
-
-
-def _discovery_question_structure_error(
-    request: ToolCallRequest,
-    current_tool_name: str,
-) -> ToolMessage | None:
-    """Reject exploratory calls that add unstated operations to the question."""
-
-    if current_tool_name not in _SOURCE_DISCOVERY_TOOLS:
-        return None
-    conditions = _question_structure_conditions(request.state)
-    if conditions is None:
-        return None
-    arguments = request.tool_call.get("args") or {}
-    if not isinstance(arguments, Mapping):
-        return None
-    argument_text = "\n".join(_argument_text_values(arguments))
-    if not argument_text:
-        return None
-
-    if (
-        not _question_structure_has_condition(conditions, "calculations")
-        and _DISCOVERY_CALCULATION_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.calculations is empty, but the tool arguments/code "
-                "attempt to explore an aggregate, derived calculation, or total. "
-                "Inspect direct target fields only, or call analyze_plan once the "
-                "source is clear."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(conditions, "orderings")
-        and _DISCOVERY_ORDERING_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.orderings is empty, but the tool arguments/code "
-                "attempt to explore sorting or ordered ranking."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(conditions, "limits")
-        and _DISCOVERY_LIMIT_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.limits is empty, but the tool arguments/code attempt "
-                "to explore a top/limit slice."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(conditions, "filters")
-        and _DISCOVERY_FILTER_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.filters is empty, but the tool arguments/code attempt "
-                "to explore a filtered subset."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(
-            conditions,
-            "output_columns",
-            "groupings",
-            "time_ranges",
-            "filters",
-        )
-        and _DISCOVERY_DIMENSION_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: no output, "
-                "grouping, time, or filter condition authorizes enumerating "
-                "helper dimensions such as geography or date values."
-            ),
-        )
-    return None
-
-
 def _validate_plan_contract(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
@@ -1010,22 +867,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                     request,
                     "Only discovery tools are available before analyze_plan.",
                 )
-            if current_tool_name in _SOURCE_DISCOVERY_TOOLS:
-                structure_error = _discovery_question_structure_error(
-                    request,
-                    current_tool_name,
-                )
-                if structure_error is not None:
-                    return structure_error
-                if discovery.context_ready:
-                    return _tool_error(
-                        request,
-                        (
-                            "Discovery is already sufficient for the current "
-                            "question_structure and context evidence. Call "
-                            "analyze_plan instead of exploring another source."
-                        ),
-                    )
 
         if current_tool_name == "analyze_plan":
             assert discovery is not None

@@ -5,12 +5,9 @@ wording alone.
 
 ## 1. Discovery
 
-1. Use the injected `question_structure` as the primary reference for user
-   intent when it is present. Its `original_question` field exists for exact
-   quote/provenance checks, not as a second source for free-form reinterpretation.
-   Identify entities, measures, filters, time range, grouping, ordering, limits,
-   and output requests from the structure, but do not add requirements that the
-   structure did not capture.
+1. Preserve every explicit detail in the user's conversational request. Identify
+   entities, measures, filters, time range, grouping, ordering, limits, and output
+   requests provisionally, but do not add requirements that the user did not state.
 2. Use the injected `/context/knowledge.md` block when it exists. It is the
    authoritative standard for terminology, field meaning, units, filters, and
    output rules; do not spend a tool call rereading it unless resolving a
@@ -24,8 +21,6 @@ wording alone.
    that point. Inspect another source only to resolve a specific remaining
    uncertainty, schema mismatch, missing field, or required cross-validation.
    Do not traverse files merely to see whether an alternative exists.
-   Discovery tool calls are also checked against `question_structure`; do not
-   probe for an unstated aggregate, ordering, filter, limit, or helper dimension.
 5. The recursive inventory is already provided. Do not call `glob`, list
    directories, or delegate discovery merely to rediscover available files.
 
@@ -92,10 +87,7 @@ Build the plan as a traceable contract:
    The injected `question_structure` block is enforced by middleware when present:
    empty `conditions.calculations` forbids aggregate/derive transformations, empty
    `conditions.orderings` means source order, and empty `conditions.output_columns`
-   means no date/geography/helper columns beyond the requested target. If the
-   original wording seems to suggest something that the structure lists only as a
-   target constraint or ambiguity, keep the plan conservative instead of adding a
-   transformation.
+   means no date/geography/helper columns beyond the requested target.
 5. Set `expected_row_count` only when it is directly established and the planned
    output count is deterministic; otherwise use `null`.
 6. The initial plan uses revision version 1 with no changed fields. A revision
