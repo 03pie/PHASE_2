@@ -155,17 +155,17 @@ class DeepAgent:
                 }
             ],
             middleware=[
+                LlmTraceMiddleware(
+                    collector,
+                    scope="main",
+                    rate_limiter=rate_limiter,
+                ),
                 PlanningMiddleware(),
                 AnswerMiddleware(),
                 HideUnavailableToolsMiddleware(),
                 ModelCallLimitMiddleware(
                     run_limit=self.config.max_steps,
                     exit_behavior="end",
-                ),
-                LlmTraceMiddleware(
-                    collector,
-                    scope="main",
-                    rate_limiter=rate_limiter,
                 ),
                 TextOnlyReadFileMiddleware(),
             ],
