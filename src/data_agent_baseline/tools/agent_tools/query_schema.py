@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.agents.semantic_layer import query_semantic_context
 from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import error, query_context_schema, success
 
@@ -44,6 +45,11 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
             field_text,
             max_matches=max_matches,
         )
+        semantic_matches = query_semantic_context(
+            context_root,
+            field_text,
+            max_matches=max_matches,
+        )
         return success(
             name="query_schema",
             tool_call_id=tool_call_id,
@@ -51,6 +57,10 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
                 "field": field_text,
                 "matches": matches,
                 "match_count": len(matches),
+                "source_candidates": semantic_matches["source_candidates"],
+                "logical_bindings": semantic_matches["logical_bindings"],
+                "binding_issues": semantic_matches["binding_issues"],
+                "knowledge_facts": semantic_matches["knowledge_facts"],
                 "hint": "Inspect the reported source before relying on a field.",
             },
             max_output_bytes=config.max_output_bytes,

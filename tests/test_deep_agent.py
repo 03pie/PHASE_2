@@ -19,6 +19,10 @@ from data_agent_baseline.agents.filesystem import Utf8FilesystemBackend
 from data_agent_baseline.agents.middleware import _canonical_knowledge_quote
 from data_agent_baseline.agents.middleware import _discovery_state
 from data_agent_baseline.agents.question_structure import _normalize_structure
+from data_agent_baseline.agents.semantic_layer import (
+    parse_knowledge_content,
+    query_semantic_context,
+)
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
 from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
@@ -573,6 +577,85 @@ def test_question_structure_normalizes_unrequested_aggregate_grain() -> None:
 
     assert normalized["output"]["row_grain_hint"] == "source_records"
     assert normalized["output"]["preserve_source_rows"] == "true"
+
+
+def test_question_structure_keeps_unquoted_condition_strings_as_hints() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "Show the education distribution.",
+            "targets": [
+                {
+                    "quote": "education distribution",
+                    "name": "education distribution",
+                    "target_type": "record_set",
+                    "description": "Return the distribution.",
+                }
+            ],
+            "conditions": {
+                "filters": ["fund size > 100 billion"],
+                "calculations": ["group by education"],
+            },
+            "output": {},
+        },
+        "Show the education distribution.",
+    )
+
+    assert normalized["conditions"]["filters"] == [
+        {
+            "quote": None,
+            "value": "fund size > 100 billion",
+            "condition_type": "filter",
+            "explicitness": "unquoted_hint",
+        }
+    ]
+    assert normalized["conditions"]["calculations"][0]["quote"] is None
+    assert {
+        (item["quote"], item["operation"], item["operator_type"])
+        for item in normalized["intent_operators"]
+    } >= {("distribution", "aggregate", "distribution")}
+
+
+def test_semantic_layer_extracts_facts_and_same_basename_sources(tmp_path: Path) -> None:
+    context_dir = tmp_path / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "# Table `mf_missing`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | return rate in ten years | % |",
+                "Join `fundcode` to `mf_fundarchives`.",
+                "Formula: `RRInTenYear` is already provided by the source.",
+                "```sql",
+                "SELECT Education, COUNT(*) FROM mf_personalinfo WHERE ExperienceTime > 10 GROUP BY Education",
+                "```",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_missing.md").write_text(
+        "Narrative records contain RRInTenYear values.",
+        encoding="utf-8",
+    )
+
+    facts = parse_knowledge_content(
+        context_dir.joinpath("knowledge.md").read_text(encoding="utf-8")
+    )
+    assert {"field", "unit", "join", "calculation", "example_query"} <= {
+        fact.kind for fact in facts
+    }
+    assert any(fact.operation == "filter,aggregate" for fact in facts)
+
+    semantic = query_semantic_context(context_dir, "mf_missing", max_matches=10)
+    assert any(
+        item["source_type"] == "doc"
+        and item["source_path"] == "/context/doc/mf_missing.md"
+        for item in semantic["source_candidates"]
+    )
+    assert any("status=narrative_only" in issue for issue in semantic["binding_issues"])
 
 
 def test_question_structure_limits_plan_output_columns(
@@ -2088,6 +2171,135 @@ def test_unrequested_output_columns_are_rejected(public_task: PublicTask) -> Non
     _, valid_call = _tool_call(result, "single-column-plan")
     assert invalid_call["status"] == "error"
     assert invalid_call["ok"] is False
+    assert valid_call["ok"] is True
+
+
+def test_execution_spec_supporting_selector_field_is_not_final_output(
+    public_task: PublicTask,
+) -> None:
+    question = "Which company has the highest commission?"
+    plan = _plan_args(
+        requirement_quote=question,
+        columns=[("ChiNameAbbr", ["ChiNameAbbr"])],
+        transformations=[
+            {
+                "operation": "sort",
+                "description": "Sort by commission to identify the selector row.",
+                "authorization": {"source": "user", "quote": "highest"},
+            },
+            {
+                "operation": "limit",
+                "description": "Keep the selected highest row.",
+                "authorization": {"source": "user", "quote": "highest"},
+            },
+        ],
+        expected_row_count=1,
+    )
+    plan["output_spec"]["ordering"] = "specified"
+    plan["output_spec"]["sort_keys"] = [
+        {"field": "Commission", "direction": "descending"}
+    ]
+    plan["execution_spec"] = {
+        "sources": [{"path": "/context/data.txt", "source_type": "doc"}],
+        "supporting_fields": [
+            {
+                "name": "Commission",
+                "source_fields": ["Commission"],
+                "purpose": "selector",
+            }
+        ],
+        "operations": [
+            {
+                "operation": "sort",
+                "description": "Use highest as the selector operation.",
+                "authorization": {"source": "user", "quote": "highest"},
+            },
+            {
+                "operation": "limit",
+                "description": "Return only the selected company.",
+                "authorization": {"source": "user", "quote": "highest"},
+            },
+        ],
+    }
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(target_quote=question),
+            _tool_response("read_doc", {"path": "/context/data.txt"}, "selector-source"),
+            _tool_response("analyze_plan", plan, "selector-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "selector-todos",
+            ),
+            _answer_response(columns=["ChiNameAbbr"], rows=[["Example Co"]]),
+        ],
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "selector-plan")
+    assert plan_call["ok"] is True
+    assert plan_call["result"]["update"]["analysis_plan"]["output_spec"]["columns"] == [
+        {"name": "ChiNameAbbr", "source_fields": ["ChiNameAbbr"]}
+    ]
+
+
+def test_execution_spec_rejects_unauthorized_operations(public_task: PublicTask) -> None:
+    invalid_plan = _plan_args()
+    invalid_plan["execution_spec"] = {
+        "sources": [{"path": "/context/data.txt"}],
+        "supporting_fields": [],
+        "operations": [
+            {
+                "operation": "aggregate",
+                "description": "Aggregate because the source has many rows.",
+            }
+        ],
+    }
+    valid_plan = _plan_args()
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "unauthorized-execution-source",
+            ),
+            _tool_response(
+                "analyze_plan",
+                invalid_plan,
+                "unauthorized-execution-plan",
+            ),
+            _tool_response("analyze_plan", valid_plan, "authorized-execution-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "authorized-execution-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "unauthorized-execution-plan")
+    _, valid_call = _tool_call(result, "authorized-execution-plan")
+    assert invalid_call["status"] == "error"
+    assert "requires an exact user quote" in invalid_call["result"]["content"]
     assert valid_call["ok"] is True
 
 

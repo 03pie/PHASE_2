@@ -25,6 +25,7 @@ from langchain_core.messages import (
 from langgraph.types import Command
 
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
+from data_agent_baseline.agents.semantic_layer import parse_knowledge_content
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
 
 _SOURCE_DISCOVERY_TOOLS = frozenset(
@@ -60,6 +61,15 @@ _KNOWLEDGE_TRANSFORMATION_RULE_TYPES = {
     "limit": frozenset({"output"}),
     "deduplicate": frozenset({"output"}),
     "reshape": frozenset({"output"}),
+}
+_KNOWLEDGE_FACT_KINDS_BY_OPERATION = {
+    "filter": frozenset({"filter_rule", "example_query"}),
+    "aggregate": frozenset({"calculation", "example_query", "output_rule"}),
+    "derive": frozenset({"calculation", "example_query"}),
+    "sort": frozenset({"ordering_rule", "example_query", "output_rule"}),
+    "limit": frozenset({"ordering_rule", "example_query", "output_rule"}),
+    "deduplicate": frozenset({"output_rule", "example_query"}),
+    "reshape": frozenset({"output_rule", "example_query"}),
 }
 _OPERATION_CONDITION_KEYS = {
     "filter": "filters",
@@ -159,6 +169,8 @@ _ACTION_CLAIM_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 _OUTPUT_COLUMN_REQUIREMENT_TYPES = frozenset(
     {
         "calculation",
+        "entity",
+        "grouping",
         "measure",
         "output_column",
     }
@@ -550,9 +562,11 @@ def _canonical_requirements_from_question_structure(
     if not isinstance(structure, Mapping):
         return None
 
+    question_text = str(
+        structure.get("original_question") or state.get("original_request") or ""
+    )
     requirements: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    seen_quotes: set[str] = set()
 
     def append_requirement(
         *,
@@ -564,13 +578,12 @@ def _canonical_requirements_from_question_structure(
         statement_text = str(statement or "").strip()
         if not quote_text or not requirement_type:
             return
-        if quote_text in seen_quotes:
+        if question_text and quote_text not in question_text:
             return
         key = (quote_text, requirement_type)
         if key in seen:
             return
         seen.add(key)
-        seen_quotes.add(quote_text)
         requirements.append(
             {
                 "statement": statement_text or f"{requirement_type}: {quote_text}",
@@ -649,6 +662,29 @@ def _canonical_requirements_from_question_structure(
                     requirement_type=requirement_type,
                     statement=statement,
                 )
+
+    operator_type_map = {
+        "aggregate": "calculation",
+        "derive": "calculation",
+        "sort": "ordering",
+        "limit": "limit",
+    }
+    for operator in structure.get("intent_operators") or []:
+        if not isinstance(operator, Mapping):
+            continue
+        operation = str(operator.get("operation") or "")
+        requirement_type = operator_type_map.get(operation)
+        append_requirement(
+            quote=operator.get("quote"),
+            requirement_type=requirement_type,
+            statement=f"{operation}: {operator.get('operator_type') or operator.get('quote')}",
+        )
+        if operation == "aggregate" and str(operator.get("operator_type") or "") == "distribution":
+            append_requirement(
+                quote=operator.get("quote"),
+                requirement_type="grouping",
+                statement=f"{operation}: distribution group key",
+            )
 
     return requirements or None
 
@@ -831,47 +867,27 @@ def _canonicalize_plan_quotes(
     if not isinstance(raw_evidence, Mapping):
         return request
     evidence = dict(raw_evidence)
-    knowledge_status = str(evidence.get("knowledge_status") or "")
-    if knowledge_status != "authoritative":
-        context_sources = [
-            item
-            for item in evidence.get("context_sources") or []
-            if not (
-                isinstance(item, Mapping)
-                and str(item.get("path") or "")
-                .replace("\\", "/")
-                .lower()
-                .endswith("/knowledge.md")
-            )
-        ]
-        if context_sources != evidence.get("context_sources"):
-            evidence["context_sources"] = context_sources
-            changed = True
-        else:
-            changed = False
-    else:
-        changed = False
-    if knowledge_status != "authoritative" and evidence.get("knowledge_rules"):
-        evidence["knowledge_rules"] = []
-        changed = True
-    if changed:
-        arguments["evidence"] = evidence
-        return request.override(
-            tool_call={
-                **request.tool_call,
-                "args": arguments,
-            }
-        )
+    changed = False
 
+    knowledge_facts_by_id = {
+        fact.fact_id: fact for fact in parse_knowledge_content(discovery.knowledge_content)
+    }
     normalized_rules: list[Any] = []
     for rule in evidence.get("knowledge_rules") or []:
         if not isinstance(rule, dict):
             normalized_rules.append(rule)
             continue
         normalized_rule = dict(rule)
+        fact_id = str(rule.get("fact_id") or "").strip()
+        if fact_id and not normalized_rule.get("quote"):
+            fact = knowledge_facts_by_id.get(fact_id)
+            if fact is not None:
+                normalized_rule["quote"] = fact.quote
+                normalized_rule["source_path"] = fact.source_path
+                changed = True
         quote = str(rule.get("quote") or "").strip()
         canonical_quote = _canonical_knowledge_quote(
-            quote,
+            str(normalized_rule.get("quote") or quote),
             discovery.knowledge_content,
         )
         if canonical_quote is not None and canonical_quote != quote:
@@ -1077,7 +1093,7 @@ def _detect_action_claim(text: str) -> tuple[str, str] | None:
 def _operation_is_authorized(
     operation: str,
     *,
-    requirement_types_by_quote: Mapping[str, str],
+    requirement_types_by_quote: Mapping[str, set[str]],
     rule_quotes_by_type: Mapping[str, set[str]],
     declared_operations: set[str],
 ) -> bool:
@@ -1085,7 +1101,11 @@ def _operation_is_authorized(
         return True
 
     user_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(operation, frozenset())
-    if any(requirement_type in user_types for requirement_type in requirement_types_by_quote.values()):
+    if any(
+        requirement_type in user_types
+        for requirement_types in requirement_types_by_quote.values()
+        for requirement_type in requirement_types
+    ):
         return True
 
     rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(operation, frozenset())
@@ -1099,7 +1119,7 @@ def _authorization_facts(
     json_path: str,
     offending_text: str,
     original_request: str,
-    requirement_types_by_quote: Mapping[str, str],
+    requirement_types_by_quote: Mapping[str, set[str]],
     rule_quotes_by_type: Mapping[str, set[str]],
     declared_operations: set[str],
     question_conditions: Mapping[str, list[Any]] | None,
@@ -1118,7 +1138,7 @@ def _authorization_facts(
         ),
         (
             "Observed user requirement types are "
-            f"{sorted(set(requirement_types_by_quote.values()))}; "
+            f"{sorted({item for values in requirement_types_by_quote.values() for item in values})}; "
             f"{operation!r} requires one of {sorted(user_types)}."
         ),
         (
@@ -1183,7 +1203,7 @@ def _intent_reconsideration_payload(
     json_path: str,
     offending_text: str,
     original_request: str,
-    requirement_types_by_quote: Mapping[str, str],
+    requirement_types_by_quote: Mapping[str, set[str]],
     question_conditions: Mapping[str, list[Any]] | None,
 ) -> dict[str, Any]:
     condition_key = _OPERATION_CONDITION_KEYS.get(operation)
@@ -1206,7 +1226,8 @@ def _intent_reconsideration_payload(
             "original_request": original_request,
             "requirement_quotes": [
                 {"quote": quote, "requirement_type": requirement_type}
-                for quote, requirement_type in requirement_types_by_quote.items()
+                for quote, requirement_types in requirement_types_by_quote.items()
+                for requirement_type in sorted(requirement_types)
             ],
         },
         "fact_based_questions": [
@@ -1251,7 +1272,7 @@ def _validate_free_text_action_claims(
     request: ToolCallRequest,
     *,
     arguments: Mapping[str, Any],
-    requirement_types_by_quote: Mapping[str, str],
+    requirement_types_by_quote: Mapping[str, set[str]],
     rule_quotes_by_type: Mapping[str, set[str]],
     declared_operations: set[str],
     question_conditions: Mapping[str, list[Any]] | None,
@@ -1347,6 +1368,9 @@ def _quoted_requirement_support(state: Mapping[str, Any]) -> set[tuple[str, str]
     if not isinstance(structure, Mapping):
         return None
 
+    question_text = str(
+        structure.get("original_question") or state.get("original_request") or ""
+    )
     supported: set[tuple[str, str]] = set()
 
     target_type_map = {
@@ -1359,7 +1383,7 @@ def _quoted_requirement_support(state: Mapping[str, Any]) -> set[tuple[str, str]
             continue
         quote = str(target.get("quote") or "").strip()
         requirement_type = target_type_map.get(str(target.get("target_type") or ""))
-        if quote and requirement_type:
+        if quote and requirement_type and (not question_text or quote in question_text):
             supported.add((quote, requirement_type))
 
     constraint_type_map = {
@@ -1380,7 +1404,7 @@ def _quoted_requirement_support(state: Mapping[str, Any]) -> set[tuple[str, str]
         requirement_type = constraint_type_map.get(
             str(constraint.get("constraint_type") or "")
         )
-        if quote and requirement_type:
+        if quote and requirement_type and (not question_text or quote in question_text):
             supported.add((quote, requirement_type))
 
     condition_type_map = {
@@ -1401,8 +1425,30 @@ def _quoted_requirement_support(state: Mapping[str, Any]) -> set[tuple[str, str]
                     if isinstance(item, Mapping)
                     else str(item or "").strip()
                 )
-                if quote:
+                if quote and (not question_text or quote in question_text):
                     supported.add((quote, requirement_type))
+
+    operator_type_map = {
+        "aggregate": "calculation",
+        "derive": "calculation",
+        "sort": "ordering",
+        "limit": "limit",
+    }
+    for operator in structure.get("intent_operators") or []:
+        if not isinstance(operator, Mapping):
+            continue
+        quote = str(operator.get("quote") or "").strip()
+        operation = str(operator.get("operation") or "")
+        requirement_type = operator_type_map.get(operation)
+        if quote and requirement_type and (not question_text or quote in question_text):
+            supported.add((quote, requirement_type))
+        if (
+            quote
+            and operation == "aggregate"
+            and str(operator.get("operator_type") or "") == "distribution"
+            and (not question_text or quote in question_text)
+        ):
+            supported.add((quote, "grouping"))
 
     return supported
 
@@ -1466,13 +1512,14 @@ def _validate_plan_contract(
     if not isinstance(intent, Mapping):
         return _plan_error(request, "intent must be a JSON object.")
     requirements = intent.get("requirements") or []
-    requirement_types_by_quote = {
-        str(item.get("quote") or "").strip(): str(
-            item.get("requirement_type") or ""
-        )
-        for item in requirements
-        if isinstance(item, dict)
-    }
+    requirement_types_by_quote: dict[str, set[str]] = {}
+    for item in requirements:
+        if not isinstance(item, dict):
+            continue
+        quote = str(item.get("quote") or "").strip()
+        requirement_type = str(item.get("requirement_type") or "").strip()
+        if quote and requirement_type:
+            requirement_types_by_quote.setdefault(quote, set()).add(requirement_type)
     if not requirement_types_by_quote or any(
         not quote or quote not in original_request
         for quote in requirement_types_by_quote
@@ -1492,6 +1539,8 @@ def _validate_plan_contract(
         if isinstance(item, dict) and str(item.get("path") or "").strip()
     }
     unobserved_sources = requested_sources - discovery.context_sources
+    if discovery.knowledge_present:
+        unobserved_sources.discard("/context/knowledge.md")
     if unobserved_sources:
         return _plan_error(
             request,
@@ -1508,6 +1557,8 @@ def _validate_plan_contract(
             "knowledge cannot be authoritative because knowledge.md was unavailable.",
         )
 
+    knowledge_facts = parse_knowledge_content(discovery.knowledge_content)
+    knowledge_facts_by_id = {fact.fact_id: fact for fact in knowledge_facts}
     knowledge_rules = evidence.get("knowledge_rules") or []
     rule_quotes_by_type: dict[str, set[str]] = {}
     for rule in knowledge_rules:
@@ -1516,6 +1567,24 @@ def _validate_plan_contract(
         source_path = str(rule.get("source_path") or "").replace("\\", "/")
         quote = str(rule.get("quote") or "").strip()
         rule_type = str(rule.get("rule_type") or "")
+        fact_id = str(rule.get("fact_id") or "").strip()
+        if fact_id:
+            fact = knowledge_facts_by_id.get(fact_id)
+            if fact is None:
+                return _plan_error(
+                    request,
+                    f"knowledge rule cites unknown KnowledgeFact.fact_id {fact_id!r}.",
+                )
+            if source_path and source_path.lower() != fact.source_path.lower():
+                return _plan_error(
+                    request,
+                    (
+                        f"knowledge rule fact_id {fact_id!r} must use source_path "
+                        f"{fact.source_path!r}."
+                    ),
+                )
+            quote = quote or fact.quote
+            source_path = fact.source_path
         if (
             source_path.lower() != "/context/knowledge.md"
             or not quote
@@ -1538,49 +1607,58 @@ def _validate_plan_contract(
         return _plan_error(request, "output_spec.columns must be a list.")
     transformations = output_spec.get("transformations") or []
     row_policy = str(output_spec.get("row_policy") or "")
-    preserve_source_rows = (
-        not transformations
-        and row_policy == "preserve"
-        and output_spec.get("ordering") == "source"
-        and output_spec.get("null_policy") == "preserve"
-        and not output_spec.get("sort_keys")
-    )
-    question_context_capacity = _question_structure_context_capacity(request.state)
-    context_column_counts = {role: 0 for role in _CONTEXT_COLUMN_ROLES}
-    target_output_columns = []
-    for column in output_columns:
-        role = _column_role(column)
-        if (
-            preserve_source_rows
-            and question_context_capacity is not None
-            and role in _CONTEXT_COLUMN_ROLES
-        ):
-            context_column_counts[role] += 1
-            continue
-        target_output_columns.append(column)
-    if question_context_capacity is not None:
-        for role, count in context_column_counts.items():
-            if count > question_context_capacity.get(role, 0):
+    execution_spec = arguments.get("execution_spec") or {}
+    if execution_spec and not isinstance(execution_spec, Mapping):
+        return _plan_error(request, "execution_spec must be an object when provided.")
+    target_output_columns = output_columns
+    if isinstance(execution_spec, Mapping):
+        output_field_names = {
+            str(column.get("name") or "").casefold()
+            for column in target_output_columns
+            if isinstance(column, Mapping)
+        }
+        for column in target_output_columns:
+            if isinstance(column, Mapping):
+                output_field_names.update(
+                    str(field or "").casefold()
+                    for field in column.get("source_fields") or []
+                    if str(field or "").strip()
+                )
+        for field in execution_spec.get("supporting_fields") or []:
+            if not isinstance(field, Mapping):
+                continue
+            supporting_names = {
+                str(field.get("name") or "").casefold(),
+                *(
+                    str(item or "").casefold()
+                    for item in field.get("source_fields") or []
+                    if str(item or "").strip()
+                ),
+            }
+            overlap = sorted(output_field_names & {name for name in supporting_names if name})
+            if overlap:
                 return _plan_error(
                     request,
                     (
-                        f"too many {role} context columns for the isolated "
-                        "question structure."
+                        "selector/filter/join/context fields declared in "
+                        "execution_spec.supporting_fields must not also appear in "
+                        f"final output_spec.columns: {overlap}."
                     ),
                 )
     output_column_capacity = sum(
         1
-        for requirement_type in requirement_types_by_quote.values()
+        for requirement_types in requirement_types_by_quote.values()
+        for requirement_type in requirement_types
         if requirement_type in _OUTPUT_COLUMN_REQUIREMENT_TYPES
     )
-    if len(target_output_columns) > output_column_capacity:
+    if output_column_capacity > 0 and len(target_output_columns) > output_column_capacity:
         return _plan_error(
             request,
             (
-                "each output column must be backed by a distinct measure, "
-                "calculation, or explicit output_column requirement; got "
-                f"{len(target_output_columns)} non-context columns but "
-                f"{output_column_capacity} output-bearing requirements."
+                "output_spec.columns is final answer only. Move selector, "
+                "filter, join, or context fields to execution_spec.supporting_fields; "
+                f"got {len(target_output_columns)} final columns but "
+                f"{output_column_capacity} answer-bearing requirement(s)."
             ),
         )
     if output_column_capacity > 0 and not target_output_columns:
@@ -1589,21 +1667,6 @@ def _validate_plan_contract(
             "at least one non-context output column must satisfy the requested target.",
         )
     question_conditions = _question_structure_conditions(request.state)
-    question_target_count = _question_structure_target_count(request.state)
-    if question_conditions is not None and question_target_count is not None:
-        explicit_output_columns = len(question_conditions.get("output_columns", []))
-        question_output_capacity = question_target_count + explicit_output_columns
-        if len(target_output_columns) > question_output_capacity:
-            return _plan_error(
-                request,
-                (
-                    "output_spec.columns exceeds the isolated question structure: "
-                    f"{len(target_output_columns)} non-context columns requested by "
-                    "the plan, but the question structure supports "
-                    f"{question_target_count} target column(s) plus "
-                    f"{explicit_output_columns} explicit output column(s)."
-                ),
-            )
     if transformations and row_policy != "transform":
         return _plan_error(
             request,
@@ -1631,6 +1694,60 @@ def _validate_plan_contract(
                 "preserve plans cannot define sort keys.",
             )
 
+    supported_requirements = _quoted_requirement_support(request.state)
+
+    def user_authorization_error(operation: str, quote: str) -> str | None:
+        requirement_types = requirement_types_by_quote.get(quote, set())
+        allowed_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(
+            operation, frozenset()
+        )
+        if not (requirement_types & allowed_types):
+            return (
+                f"user authorization for {operation!r} must cite an explicit "
+                f"requirement typed as one of {sorted(allowed_types)}."
+            )
+        if supported_requirements is not None and not any(
+            (quote, requirement_type) in supported_requirements
+            for requirement_type in requirement_types & allowed_types
+        ):
+            return (
+                f"user authorization for {operation!r} must be supported "
+                "by the isolated question structure with the same quote "
+                "and requirement type."
+            )
+        return None
+
+    def knowledge_authorization_error(operation: str, quote: str) -> str | None:
+        allowed_rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(
+            operation, frozenset()
+        )
+        authorized_quotes = set().union(
+            *(
+                rule_quotes_by_type.get(rule_type, set())
+                for rule_type in allowed_rule_types
+            )
+        )
+        if quote not in authorized_quotes:
+            return (
+                f"knowledge authorization for {operation!r} must cite an "
+                f"observed rule typed as one of {sorted(allowed_rule_types)}."
+            )
+        return None
+
+    def fact_authorizes_operation(operation: str, fact_id: str) -> bool:
+        fact = knowledge_facts_by_id.get(fact_id)
+        if fact is None:
+            return False
+        allowed_kinds = _KNOWLEDGE_FACT_KINDS_BY_OPERATION.get(
+            operation, frozenset()
+        )
+        fact_operations = {
+            item.strip()
+            for item in str(fact.operation or "").split(",")
+            if item.strip()
+        }
+        return fact.kind in allowed_kinds or operation in fact_operations
+
     for transformation in transformations:
         if not isinstance(transformation, dict):
             return _plan_error(request, "transformations must be structured objects.")
@@ -1641,61 +1758,72 @@ def _validate_plan_contract(
         source = str(authorization.get("source") or "")
         quote = str(authorization.get("quote") or "").strip()
         if source == "user":
-            requirement_type = requirement_types_by_quote.get(quote)
-            allowed_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(
-                operation, frozenset()
-            )
-            if requirement_type not in allowed_types:
-                return _plan_error(
-                    request,
-                    (
-                        f"user authorization for {operation!r} must cite an explicit "
-                        f"requirement typed as one of {sorted(allowed_types)}."
-                    ),
-                )
-            supported_requirements = _quoted_requirement_support(request.state)
-            if (
-                supported_requirements is not None
-                and (quote, requirement_type) not in supported_requirements
-            ):
-                return _plan_error(
-                    request,
-                    (
-                        f"user authorization for {operation!r} must be supported "
-                        "by the isolated question structure with the same quote "
-                        "and requirement type."
-                    ),
-                )
+            if error_message := user_authorization_error(operation, quote):
+                return _plan_error(request, error_message)
         if source == "knowledge":
-            allowed_rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(
-                operation, frozenset()
-            )
-            authorized_quotes = set().union(
-                *(
-                    rule_quotes_by_type.get(rule_type, set())
-                    for rule_type in allowed_rule_types
-                )
-            )
-            if quote not in authorized_quotes:
-                return _plan_error(
-                    request,
-                    (
-                        f"knowledge authorization for {operation!r} must cite an "
-                        f"observed rule typed as one of {sorted(allowed_rule_types)}."
-                    ),
-                )
+            if error_message := knowledge_authorization_error(operation, quote):
+                return _plan_error(request, error_message)
         if source not in {"user", "knowledge"}:
             return _plan_error(
                 request,
                 "context evidence cannot authorize a transformation.",
             )
 
+    execution_operations: set[str] = set()
+    if isinstance(execution_spec, Mapping):
+        for index, operation_item in enumerate(execution_spec.get("operations") or []):
+            if not isinstance(operation_item, Mapping):
+                return _plan_error(
+                    request,
+                    f"execution_spec.operations[{index}] must be an object.",
+                )
+            operation = str(operation_item.get("operation") or "")
+            if not operation:
+                return _plan_error(
+                    request,
+                    f"execution_spec.operations[{index}].operation is required.",
+                )
+            authorized = False
+            authorization = operation_item.get("authorization")
+            if isinstance(authorization, Mapping):
+                source = str(authorization.get("source") or "")
+                quote = str(authorization.get("quote") or "").strip()
+                if source == "user":
+                    authorized = user_authorization_error(operation, quote) is None
+                elif source == "knowledge":
+                    authorized = knowledge_authorization_error(operation, quote) is None
+                elif source:
+                    return _plan_error(
+                        request,
+                        "context evidence cannot authorize an execution operation.",
+                    )
+            fact_ids = [
+                str(item).strip()
+                for item in operation_item.get("authorization_fact_ids") or []
+                if str(item).strip()
+            ]
+            if not authorized and fact_ids:
+                authorized = any(
+                    fact_authorizes_operation(operation, fact_id)
+                    for fact_id in fact_ids
+                )
+            if not authorized:
+                return _plan_error(
+                    request,
+                    (
+                        f"execution_spec.operations[{index}] for {operation!r} "
+                        "requires an exact user quote, an observed knowledge rule, "
+                        "or a valid KnowledgeFact.fact_id."
+                    ),
+                )
+            execution_operations.add(operation)
+
     declared_operations = {
         str(transformation.get("operation") or "")
         for transformation in transformations
         if isinstance(transformation, Mapping)
         and str(transformation.get("operation") or "")
-    }
+    } | execution_operations
     free_text_error = _validate_free_text_action_claims(
         request,
         arguments=arguments,
