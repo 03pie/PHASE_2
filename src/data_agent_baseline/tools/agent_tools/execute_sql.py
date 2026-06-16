@@ -7,6 +7,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     DB_SUFFIXES,
     empty_result_hint,
@@ -18,20 +19,19 @@ from data_agent_baseline.tools._helpers import (
     virtual_path,
 )
 
-
 def create_execute_sql_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create a read-only SQLite query tool."""
 
     context_root = (workspace / "context").resolve()
 
-    @tool("execute_sql")
+    @tool("execute_sql", description=load_tool_prompt("execute_sql"))
     def execute_sql(
         path: str,
         sql: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         max_rows: int = 100,
     ) -> Any:
-        """Execute a read-only SQL query against a SQLite database."""
+        """Run the execute_sql tool."""
 
         if max_rows < 1:
             return error(

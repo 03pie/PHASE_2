@@ -8,9 +8,10 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
+from data_agent_baseline.prompts.loader import load_tool_prompt
 
 KnowledgeStatus = Literal[
     "authoritative",
@@ -33,6 +34,14 @@ RequirementType = Literal[
     "reshape",
 ]
 KnowledgeRuleType = Literal["semantic", "filter", "calculation", "output"]
+OutputColumnRole = Literal[
+    "measure",
+    "calculation",
+    "output_column",
+    "record_key",
+    "entity_key",
+    "time_key",
+]
 TransformationOperation = Literal[
     "filter",
     "aggregate",
@@ -58,6 +67,7 @@ class IntentSpec(TypedDict):
 class OutputColumn(TypedDict):
     name: str
     source_fields: list[str]
+    role: NotRequired[OutputColumnRole]
 
 
 class TransformationAuthorization(TypedDict):
@@ -130,7 +140,7 @@ def _clean_texts(items: list[str]) -> list[str]:
     return [text for item in items if (text := _clean_text(item))]
 
 
-@tool("analyze_plan")
+@tool("analyze_plan", description=load_tool_prompt("analyze_plan"))
 def analyze_plan_tool(
     intent: IntentSpec,
     output_spec: OutputSpec,
@@ -142,7 +152,19 @@ def analyze_plan_tool(
     schema_version: Literal["1.0"] = "1.0",
     delegation_candidates: list[str] | None = None,
 ) -> Command[BenchmarkDeepAgentState] | ToolMessage:
-    """Create or revise a traceable plan after inspecting knowledge and task data."""
+    """Create or revise a traceable plan after inspecting knowledge and task data.
+
+    In preserve mode, columns may include minimal source-row context keys such as
+    dates, periods, locations, or row IDs. Mark these as record_key, entity_key,
+    or time_key when they explain the preserved source row rather than adding an
+    analytical output target. The role is descriptive and must be supported by
+    the isolated question structure; it does not make arbitrary helper columns
+    valid.
+
+    When knowledge is not authoritative, unavailable, or insufficient, pass an
+    empty knowledge_rules list and document the issue plus the evidence-based
+    inference in the corresponding evidence fields.
+    """
 
     requirements = [
         {
@@ -164,6 +186,11 @@ def analyze_plan_tool(
         {
             "name": _clean_text(item["name"]),
             "source_fields": _clean_texts(item["source_fields"]),
+            **(
+                {"role": item["role"]}
+                if "role" in item and _clean_text(item["role"])
+                else {}
+            ),
         }
         for item in output_spec["columns"]
     ]
@@ -255,14 +282,6 @@ def analyze_plan_tool(
         if not knowledge_issue:
             return _error(
                 "Non-authoritative knowledge requires an explicit knowledge_issue.",
-                tool_call_id,
-            )
-        if len({item["path"] for item in context_sources}) < 2:
-            return _error(
-                (
-                    "Non-authoritative knowledge requires at least two distinct "
-                    "context sources for cross-validation."
-                ),
                 tool_call_id,
             )
         if not cross_validated_inference:

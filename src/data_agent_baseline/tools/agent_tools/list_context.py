@@ -7,6 +7,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     classify_file_role,
     format_size,
@@ -14,18 +15,17 @@ from data_agent_baseline.tools._helpers import (
     virtual_path,
 )
 
-
 def create_list_context_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create a context inventory tool with EVE-style file role hints."""
 
     context_root = (workspace / "context").resolve()
 
-    @tool("list_context")
+    @tool("list_context", description=load_tool_prompt("list_context"))
     def list_context(
         tool_call_id: Annotated[str, InjectedToolCallId],
         max_files: int = 200,
     ) -> Any:
-        """List context files with size and role hints."""
+        """Run the list_context tool."""
 
         entries: list[dict[str, Any]] = []
         for path in sorted(context_root.rglob("*")):

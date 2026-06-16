@@ -10,6 +10,7 @@ from langgraph.types import Command
 from typing_extensions import TypedDict
 
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
+from data_agent_baseline.prompts.loader import load_tool_prompt
 
 ContractIntentMode = Literal["lookup_records", "transform_records"]
 ContractOperation = Literal[
@@ -79,13 +80,16 @@ def _dedupe_texts(values: list[str]) -> list[str]:
     return deduped
 
 
-@tool("establish_plan_contract")
+@tool(
+    "establish_plan_contract",
+    description=load_tool_prompt("establish_plan_contract"),
+)
 def establish_plan_contract_tool(
     contract: PlanContract,
     original_request: Annotated[str, InjectedState("original_request")],
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command[BenchmarkDeepAgentState] | ToolMessage:
-    """Establish the binding plan contract before analyze_plan is available."""
+    """Run the establish_plan_contract tool."""
 
     contract_id = _clean_text(contract["contract_id"])
     if not contract_id:

@@ -166,6 +166,21 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
     output["row_grain_hint"] = str(output.get("row_grain_hint") or "unspecified")
     output["requested_columns"] = _list_value(output.get("requested_columns"))
     output["preserve_source_rows"] = str(output.get("preserve_source_rows") or "unknown")
+    if output["row_grain_hint"] not in {
+        "source_records",
+        "aggregated_records",
+        "unspecified",
+    }:
+        output["row_grain_hint"] = "unspecified"
+    if output["preserve_source_rows"] not in {"true", "false", "unknown"}:
+        output["preserve_source_rows"] = "unknown"
+    if (
+        output["row_grain_hint"] == "aggregated_records"
+        and not conditions["calculations"]
+        and not conditions["groupings"]
+    ):
+        output["row_grain_hint"] = "source_records"
+        output["preserve_source_rows"] = "true"
     return normalized
 
 

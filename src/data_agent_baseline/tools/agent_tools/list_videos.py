@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import VIDEO_SUFFIXES, format_size, success, virtual_path
 
 
@@ -14,11 +15,11 @@ def create_list_videos_tool(workspace: Path, config: DeepAgentConfig) -> BaseToo
 
     context_root = (workspace / "context").resolve()
 
-    @tool("list_videos")
+    @tool("list_videos", description=load_tool_prompt("list_videos"))
     def list_videos(
         tool_call_id: Annotated[str, InjectedToolCallId],
     ) -> Any:
-        """List video files in context with basic metadata."""
+        """Run the list_videos tool."""
 
         videos: list[dict[str, Any]] = []
         for path in sorted(context_root.rglob("*")):

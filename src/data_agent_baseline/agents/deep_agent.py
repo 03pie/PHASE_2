@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from deepagents import create_deep_agent
+from deepagents import HarnessProfile, create_deep_agent, register_harness_profile
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -20,9 +21,10 @@ from data_agent_baseline.agents.deep_state import (
 from data_agent_baseline.agents.filesystem import Utf8FilesystemBackend
 from data_agent_baseline.agents.middleware import (
     AnswerMiddleware,
-    HideUnavailableToolsMiddleware,
+    CustomSystemPromptMiddleware,
+    DISABLED_BUILTIN_TOOLS,
+    DisabledToolGuardMiddleware,
     PlanningMiddleware,
-    TextOnlyReadFileMiddleware,
     workspace_permissions,
 )
 from data_agent_baseline.agents.question_structure import (
@@ -44,14 +46,30 @@ from data_agent_baseline.prompts.loader import (
     load_main_agent_prompt,
     load_subagent_prompt,
 )
-from data_agent_baseline.tools.execute_sql import create_execute_sql_tool
-from data_agent_baseline.tools.execute_python import create_execute_python_tool
-from data_agent_baseline.tools.grep_file import create_grep_file_tool
-from data_agent_baseline.tools.inspect_sqlite import create_inspect_sqlite_tool
-from data_agent_baseline.tools.query_schema import create_query_schema_tool
-from data_agent_baseline.tools.read_csv import create_read_csv_tool
-from data_agent_baseline.tools.read_doc import create_read_doc_tool
-from data_agent_baseline.tools.read_json import create_read_json_tool
+from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
+from data_agent_baseline.tools.agent_tools.execute_sql import create_execute_sql_tool
+from data_agent_baseline.tools.agent_tools.execute_python import (
+    create_execute_python_tool,
+)
+from data_agent_baseline.tools.agent_tools.grep_file import create_grep_file_tool
+from data_agent_baseline.tools.agent_tools.inspect_sqlite import (
+    create_inspect_sqlite_tool,
+)
+from data_agent_baseline.tools.agent_tools.query_schema import create_query_schema_tool
+from data_agent_baseline.tools.agent_tools.read_csv import create_read_csv_tool
+from data_agent_baseline.tools.agent_tools.read_doc import create_read_doc_tool
+from data_agent_baseline.tools.agent_tools.read_json import create_read_json_tool
+from data_agent_baseline.tools.agent_tools.task import (
+    format_task_prompt_entry,
+    task_tool_description_overrides,
+)
+from data_agent_baseline.tools.agent_tools.write_todos import (
+    WRITE_TODOS_EXCLUDED_MIDDLEWARE,
+    build_write_todos_middleware,
+    create_write_todos_tools,
+)
+
+_TOOL_DESCRIPTION_LIMIT = 260
 
 
 def _normalize_answer(value: Any) -> AnswerTable | None:
@@ -93,6 +111,117 @@ def _partial_run_result(
     )
 
 
+def _model_provider(model: BaseChatModel) -> str | None:
+    try:
+        params = model._get_ls_params()
+    except (AttributeError, TypeError, NotImplementedError):
+        return None
+    provider = params.get("ls_provider")
+    return provider if isinstance(provider, str) and provider else None
+
+
+def _register_benchmark_harness_profile(model: BaseChatModel) -> None:
+    provider = _model_provider(model)
+    if provider is None:
+        return
+    register_harness_profile(
+        provider,
+        HarnessProfile(
+            base_system_prompt="",
+            tool_description_overrides=task_tool_description_overrides(),
+            excluded_tools=DISABLED_BUILTIN_TOOLS,
+            excluded_middleware=WRITE_TODOS_EXCLUDED_MIDDLEWARE,
+            extra_middleware=build_write_todos_middleware,
+        ),
+    )
+
+
+def _compact_text(value: Any, *, limit: int = _TOOL_DESCRIPTION_LIMIT) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3].rstrip()}..."
+
+
+def _tool_name(tool: Any) -> str:
+    if isinstance(tool, Mapping):
+        return str(tool.get("name") or tool.get("function", {}).get("name") or "")
+    return str(getattr(tool, "name", ""))
+
+
+def _tool_description(tool: Any) -> str:
+    if isinstance(tool, Mapping):
+        function = tool.get("function") if isinstance(tool.get("function"), Mapping) else {}
+        return str(tool.get("description") or function.get("description") or "")
+    return str(getattr(tool, "description", "") or "")
+
+
+def _tool_argument_names(tool: Any) -> list[str]:
+    args = getattr(tool, "args", None)
+    if isinstance(args, Mapping):
+        return [str(name) for name in args if not str(name).startswith("_")]
+    if isinstance(tool, Mapping):
+        function = tool.get("function") if isinstance(tool.get("function"), Mapping) else {}
+        parameters = function.get("parameters")
+        if isinstance(parameters, Mapping):
+            properties = parameters.get("properties")
+            if isinstance(properties, Mapping):
+                return [str(name) for name in properties]
+    return []
+
+
+def _format_tool_entry(tool: Any) -> str | None:
+    name = _tool_name(tool)
+    if not name:
+        return None
+    args = _tool_argument_names(tool)
+    signature = f"`{name}`({', '.join(args)})" if args else f"`{name}`"
+    description = _compact_text(_tool_description(tool)) or "Use according to its tool schema."
+    return f"- {signature}: {description}"
+
+
+def _format_tool_entries(tools: Sequence[Any]) -> list[str]:
+    entries: list[str] = []
+    seen: set[str] = set()
+    for tool in tools:
+        name = _tool_name(tool)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        entry = _format_tool_entry(tool)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _build_tool_descriptions(
+    *,
+    tools: Sequence[Any],
+    include_plan_tools: bool,
+    include_todo_tool: bool,
+    subagents: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    dynamic_tools: list[Any] = list(tools)
+    if include_plan_tools:
+        dynamic_tools.append(analyze_plan_tool)
+    if include_todo_tool:
+        dynamic_tools.extend(create_write_todos_tools())
+
+    entries = _format_tool_entries(dynamic_tools)
+    task_entry = format_task_prompt_entry(subagents)
+    if task_entry is not None:
+        entries.append(task_entry)
+
+    return "\n".join(entries)
+
+
+def _inject_tool_descriptions(prompt: str, tool_descriptions: str) -> str:
+    placeholder = "{tool_descriptions}"
+    if placeholder in prompt:
+        return prompt.replace(placeholder, tool_descriptions.strip())
+    return f"{prompt.strip()}\n\n## 可用工具\n\n{tool_descriptions.strip()}"
+
+
 class DeepAgent:
     """负责组装 DeepAgents 图，并在隔离工作区内执行单个基准任务。"""
 
@@ -112,6 +241,7 @@ class DeepAgent:
         workspace: Path,
         collector: TraceEventCollector,
     ) -> Any:
+        _register_benchmark_harness_profile(self.model)
         backend = Utf8FilesystemBackend(
             root_dir=workspace,
             virtual_mode=True,
@@ -127,34 +257,55 @@ class DeepAgent:
             create_query_schema_tool(workspace, self.config),
         ]
         rate_limiter = ModelCallRateLimiter(self.config.model_call_interval_seconds)
+        execution_tools = [*data_tools, execute_python_tool]
+        subagent_description = (
+            "Handle a focused, complex data-analysis or verification subtask. "
+            "Returns findings with source files, calculation rules, assumptions, "
+            "and unresolved issues; it cannot submit the final answer."
+        )
+        subagent_prompt = _inject_tool_descriptions(
+            load_subagent_prompt(),
+            _build_tool_descriptions(
+                tools=execution_tools,
+                include_plan_tools=False,
+                include_todo_tool=True,
+            ),
+        )
+        subagents: list[dict[str, Any]] = [
+            {
+                "name": "general-purpose",
+                "description": subagent_description,
+                "system_prompt": subagent_prompt,
+                "tools": execution_tools,
+                "middleware": [
+                    CustomSystemPromptMiddleware(subagent_prompt),
+                    DisabledToolGuardMiddleware(),
+                    LlmTraceMiddleware(
+                        collector,
+                        scope="subagent:general-purpose",
+                        rate_limiter=rate_limiter,
+                    ),
+                ],
+            }
+        ]
+        main_prompt = _inject_tool_descriptions(
+            self.system_prompt,
+            _build_tool_descriptions(
+                tools=execution_tools,
+                include_plan_tools=True,
+                include_todo_tool=True,
+                subagents=subagents,
+            ),
+        )
         return create_deep_agent(
             model=self.model,
-            tools=[*data_tools, execute_python_tool],
-            system_prompt=self.system_prompt,
+            tools=execution_tools,
+            system_prompt=None,
             backend=backend,
             permissions=workspace_permissions(),
-            subagents=[
-                {
-                    "name": "general-purpose",
-                    "description": (
-                        "Handle a focused, complex data-analysis or verification subtask. "
-                        "Returns findings with source files, calculation rules, assumptions, "
-                        "and unresolved issues; it cannot submit the final answer."
-                    ),
-                    "system_prompt": load_subagent_prompt(),
-                    "tools": [*data_tools, execute_python_tool],
-                    "middleware": [
-                        HideUnavailableToolsMiddleware(),
-                        LlmTraceMiddleware(
-                            collector,
-                            scope="subagent:general-purpose",
-                            rate_limiter=rate_limiter,
-                        ),
-                        TextOnlyReadFileMiddleware(),
-                    ],
-                }
-            ],
+            subagents=subagents,
             middleware=[
+                CustomSystemPromptMiddleware(main_prompt),
                 LlmTraceMiddleware(
                     collector,
                     scope="main",
@@ -162,12 +313,11 @@ class DeepAgent:
                 ),
                 PlanningMiddleware(),
                 AnswerMiddleware(),
-                HideUnavailableToolsMiddleware(),
+                DisabledToolGuardMiddleware(),
                 ModelCallLimitMiddleware(
                     run_limit=self.config.max_steps,
                     exit_behavior="end",
                 ),
-                TextOnlyReadFileMiddleware(),
             ],
             state_schema=BenchmarkDeepAgentState,
             name="dabench_deep_agent",

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from difflib import SequenceMatcher
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import Any
 
 from deepagents.middleware.filesystem import FilesystemPermission
@@ -15,11 +15,17 @@ from langchain.agents.middleware.types import (
     ToolCallRequest,
     hook_config,
 )
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.types import Command
 
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
-from data_agent_baseline.tools.analyze_plan import analyze_plan_tool
+from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
 
 _SOURCE_DISCOVERY_TOOLS = frozenset(
     {
@@ -55,6 +61,101 @@ _KNOWLEDGE_TRANSFORMATION_RULE_TYPES = {
     "deduplicate": frozenset({"output"}),
     "reshape": frozenset({"output"}),
 }
+_OPERATION_CONDITION_KEYS = {
+    "filter": "filters",
+    "aggregate": "calculations",
+    "derive": "calculations",
+    "sort": "orderings",
+    "limit": "limits",
+    "deduplicate": "deduplications",
+    "reshape": "reshapes",
+}
+_ACTION_CLAIM_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "filter": (
+        re.compile(
+            r"\b(?:can|could|would|should|will|need\s+to|i\s+will|i\s+should)\s+"
+            r"select\s+(?:representative|matching|only|national|source\s+)?"
+            r"(?:rows?|records?)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bselect\s+(?:representative|matching|only|national|source\s+)"
+            r"(?:rows?|records?)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:filter|select|keep|retain|return)\s+(?:only\s+)?"
+            r"(?:the\s+)?(?:rows?|records?|source\s+rows?)?\s*"
+            r"(?:where|with|matching|for)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\breturn\s+only\s+(?:the\s+)?(?:rows?|records?)\b", re.IGNORECASE),
+        re.compile(r"(?:筛选|过滤|只保留|仅保留|只返回|仅返回).{0,40}(?:记录|行|数据)"),
+    ),
+    "aggregate": (
+        re.compile(
+            r"\b(?:can|could|would|should|will|need\s+to|i\s+will|i\s+should)\s+"
+            r"(?:aggregate|sum|total|roll\s*up)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:calculate|compute|derive|produce|create|return|report)\s+"
+            r"(?:the\s+)?(?:sum|total|aggregate)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:calculate|compute)\s+(?:the\s+)?sum\s+"
+            r"(?:across|of|from|over)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:sum|aggregate|total|roll\s*up)\s+(?:all\s+)?"
+            r"(?:source\s+)?(?:rows|records|values|provinces|provincial)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\bgroup\s+by\b", re.IGNORECASE),
+        re.compile(r"(?:计算|求取|求和|汇总|加总|合计|聚合).{0,40}(?:记录|行|值|省|地区|全国|总量)"),
+    ),
+    "derive": (
+        re.compile(
+            r"\b(?:calculate|compute|derive|create|produce)\s+"
+            r"(?:(?:a|an|the)\s+)?(?:ratio|rate|share|percentage|growth|"
+            r"difference|delta|change|index|indicator|derived)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:派生|计算|生成).{0,40}(?:比例|占比|率|增速|增长|差值|变化|指标|新列)"),
+    ),
+    "sort": (
+        re.compile(
+            r"\b(?:sort|order|rank)\s+(?:the\s+)?"
+            r"(?:rows|records|values|data|result|results)?\s*"
+            r"(?:by|ascending|descending|from)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\border\s+by\b", re.IGNORECASE),
+        re.compile(r"(?:排序|按.{1,40}排序|降序|升序|排名)"),
+    ),
+    "limit": (
+        re.compile(
+            r"\b(?:limit|keep|return|select|take)\s+(?:the\s+)?"
+            r"(?:top|bottom|first|last|latest|earliest)\s+\d+\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:top|bottom)\s+\d+\b", re.IGNORECASE),
+        re.compile(r"(?:前|后|最新|最早)\s*\d+\s*(?:条|个|行|年)"),
+    ),
+    "deduplicate": (
+        re.compile(r"\b(?:deduplicate|de-duplicate|remove\s+duplicates|distinct)\b", re.IGNORECASE),
+        re.compile(r"(?:去重|删除重复|唯一值)"),
+    ),
+    "reshape": (
+        re.compile(
+            r"\b(?:pivot|unpivot|transpose|reshape|wide\s+format|long\s+format)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:透视|转置|宽表|长表|重塑)"),
+    ),
+}
 _OUTPUT_COLUMN_REQUIREMENT_TYPES = frozenset(
     {
         "calculation",
@@ -62,65 +163,7 @@ _OUTPUT_COLUMN_REQUIREMENT_TYPES = frozenset(
         "output_column",
     }
 )
-_TRANSFORMATION_CONDITION_KEYS = {
-    "aggregate": "calculations",
-    "derive": "calculations",
-    "filter": "filters",
-    "sort": "orderings",
-    "limit": "limits",
-}
-_EXPLICIT_REQUIREMENT_PATTERNS = {
-    "calculation": re.compile(
-        (
-            r"(求和|合计|汇总|加总|总和|总额|平均|均值|最大|最高|最小|最低|"
-            r"增长率|同比|环比|占比|比例|计算|算出|sum|average|mean|max|min|"
-            r"total|calculate|aggregate|growth|ratio)"
-        ),
-        re.IGNORECASE,
-    ),
-    "ordering": re.compile(
-        r"(排序|升序|降序|顺序|从高到低|从低到高|最高|最低|top|order|sort|ascending|descending)",
-        re.IGNORECASE,
-    ),
-    "output_column": re.compile(
-        (
-            r"(列|字段|维度|包含|包括|显示|输出|返回|日期|年份|时间|省份|地区|城市|"
-            r"column|field|dimension|include|show|return|date|year|province|region|city)"
-        ),
-        re.IGNORECASE,
-    ),
-}
-_DISCOVERY_CALCULATION_INFERENCE_PATTERN = re.compile(
-    (
-        r"(sum\s*\(|\.sum\s*\(|groupby\s*\(|group\s+by|aggregate|aggregation|"
-        r"calculate|calculation|average|mean\s*\(|max\s*\(|min\s*\(|ratio|"
-        r"growth|total\s+(?:row|value|amount|sum|gdp|record)|"
-        r"求和|合计|汇总|加总|总和|总额|平均|均值|最大|最小|增长率|同比|环比|"
-        r"占比|比例|计算|算出|全国总计|全国合计|国家总计|国家合计)"
-    ),
-    re.IGNORECASE,
-)
-_DISCOVERY_ORDERING_INFERENCE_PATTERN = re.compile(
-    r"(\bsort(?:ed)?\s*\(|\.sort\s*\(|order\s+by|ascending|descending|排序|升序|降序)",
-    re.IGNORECASE,
-)
-_DISCOVERY_LIMIT_INFERENCE_PATTERN = re.compile(
-    r"(\blimit\s+\d+|\btop\s+\d+|head\s*\(\s*\d+|tail\s*\(\s*\d+|前\s*\d+\s*个|后\s*\d+\s*个)",
-    re.IGNORECASE,
-)
-_DISCOVERY_FILTER_INFERENCE_PATTERN = re.compile(
-    r"(\bwhere\b|\.query\s*\(|filter\s*\(|筛选|过滤|条件)",
-    re.IGNORECASE,
-)
-_DISCOVERY_DIMENSION_INFERENCE_PATTERN = re.compile(
-    (
-        r"((unique|distinct|values|list|enumerate|print)\W{0,40}"
-        r"(province|region|city|date|year|enddate|time|省份|地区|城市|日期|年份|时间))|"
-        r"((province|region|city|date|year|enddate|time|省份|地区|城市|日期|年份|时间)"
-        r"\W{0,40}(unique|distinct|values|list|enumerate|print))"
-    ),
-    re.IGNORECASE,
-)
+_CONTEXT_COLUMN_ROLES = frozenset({"entity_key", "record_key", "time_key"})
 _REVISION_FIELDS = (
     "intent",
     "output_spec",
@@ -128,26 +171,16 @@ _REVISION_FIELDS = (
     "steps",
     "delegation_candidates",
 )
-_UNSUPPORTED_MEDIA_SUFFIXES = frozenset(
+_TODO_STATUSES = frozenset({"pending", "in_progress", "completed"})
+DISABLED_BUILTIN_TOOLS = frozenset(
     {
-        ".aac",
-        ".avi",
-        ".bmp",
-        ".flac",
-        ".gif",
-        ".jpeg",
-        ".jpg",
-        ".m4a",
-        ".mov",
-        ".mp3",
-        ".mp4",
-        ".ogg",
-        ".pdf",
-        ".png",
-        ".tif",
-        ".tiff",
-        ".wav",
-        ".webp",
+        "edit_file",
+        "execute",
+        "glob",
+        "grep",
+        "ls",
+        "read_file",
+        "write_file",
     }
 )
 
@@ -167,8 +200,7 @@ class _DiscoveryState:
 
     @property
     def context_ready(self) -> bool:
-        required = 2 if not self.knowledge_available or self.needs_cross_validation else 1
-        return len(self.context_sources) >= required
+        return bool(self.context_sources)
 
     def tool_policy(self) -> tuple[set[str], str | None]:
         """根据已掌握的信息决定下一轮可见工具及是否强制调用。"""
@@ -239,31 +271,6 @@ def _tool_error(request: ToolCallRequest, content: str) -> ToolMessage:
     )
 
 
-def _unsupported_media_read_error(request: ToolCallRequest) -> ToolMessage | None:
-    if str(request.tool_call.get("name") or "") != "read_file":
-        return None
-    arguments = request.tool_call.get("args") or {}
-    if not isinstance(arguments, Mapping):
-        return None
-    file_path = str(
-        arguments.get("file_path")
-        or arguments.get("path")
-        or ""
-    ).replace("\\", "/")
-    suffix = PurePosixPath(file_path).suffix.casefold()
-    if suffix not in _UNSUPPORTED_MEDIA_SUFFIXES:
-        return None
-    return _tool_error(
-        request,
-        (
-            f"Direct read_file for {suffix or 'binary'} files is disabled for "
-            "this model endpoint because it returns multimodal file blocks. "
-            "Use read_doc for text/PDF files, or specialized structured-data "
-            "tools for CSV, JSON, and SQLite sources instead."
-        ),
-    )
-
-
 def _decode_json_like_argument(value: Any) -> Any:
     if isinstance(value, str):
         stripped = value.strip()
@@ -292,6 +299,424 @@ def _normalize_tool_call_arguments(request: ToolCallRequest) -> ToolCallRequest:
         tool_call={
             **request.tool_call,
             "args": dict(normalized_arguments),
+        }
+    )
+
+
+def _normalize_write_todos_arguments(
+    request: ToolCallRequest,
+    plan: Mapping[str, Any],
+) -> ToolCallRequest | ToolMessage:
+    if str(request.tool_call.get("name") or "") != "write_todos":
+        return request
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        arguments = {}
+    todos = arguments.get("todos")
+    plan_steps = [str(step) for step in plan.get("steps") or []]
+    if not plan_steps:
+        return _tool_error(
+            request,
+            "analysis_plan.steps must contain at least one step before write_todos.",
+        )
+
+    incoming_todos = todos if isinstance(todos, list) else []
+    previous_todos = request.state.get("todos") or []
+    previous_status_by_content = {
+        str(todo.get("content") or ""): str(todo.get("status") or "")
+        for todo in previous_todos
+        if isinstance(todo, Mapping)
+    }
+    normalized_todos: list[dict[str, Any]] = []
+    for index, plan_step in enumerate(plan_steps):
+        incoming = incoming_todos[index] if index < len(incoming_todos) else {}
+        incoming_status = (
+            str(incoming.get("status") or "")
+            if isinstance(incoming, Mapping)
+            else ""
+        )
+        previous_status = previous_status_by_content.get(plan_step, "")
+        status = (
+            incoming_status
+            if incoming_status in _TODO_STATUSES
+            else previous_status
+            if previous_status in _TODO_STATUSES
+            else "pending"
+        )
+        normalized_todos.append({"content": plan_step, "status": status})
+
+    if (
+        normalized_todos
+        and all(todo["status"] == "pending" for todo in normalized_todos)
+    ):
+        normalized_todos[0]["status"] = "in_progress"
+
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "todos": normalized_todos,
+            },
+        }
+    )
+
+
+def _canonical_plan_steps(arguments: Mapping[str, Any]) -> list[str]:
+    output_spec = arguments.get("output_spec") or {}
+    evidence = arguments.get("evidence") or {}
+    context_sources = (
+        evidence.get("context_sources") if isinstance(evidence, Mapping) else []
+    )
+    source_paths = [
+        str(source.get("path") or "")
+        for source in context_sources or []
+        if isinstance(source, Mapping) and source.get("path")
+    ]
+    if source_paths:
+        source_label = ", ".join(source_paths[:2])
+        if len(source_paths) > 2:
+            source_label = f"{source_label}, and {len(source_paths) - 2} more"
+        read_step = f"Read relevant source data from {source_label}"
+    else:
+        read_step = "Read relevant source data from analysis_plan.evidence.context_sources"
+
+    columns = output_spec.get("columns") if isinstance(output_spec, Mapping) else []
+    column_names = [
+        str(column.get("name") or "")
+        for column in columns or []
+        if isinstance(column, Mapping) and column.get("name")
+    ]
+    column_label = ", ".join(column_names) if column_names else "output_spec.columns"
+    transformations = (
+        output_spec.get("transformations") if isinstance(output_spec, Mapping) else []
+    )
+    if transformations:
+        operations = [
+            str(item.get("operation") or "transformation")
+            for item in transformations
+            if isinstance(item, Mapping)
+        ]
+        operation_label = ", ".join(operations) if operations else "transformations"
+        prepare_step = (
+            "Apply authorized output_spec.transformations "
+            f"({operation_label}) and project {column_label}"
+        )
+    elif (
+        isinstance(output_spec, Mapping)
+        and str(output_spec.get("row_policy") or "") == "preserve"
+    ):
+        prepare_step = (
+            f"Project {column_label} from source rows preserving source order and nulls"
+        )
+    else:
+        prepare_step = "Construct output rows according to analysis_plan.output_spec"
+
+    return [
+        read_step,
+        prepare_step,
+        "Submit final answer with analysis_plan.output_spec columns",
+    ]
+
+
+def _canonicalize_plan_steps(request: ToolCallRequest) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    canonical_steps = _canonical_plan_steps(arguments)
+    if arguments.get("steps") == canonical_steps:
+        return request
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "steps": canonical_steps,
+            },
+        }
+    )
+
+
+def _tool_payload(message: BaseMessage) -> Mapping[str, Any] | None:
+    if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
+        return None
+    try:
+        payload = json.loads(message.content)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _observed_source_row_counts(messages: list[BaseMessage]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for message in messages:
+        payload = _tool_payload(message)
+        if payload is None:
+            continue
+        path = str(payload.get("path") or "").replace("\\", "/")
+        if not path:
+            continue
+        row_count = payload.get("total_items")
+        if row_count is None:
+            row_count = payload.get("total_rows")
+        if isinstance(row_count, int) and row_count >= 0:
+            counts[path] = row_count
+    return counts
+
+
+def _canonicalize_preserve_expected_row_count(
+    request: ToolCallRequest,
+) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    output_spec = arguments.get("output_spec")
+    evidence = arguments.get("evidence")
+    if not isinstance(output_spec, Mapping) or not isinstance(evidence, Mapping):
+        return request
+    if str(output_spec.get("row_policy") or "") != "preserve":
+        return request
+    if output_spec.get("transformations"):
+        return request
+
+    observed_counts = _observed_source_row_counts(request.state["messages"])
+    context_sources = evidence.get("context_sources") or []
+    candidate_counts = {
+        observed_counts[path]
+        for source in context_sources
+        if isinstance(source, Mapping)
+        and (path := str(source.get("path") or "").replace("\\", "/"))
+        in observed_counts
+    }
+    if len(candidate_counts) != 1:
+        return request
+
+    updated_output_spec = dict(output_spec)
+    expected_row_count = candidate_counts.pop()
+    if updated_output_spec.get("expected_row_count") == expected_row_count:
+        return request
+    updated_output_spec["expected_row_count"] = expected_row_count
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "output_spec": updated_output_spec,
+            },
+        }
+    )
+
+
+def _canonicalize_preserve_output_policy(
+    request: ToolCallRequest,
+) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    output_spec = arguments.get("output_spec")
+    if not isinstance(output_spec, Mapping):
+        return request
+    if str(output_spec.get("row_policy") or "") != "preserve":
+        return request
+    if output_spec.get("transformations"):
+        return request
+    if output_spec.get("sort_keys"):
+        return request
+    if output_spec.get("null_policy") != "preserve":
+        return request
+    ordering = str(output_spec.get("ordering") or "")
+    if ordering not in {"", "unspecified"}:
+        return request
+
+    updated_output_spec = dict(output_spec)
+    updated_output_spec["ordering"] = "source"
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "output_spec": updated_output_spec,
+            },
+        }
+    )
+
+
+def _canonical_requirements_from_question_structure(
+    state: Mapping[str, Any],
+) -> list[dict[str, str]] | None:
+    if not state.get("question_structure_enforced"):
+        return None
+    structure = state.get("question_structure")
+    if not isinstance(structure, Mapping):
+        return None
+
+    requirements: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    seen_quotes: set[str] = set()
+
+    def append_requirement(
+        *,
+        quote: Any,
+        requirement_type: str | None,
+        statement: Any,
+    ) -> None:
+        quote_text = str(quote or "").strip()
+        statement_text = str(statement or "").strip()
+        if not quote_text or not requirement_type:
+            return
+        if quote_text in seen_quotes:
+            return
+        key = (quote_text, requirement_type)
+        if key in seen:
+            return
+        seen.add(key)
+        seen_quotes.add(quote_text)
+        requirements.append(
+            {
+                "statement": statement_text or f"{requirement_type}: {quote_text}",
+                "requirement_type": requirement_type,
+                "quote": quote_text,
+            }
+        )
+
+    target_type_map = {
+        "entity": "entity",
+        "measure": "measure",
+        "record_set": "output",
+    }
+    for target in structure.get("targets") or []:
+        if not isinstance(target, Mapping):
+            continue
+        requirement_type = target_type_map.get(str(target.get("target_type") or ""))
+        append_requirement(
+            quote=target.get("quote"),
+            requirement_type=requirement_type,
+            statement=target.get("description") or target.get("name"),
+        )
+
+    constraint_type_map = {
+        "entity": "entity",
+        "filter": "filter",
+        "geography": "entity",
+        "grouping": "grouping",
+        "limit": "limit",
+        "ordering": "ordering",
+        "output_shape": "output",
+        "scope": "entity",
+        "time_range": "time_range",
+    }
+    for constraint in structure.get("target_constraints") or []:
+        if not isinstance(constraint, Mapping):
+            continue
+        constraint_type = str(constraint.get("constraint_type") or "")
+        requirement_type = constraint_type_map.get(constraint_type)
+        statement_parts = [
+            constraint_type,
+            str(constraint.get("value") or "").strip(),
+        ]
+        append_requirement(
+            quote=constraint.get("quote"),
+            requirement_type=requirement_type,
+            statement=": ".join(part for part in statement_parts if part),
+        )
+
+    condition_type_map = {
+        "calculations": "calculation",
+        "filters": "filter",
+        "groupings": "grouping",
+        "limits": "limit",
+        "orderings": "ordering",
+        "output_columns": "output_column",
+        "time_ranges": "time_range",
+    }
+    conditions = structure.get("conditions") or {}
+    if isinstance(conditions, Mapping):
+        for key, requirement_type in condition_type_map.items():
+            for item in conditions.get(key) or []:
+                if isinstance(item, Mapping):
+                    quote = item.get("quote")
+                    statement = (
+                        item.get("description")
+                        or item.get("statement")
+                        or item.get("value")
+                        or key
+                    )
+                else:
+                    quote = item
+                    statement = key
+                append_requirement(
+                    quote=quote,
+                    requirement_type=requirement_type,
+                    statement=statement,
+                )
+
+    return requirements or None
+
+
+def _canonicalize_intent_requirements(request: ToolCallRequest) -> ToolCallRequest:
+    canonical_requirements = _canonical_requirements_from_question_structure(
+        request.state
+    )
+    if not canonical_requirements:
+        return request
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    intent = arguments.get("intent")
+    if not isinstance(intent, Mapping):
+        return request
+    if intent.get("requirements") == canonical_requirements:
+        return request
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "intent": {
+                    **dict(intent),
+                    "requirements": canonical_requirements,
+                },
+            },
+        }
+    )
+
+
+def _canonicalize_revision(request: ToolCallRequest) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    previous_plan = request.state.get("analysis_plan")
+    revision = dict(arguments.get("revision") or {})
+    if previous_plan is None:
+        revision["version"] = 1
+        revision["changed_fields"] = []
+        revision["evidence_changes"] = []
+    else:
+        previous_version = (previous_plan.get("revision") or {}).get("version")
+        revision["version"] = (
+            previous_version + 1
+            if isinstance(previous_version, int)
+            else 2
+        )
+        actual_changes = sorted(
+            field
+            for field in _REVISION_FIELDS
+            if previous_plan.get(field) != arguments.get(field)
+        )
+        revision["changed_fields"] = actual_changes
+        if "evidence" in actual_changes and not revision.get("evidence_changes"):
+            revision["evidence_changes"] = [
+                "Evidence changed in the revised analysis plan."
+            ]
+    if revision == arguments.get("revision"):
+        return request
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "revision": revision,
+            },
         }
     )
 
@@ -333,6 +758,14 @@ def _normalized_quote_text(value: str) -> str:
     )
 
 
+def _quote_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in _normalized_quote_text(value).split()
+        if len(token) > 1 or re.search(r"[\u4e00-\u9fff]", token)
+    }
+
+
 def _canonical_knowledge_quote(
     quote: str,
     knowledge_content: str | None,
@@ -351,7 +784,37 @@ def _canonical_knowledge_quote(
         for line in knowledge_content.splitlines()
         if normalized_quote in _normalized_quote_text(line)
     ]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+
+    quote_tokens = _quote_tokens(quote)
+    if len(quote_tokens) < 3:
+        return None
+    fuzzy_matches: list[tuple[float, str]] = []
+    for line in knowledge_content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        normalized_line = _normalized_quote_text(stripped)
+        line_tokens = _quote_tokens(stripped)
+        if not line_tokens:
+            continue
+        token_recall = len(quote_tokens & line_tokens) / len(quote_tokens)
+        sequence_ratio = SequenceMatcher(
+            None,
+            normalized_quote,
+            normalized_line,
+        ).ratio()
+        score = max(token_recall, sequence_ratio)
+        if score >= 0.82:
+            fuzzy_matches.append((score, stripped))
+
+    if not fuzzy_matches:
+        return None
+    best_score = max(score for score, _ in fuzzy_matches)
+    best_matches = [line for score, line in fuzzy_matches if score == best_score]
+    return best_matches[0] if len(best_matches) == 1 else None
+
 
 
 def _canonicalize_plan_quotes(
@@ -368,8 +831,39 @@ def _canonicalize_plan_quotes(
     if not isinstance(raw_evidence, Mapping):
         return request
     evidence = dict(raw_evidence)
+    knowledge_status = str(evidence.get("knowledge_status") or "")
+    if knowledge_status != "authoritative":
+        context_sources = [
+            item
+            for item in evidence.get("context_sources") or []
+            if not (
+                isinstance(item, Mapping)
+                and str(item.get("path") or "")
+                .replace("\\", "/")
+                .lower()
+                .endswith("/knowledge.md")
+            )
+        ]
+        if context_sources != evidence.get("context_sources"):
+            evidence["context_sources"] = context_sources
+            changed = True
+        else:
+            changed = False
+    else:
+        changed = False
+    if knowledge_status != "authoritative" and evidence.get("knowledge_rules"):
+        evidence["knowledge_rules"] = []
+        changed = True
+    if changed:
+        arguments["evidence"] = evidence
+        return request.override(
+            tool_call={
+                **request.tool_call,
+                "args": arguments,
+            }
+        )
+
     normalized_rules: list[Any] = []
-    changed = False
     for rule in evidence.get("knowledge_rules") or []:
         if not isinstance(rule, dict):
             normalized_rules.append(rule)
@@ -522,6 +1016,302 @@ def _plan_error(
     return _tool_error(request, f"Invalid analysis plan: {content}")
 
 
+def _plan_rejection_payload(
+    *,
+    code: str,
+    json_path: str,
+    operation: str,
+    offending_text: str,
+    field_text: str,
+    facts: list[str],
+    required_fix: str,
+    intent_reconsideration: Mapping[str, Any],
+) -> str:
+    return json.dumps(
+        {
+            "code": code,
+            "json_path": json_path,
+            "operation": operation,
+            "offending_text": offending_text,
+            "field_text": field_text,
+            "facts": facts,
+            "intent_reconsideration": dict(intent_reconsideration),
+            "required_fix": required_fix,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _free_text_plan_fields(arguments: Mapping[str, Any]) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    evidence = arguments.get("evidence") or {}
+    if isinstance(evidence, Mapping):
+        inference = str(evidence.get("cross_validated_inference") or "").strip()
+        if inference:
+            fields.append(("/evidence/cross_validated_inference", inference))
+
+    intent = arguments.get("intent") or {}
+    if isinstance(intent, Mapping):
+        for index, item in enumerate(intent.get("unresolved") or []):
+            text = str(item or "").strip()
+            if text:
+                fields.append((f"/intent/unresolved/{index}", text))
+
+    for index, item in enumerate(arguments.get("steps") or []):
+        text = str(item or "").strip()
+        if text:
+            fields.append((f"/steps/{index}", text))
+
+    return fields
+
+
+def _detect_action_claim(text: str) -> tuple[str, str] | None:
+    for operation, patterns in _ACTION_CLAIM_PATTERNS.items():
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match is not None:
+                return operation, match.group(0)
+    return None
+
+
+def _operation_is_authorized(
+    operation: str,
+    *,
+    requirement_types_by_quote: Mapping[str, str],
+    rule_quotes_by_type: Mapping[str, set[str]],
+    declared_operations: set[str],
+) -> bool:
+    if operation in declared_operations:
+        return True
+
+    user_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(operation, frozenset())
+    if any(requirement_type in user_types for requirement_type in requirement_types_by_quote.values()):
+        return True
+
+    rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(operation, frozenset())
+    return any(rule_quotes_by_type.get(rule_type) for rule_type in rule_types)
+
+
+def _authorization_facts(
+    *,
+    arguments: Mapping[str, Any],
+    operation: str,
+    json_path: str,
+    offending_text: str,
+    original_request: str,
+    requirement_types_by_quote: Mapping[str, str],
+    rule_quotes_by_type: Mapping[str, set[str]],
+    declared_operations: set[str],
+    question_conditions: Mapping[str, list[Any]] | None,
+) -> list[str]:
+    user_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(operation, frozenset())
+    rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(operation, frozenset())
+    facts = [
+        f"Original request text: {original_request!r}.",
+        (
+            "Plan intent quotes from the original request are "
+            f"{sorted(requirement_types_by_quote)}."
+        ),
+        (
+            f"{json_path} contains an execution claim for {operation!r}: "
+            f"{offending_text!r}."
+        ),
+        (
+            "Observed user requirement types are "
+            f"{sorted(set(requirement_types_by_quote.values()))}; "
+            f"{operation!r} requires one of {sorted(user_types)}."
+        ),
+        (
+            "Observed knowledge rule types are "
+            f"{sorted(rule_quotes_by_type)}; {operation!r} requires one of "
+            f"{sorted(rule_types)}."
+        ),
+        (
+            "Declared authorized transformations are "
+            f"{sorted(declared_operations)}."
+        ),
+    ]
+    evidence = arguments.get("evidence") or {}
+    if isinstance(evidence, Mapping):
+        for source in evidence.get("context_sources") or []:
+            if not isinstance(source, Mapping):
+                continue
+            path = str(source.get("path") or "").strip()
+            observations = [
+                str(item).strip()
+                for item in source.get("observations") or []
+                if str(item).strip()
+            ]
+            if path and observations:
+                facts.append(
+                    f"Observed source facts from {path}: "
+                    + " | ".join(observations[:4])
+                )
+    condition_key = _OPERATION_CONDITION_KEYS.get(operation)
+    if question_conditions is not None and condition_key is not None:
+        facts.append(
+            "question_structure.conditions."
+            f"{condition_key} has "
+            f"{len(question_conditions.get(condition_key, []))} item(s)."
+        )
+    if question_conditions is not None:
+        facts.append(
+            "question_structure captured explicit transformation conditions as "
+            + json.dumps(
+                {
+                    key: len(question_conditions.get(key, []))
+                    for key in (
+                        "filters",
+                        "calculations",
+                        "orderings",
+                        "limits",
+                        "groupings",
+                        "output_columns",
+                    )
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "."
+        )
+    return facts
+
+
+def _intent_reconsideration_payload(
+    *,
+    operation: str,
+    json_path: str,
+    offending_text: str,
+    original_request: str,
+    requirement_types_by_quote: Mapping[str, str],
+    question_conditions: Mapping[str, list[Any]] | None,
+) -> dict[str, Any]:
+    condition_key = _OPERATION_CONDITION_KEYS.get(operation)
+    condition_count = (
+        len(question_conditions.get(condition_key, []))
+        if question_conditions is not None and condition_key is not None
+        else None
+    )
+    return {
+        "issue": (
+            "The plan is using an observed data capability as if it were part of "
+            "the user's intent."
+        ),
+        "trigger": {
+            "json_path": json_path,
+            "operation": operation,
+            "text": offending_text,
+        },
+        "source_text_to_reinterpret": {
+            "original_request": original_request,
+            "requirement_quotes": [
+                {"quote": quote, "requirement_type": requirement_type}
+                for quote, requirement_type in requirement_types_by_quote.items()
+            ],
+        },
+        "fact_based_questions": [
+            (
+                "Did the user explicitly ask for this operation, or did it arise "
+                "only because the observed source grain/scope differs from the "
+                "wording of the question?"
+            ),
+            (
+                "Is there an existing source row or field that satisfies the "
+                "requested scope without deriving, filtering, sorting, limiting, "
+                "deduplicating, or reshaping rows?"
+            ),
+            (
+                "If the source grain does not exactly match the requested scope, "
+                "should the plan preserve source rows and record the scope "
+                "mismatch instead of synthesizing a new answer?"
+            ),
+        ],
+        "condition_count": condition_count,
+        "allowed_revisions": [
+            (
+                "Keep the original user requirement quotes, but revise the "
+                "interpretation to a source-record retrieval plan when the "
+                "question asks for records and no transformation is authorized."
+            ),
+            (
+                "Move a transformation into output_spec.transformations only if "
+                "it can cite an explicit user quote or an observed knowledge rule "
+                "that authorizes that operation."
+            ),
+            (
+                "When the data scope/grain is mismatched, state the mismatch in "
+                "intent.unresolved and evidence as a fact, then preserve source "
+                "row grain."
+            ),
+        ],
+    }
+
+
+def _validate_free_text_action_claims(
+    request: ToolCallRequest,
+    *,
+    arguments: Mapping[str, Any],
+    requirement_types_by_quote: Mapping[str, str],
+    rule_quotes_by_type: Mapping[str, set[str]],
+    declared_operations: set[str],
+    question_conditions: Mapping[str, list[Any]] | None,
+) -> ToolMessage | None:
+    original_request = str(request.state.get("original_request") or "")
+    for json_path, text in _free_text_plan_fields(arguments):
+        action_claim = _detect_action_claim(text)
+        if action_claim is None:
+            continue
+        operation, offending_text = action_claim
+        if _operation_is_authorized(
+            operation,
+            requirement_types_by_quote=requirement_types_by_quote,
+            rule_quotes_by_type=rule_quotes_by_type,
+            declared_operations=declared_operations,
+        ):
+            continue
+
+        facts = _authorization_facts(
+            arguments=arguments,
+            operation=operation,
+            json_path=json_path,
+            offending_text=offending_text,
+            original_request=original_request,
+            requirement_types_by_quote=requirement_types_by_quote,
+            rule_quotes_by_type=rule_quotes_by_type,
+            declared_operations=declared_operations,
+            question_conditions=question_conditions,
+        )
+        return _plan_error(
+            request,
+            _plan_rejection_payload(
+                code="UNAUTHORIZED_PLAN_ACTION",
+                json_path=json_path,
+                operation=operation,
+                offending_text=offending_text,
+                field_text=text,
+                facts=facts,
+                intent_reconsideration=_intent_reconsideration_payload(
+                    operation=operation,
+                    json_path=json_path,
+                    offending_text=offending_text,
+                    original_request=original_request,
+                    requirement_types_by_quote=requirement_types_by_quote,
+                    question_conditions=question_conditions,
+                ),
+                required_fix=(
+                    "Reconsider the intent against the observed facts. If the "
+                    "operation was inferred only to reconcile a source grain/scope "
+                    "mismatch, revise the plan to preserve source rows and explain "
+                    "the mismatch. If the operation is genuinely intended, declare "
+                    "it in output_spec.transformations with a valid user or "
+                    "knowledge authorization."
+                ),
+            ),
+        )
+
+    return None
+
+
 def _question_structure_conditions(state: Mapping[str, Any]) -> dict[str, list[Any]] | None:
     if not state.get("question_structure_enforced"):
         return None
@@ -548,116 +1338,115 @@ def _question_structure_target_count(state: Mapping[str, Any]) -> int | None:
     return len(targets) if isinstance(targets, list) else 0
 
 
-def _argument_text_values(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Mapping):
-        values: list[str] = []
-        for item in value.values():
-            values.extend(_argument_text_values(item))
-        return values
-    if isinstance(value, list):
-        values = []
-        for item in value:
-            values.extend(_argument_text_values(item))
-        return values
-    return []
+def _quoted_requirement_support(state: Mapping[str, Any]) -> set[tuple[str, str]] | None:
+    """Return quote/type pairs produced by the isolated question structure."""
 
-
-def _question_structure_has_condition(
-    conditions: Mapping[str, list[Any]],
-    *keys: str,
-) -> bool:
-    return any(bool(conditions.get(key)) for key in keys)
-
-
-def _discovery_question_structure_error(
-    request: ToolCallRequest,
-    current_tool_name: str,
-) -> ToolMessage | None:
-    """Reject exploratory calls that add unstated operations to the question."""
-
-    if current_tool_name not in _SOURCE_DISCOVERY_TOOLS:
+    if not state.get("question_structure_enforced"):
         return None
-    conditions = _question_structure_conditions(request.state)
-    if conditions is None:
-        return None
-    arguments = request.tool_call.get("args") or {}
-    if not isinstance(arguments, Mapping):
-        return None
-    argument_text = "\n".join(_argument_text_values(arguments))
-    if not argument_text:
+    structure = state.get("question_structure")
+    if not isinstance(structure, Mapping):
         return None
 
-    if (
-        not _question_structure_has_condition(conditions, "calculations")
-        and _DISCOVERY_CALCULATION_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.calculations is empty, but the tool arguments/code "
-                "attempt to explore an aggregate, derived calculation, or total. "
-                "Inspect direct target fields only, or call analyze_plan once the "
-                "source is clear."
-            ),
+    supported: set[tuple[str, str]] = set()
+
+    target_type_map = {
+        "entity": "entity",
+        "measure": "measure",
+        "record_set": "output",
+    }
+    for target in structure.get("targets") or []:
+        if not isinstance(target, Mapping):
+            continue
+        quote = str(target.get("quote") or "").strip()
+        requirement_type = target_type_map.get(str(target.get("target_type") or ""))
+        if quote and requirement_type:
+            supported.add((quote, requirement_type))
+
+    constraint_type_map = {
+        "entity": "entity",
+        "filter": "filter",
+        "geography": "entity",
+        "grouping": "grouping",
+        "limit": "limit",
+        "ordering": "ordering",
+        "output_shape": "output",
+        "scope": "entity",
+        "time_range": "time_range",
+    }
+    for constraint in structure.get("target_constraints") or []:
+        if not isinstance(constraint, Mapping):
+            continue
+        quote = str(constraint.get("quote") or "").strip()
+        requirement_type = constraint_type_map.get(
+            str(constraint.get("constraint_type") or "")
         )
-    if (
-        not _question_structure_has_condition(conditions, "orderings")
-        and _DISCOVERY_ORDERING_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.orderings is empty, but the tool arguments/code "
-                "attempt to explore sorting or ordered ranking."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(conditions, "limits")
-        and _DISCOVERY_LIMIT_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.limits is empty, but the tool arguments/code attempt "
-                "to explore a top/limit slice."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(conditions, "filters")
-        and _DISCOVERY_FILTER_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: "
-                "conditions.filters is empty, but the tool arguments/code attempt "
-                "to explore a filtered subset."
-            ),
-        )
-    if (
-        not _question_structure_has_condition(
-            conditions,
-            "output_columns",
-            "groupings",
-            "time_ranges",
-            "filters",
-        )
-        and _DISCOVERY_DIMENSION_INFERENCE_PATTERN.search(argument_text)
-    ):
-        return _tool_error(
-            request,
-            (
-                "Discovery call rejected by question_structure: no output, "
-                "grouping, time, or filter condition authorizes enumerating "
-                "helper dimensions such as geography or date values."
-            ),
-        )
-    return None
+        if quote and requirement_type:
+            supported.add((quote, requirement_type))
+
+    condition_type_map = {
+        "calculations": "calculation",
+        "filters": "filter",
+        "groupings": "grouping",
+        "limits": "limit",
+        "orderings": "ordering",
+        "output_columns": "output_column",
+        "time_ranges": "time_range",
+    }
+    conditions = structure.get("conditions") or {}
+    if isinstance(conditions, Mapping):
+        for key, requirement_type in condition_type_map.items():
+            for item in conditions.get(key) or []:
+                quote = (
+                    str(item.get("quote") or "").strip()
+                    if isinstance(item, Mapping)
+                    else str(item or "").strip()
+                )
+                if quote:
+                    supported.add((quote, requirement_type))
+
+    return supported
+
+
+def _question_structure_context_capacity(
+    state: Mapping[str, Any],
+) -> dict[str, int] | None:
+    """Return how many source-row context columns the isolated question supports."""
+
+    if not state.get("question_structure_enforced"):
+        return None
+    structure = state.get("question_structure")
+    if not isinstance(structure, Mapping):
+        return None
+
+    capacities = {role: 0 for role in _CONTEXT_COLUMN_ROLES}
+    constraints = structure.get("target_constraints") or []
+    for constraint in constraints:
+        if not isinstance(constraint, Mapping):
+            continue
+        constraint_type = str(constraint.get("constraint_type") or "")
+        if constraint_type == "time_range":
+            capacities["time_key"] += 1
+        if constraint_type in {"entity", "geography", "scope"}:
+            capacities["entity_key"] += 1
+
+    conditions = structure.get("conditions") or {}
+    if isinstance(conditions, Mapping):
+        capacities["time_key"] += len(conditions.get("time_ranges") or [])
+        capacities["entity_key"] += len(conditions.get("filters") or [])
+        capacities["entity_key"] += len(conditions.get("groupings") or [])
+
+    output = structure.get("output") or {}
+    if isinstance(output, Mapping):
+        if str(output.get("row_grain_hint") or "") == "source_records":
+            capacities["record_key"] += 1
+        if str(output.get("preserve_source_rows") or "") == "true":
+            capacities["record_key"] += 1
+
+    return capacities
+
+
+def _column_role(column: Any) -> str:
+    return str(column.get("role") or "") if isinstance(column, Mapping) else ""
 
 
 def _validate_plan_contract(
@@ -692,19 +1481,6 @@ def _validate_plan_contract(
             request,
             "every intent requirement quote must occur verbatim in original_request.",
         )
-    for quote, requirement_type in requirement_types_by_quote.items():
-        explicit_pattern = _EXPLICIT_REQUIREMENT_PATTERNS.get(requirement_type)
-        if explicit_pattern is None or explicit_pattern.search(quote):
-            continue
-        return _plan_error(
-            request,
-            (
-                f"{requirement_type} requirements must quote an explicit "
-                f"{requirement_type} instruction from the original request; "
-                f"{quote!r} is not sufficient."
-            ),
-        )
-
     evidence = arguments.get("evidence") or {}
     if not isinstance(evidence, Mapping):
         return _plan_error(request, "evidence must be a JSON object.")
@@ -760,39 +1536,74 @@ def _validate_plan_contract(
     output_columns = output_spec.get("columns") or []
     if not isinstance(output_columns, list):
         return _plan_error(request, "output_spec.columns must be a list.")
+    transformations = output_spec.get("transformations") or []
+    row_policy = str(output_spec.get("row_policy") or "")
+    preserve_source_rows = (
+        not transformations
+        and row_policy == "preserve"
+        and output_spec.get("ordering") == "source"
+        and output_spec.get("null_policy") == "preserve"
+        and not output_spec.get("sort_keys")
+    )
+    question_context_capacity = _question_structure_context_capacity(request.state)
+    context_column_counts = {role: 0 for role in _CONTEXT_COLUMN_ROLES}
+    target_output_columns = []
+    for column in output_columns:
+        role = _column_role(column)
+        if (
+            preserve_source_rows
+            and question_context_capacity is not None
+            and role in _CONTEXT_COLUMN_ROLES
+        ):
+            context_column_counts[role] += 1
+            continue
+        target_output_columns.append(column)
+    if question_context_capacity is not None:
+        for role, count in context_column_counts.items():
+            if count > question_context_capacity.get(role, 0):
+                return _plan_error(
+                    request,
+                    (
+                        f"too many {role} context columns for the isolated "
+                        "question structure."
+                    ),
+                )
     output_column_capacity = sum(
         1
         for requirement_type in requirement_types_by_quote.values()
         if requirement_type in _OUTPUT_COLUMN_REQUIREMENT_TYPES
     )
-    if len(output_columns) > output_column_capacity:
+    if len(target_output_columns) > output_column_capacity:
         return _plan_error(
             request,
             (
                 "each output column must be backed by a distinct measure, "
                 "calculation, or explicit output_column requirement; got "
-                f"{len(output_columns)} columns but {output_column_capacity} "
-                "output-bearing requirements."
+                f"{len(target_output_columns)} non-context columns but "
+                f"{output_column_capacity} output-bearing requirements."
             ),
+        )
+    if output_column_capacity > 0 and not target_output_columns:
+        return _plan_error(
+            request,
+            "at least one non-context output column must satisfy the requested target.",
         )
     question_conditions = _question_structure_conditions(request.state)
     question_target_count = _question_structure_target_count(request.state)
     if question_conditions is not None and question_target_count is not None:
         explicit_output_columns = len(question_conditions.get("output_columns", []))
         question_output_capacity = question_target_count + explicit_output_columns
-        if len(output_columns) > question_output_capacity:
+        if len(target_output_columns) > question_output_capacity:
             return _plan_error(
                 request,
                 (
                     "output_spec.columns exceeds the isolated question structure: "
-                    f"{len(output_columns)} columns requested by the plan, but the "
-                    f"question structure supports {question_target_count} target "
-                    f"column(s) plus {explicit_output_columns} explicit output "
-                    "column(s)."
+                    f"{len(target_output_columns)} non-context columns requested by "
+                    "the plan, but the question structure supports "
+                    f"{question_target_count} target column(s) plus "
+                    f"{explicit_output_columns} explicit output column(s)."
                 ),
             )
-    transformations = output_spec.get("transformations") or []
-    row_policy = str(output_spec.get("row_policy") or "")
     if transformations and row_policy != "transform":
         return _plan_error(
             request,
@@ -842,18 +1653,17 @@ def _validate_plan_contract(
                         f"requirement typed as one of {sorted(allowed_types)}."
                     ),
                 )
-            condition_key = _TRANSFORMATION_CONDITION_KEYS.get(operation)
+            supported_requirements = _quoted_requirement_support(request.state)
             if (
-                question_conditions is not None
-                and condition_key is not None
-                and not question_conditions.get(condition_key)
+                supported_requirements is not None
+                and (quote, requirement_type) not in supported_requirements
             ):
                 return _plan_error(
                     request,
                     (
-                        f"user authorization for {operation!r} conflicts with the "
-                        "isolated question structure: "
-                        f"conditions.{condition_key} is empty."
+                        f"user authorization for {operation!r} must be supported "
+                        "by the isolated question structure with the same quote "
+                        "and requirement type."
                     ),
                 )
         if source == "knowledge":
@@ -879,6 +1689,23 @@ def _validate_plan_contract(
                 request,
                 "context evidence cannot authorize a transformation.",
             )
+
+    declared_operations = {
+        str(transformation.get("operation") or "")
+        for transformation in transformations
+        if isinstance(transformation, Mapping)
+        and str(transformation.get("operation") or "")
+    }
+    free_text_error = _validate_free_text_action_claims(
+        request,
+        arguments=arguments,
+        requirement_types_by_quote=requirement_types_by_quote,
+        rule_quotes_by_type=rule_quotes_by_type,
+        declared_operations=declared_operations,
+        question_conditions=question_conditions,
+    )
+    if free_text_error is not None:
+        return free_text_error
 
     revision = arguments.get("revision") or {}
     if not isinstance(revision, Mapping):
@@ -921,7 +1748,7 @@ def _validate_plan_contract(
         if previous_plan.get(field) != arguments.get(field)
     }
     if not actual_changes:
-        return _plan_error(request, "a revision must make an actual plan change.")
+        return None
     missing_changes = actual_changes - reported_changes
     if missing_changes:
         return _plan_error(
@@ -957,6 +1784,25 @@ class AnswerMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                 "jump_to": "end",
             }
         return None
+
+
+class CustomSystemPromptMiddleware(AgentMiddleware[Any, None, Any]):
+    """在工具注入后替换系统提示词，避免 SDK 默认提示词进入模型请求。"""
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__()
+        self.prompt = prompt.strip()
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[None],
+        handler: Callable[[ModelRequest[None]], ModelResponse[Any]],
+    ) -> ModelResponse[Any]:
+        if not self.prompt:
+            return handler(request)
+        return handler(
+            request.override(system_message=SystemMessage(content=self.prompt))
+        )
 
 
 class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
@@ -1011,12 +1857,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                     "Only discovery tools are available before analyze_plan.",
                 )
             if current_tool_name in _SOURCE_DISCOVERY_TOOLS:
-                structure_error = _discovery_question_structure_error(
-                    request,
-                    current_tool_name,
-                )
-                if structure_error is not None:
-                    return structure_error
                 if discovery.context_ready:
                     return _tool_error(
                         request,
@@ -1036,23 +1876,21 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                         "Complete discovery before analyze_plan: inspect the minimum "
                         "required independent data sources."
                     ),
-                )
+            )
+            request = _canonicalize_intent_requirements(request)
             request = _canonicalize_plan_quotes(request, discovery)
+            request = _canonicalize_preserve_expected_row_count(request)
+            request = _canonicalize_preserve_output_policy(request)
+            request = _canonicalize_plan_steps(request)
+            request = _canonicalize_revision(request)
             contract_error = _validate_plan_contract(request, discovery)
             if contract_error is not None:
                 return contract_error
         if current_tool_name == "write_todos" and plan is not None:
-            todos = request.tool_call.get("args", {}).get("todos") or []
-            todo_contents = [
-                str(todo.get("content") or "").strip()
-                for todo in todos
-                if isinstance(todo, dict)
-            ]
-            if todo_contents != plan.get("steps"):
-                return _tool_error(
-                    request,
-                    "write_todos contents must exactly match analysis_plan.steps.",
-                )
+            normalized_todos = _normalize_write_todos_arguments(request, plan)
+            if isinstance(normalized_todos, ToolMessage):
+                return normalized_todos
+            request = normalized_todos
         if (
             plan is not None
             and not request.state.get("todos")
@@ -1065,44 +1903,26 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
         return handler(request)
 
 
-class TextOnlyReadFileMiddleware(AgentMiddleware[Any, None, Any]):
-    """Return text errors for media files instead of multimodal content blocks."""
+class DisabledToolGuardMiddleware(AgentMiddleware[Any, None, Any]):
+    """拒绝执行官方 profile 已排除的内置工具。"""
 
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
-        unsupported_media_error = _unsupported_media_read_error(request)
-        if unsupported_media_error is not None:
-            return unsupported_media_error
+        current_tool_name = str(request.tool_call.get("name") or "")
+        if current_tool_name in DISABLED_BUILTIN_TOOLS:
+            return _tool_error(
+                request,
+                (
+                    f"Tool `{current_tool_name}` is disabled in this benchmark "
+                    "agent. Use the exposed data tools instead; for large JSON "
+                    "or CSV sources, call the original structured reader again "
+                    "with pagination rather than using read_file."
+                ),
+            )
         return handler(request)
-
-
-class HideUnavailableToolsMiddleware(AgentMiddleware[Any, None, Any]):
-    """隐藏基准环境不允许模型调用的通用文件和 shell 工具。"""
-
-    hidden_tools = frozenset(
-        {
-            "edit_file",
-            "execute",
-            "glob",
-            "grep",
-            "ls",
-            "read_file",
-            "write_file",
-        }
-    )
-
-    def wrap_model_call(
-        self,
-        request: ModelRequest[None],
-        handler: Callable[[ModelRequest[None]], ModelResponse[Any]],
-    ) -> ModelResponse[Any]:
-        filtered_tools = [
-            item for item in request.tools if tool_name(item) not in self.hidden_tools
-        ]
-        return handler(request.override(tools=filtered_tools))
 
 
 def workspace_permissions() -> list[FilesystemPermission]:

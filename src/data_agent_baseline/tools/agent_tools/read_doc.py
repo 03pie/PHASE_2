@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     DOC_SUFFIXES,
     error,
@@ -15,20 +16,19 @@ from data_agent_baseline.tools._helpers import (
     virtual_path,
 )
 
-
 def create_read_doc_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create a text/PDF document reader that returns text-only tool output."""
 
     context_root = (workspace / "context").resolve()
 
-    @tool("read_doc")
+    @tool("read_doc", description=load_tool_prompt("read_doc"))
     def read_doc(
         path: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         start_line: int = 0,
         max_lines: int = 120,
     ) -> Any:
-        """Read text or PDF documents as line-numbered plain text."""
+        """Run the read_doc tool."""
 
         resolved, path_error = resolve_context_path(
             context_root,

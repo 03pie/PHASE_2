@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import error, query_context_schema, success
 
 
@@ -14,13 +15,13 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
 
     context_root = (workspace / "context").resolve()
 
-    @tool("query_schema")
+    @tool("query_schema", description=load_tool_prompt("query_schema"))
     def query_schema(
         field: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         max_matches: int = 25,
     ) -> Any:
-        """Find matching fields across CSV, JSON, and SQLite context sources."""
+        """Run the query_schema tool."""
 
         field_text = field.strip()
         if not field_text:

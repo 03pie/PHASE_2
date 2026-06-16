@@ -48,6 +48,20 @@ def load_prompt(filename: str) -> str:
     return files(_PROMPT_PACKAGE).joinpath(filename).read_text(encoding="utf-8").strip()
 
 
+def load_tool_prompt(tool_name: str) -> str:
+    """读取单个工具暴露给模型的提示词描述。"""
+
+    if not tool_name or any(separator in tool_name for separator in ("/", "\\")):
+        raise ValueError(f"Invalid tool prompt name: {tool_name!r}")
+    filename = tool_name if tool_name.endswith(".md") else f"{tool_name}.md"
+    return (
+        files(_PROMPT_PACKAGE)
+        .joinpath("tool_prompts", filename)
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+
+
 def load_main_agent_prompt() -> str:
     return load_prompt("main_agent.md")
 

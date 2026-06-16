@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     count_csv_rows,
     error,
@@ -15,20 +16,19 @@ from data_agent_baseline.tools._helpers import (
     virtual_path,
 )
 
-
 def create_read_csv_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create a paginated CSV preview tool."""
 
     context_root = (workspace / "context").resolve()
 
-    @tool("read_csv")
+    @tool("read_csv", description=load_tool_prompt("read_csv"))
     def read_csv(
         path: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         start_row: int = 0,
         max_rows: int = 50,
     ) -> Any:
-        """Read a CSV preview with columns, dtypes, paging, and null-safe rows."""
+        """Run the read_csv tool."""
 
         resolved, path_error = resolve_context_path(
             context_root,

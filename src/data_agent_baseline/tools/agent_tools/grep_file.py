@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     apply_head_limit,
     collect_search_files,
@@ -18,13 +19,12 @@ from data_agent_baseline.tools._helpers import (
     success,
 )
 
-
 def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create an EVE-style grep_file search tool."""
 
     context_root = (workspace / "context").resolve()
 
-    @tool("grep_file")
+    @tool("grep_file", description=load_tool_prompt("grep_file"))
     def grep_file(
         pattern: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
@@ -35,7 +35,7 @@ def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
         max_matches: int = 200,
         offset: int = 0,
     ) -> Any:
-        """Search text files with regex, optional glob, context lines, and paging."""
+        """Run the grep_file tool."""
 
         if not pattern.strip():
             return error(
