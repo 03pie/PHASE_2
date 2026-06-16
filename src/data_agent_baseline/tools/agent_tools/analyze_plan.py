@@ -8,9 +8,10 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
+from data_agent_baseline.prompts.loader import load_tool_prompt
 
 KnowledgeStatus = Literal[
     "authoritative",
@@ -33,6 +34,14 @@ RequirementType = Literal[
     "reshape",
 ]
 KnowledgeRuleType = Literal["semantic", "filter", "calculation", "output"]
+OutputColumnRole = Literal[
+    "measure",
+    "calculation",
+    "output_column",
+    "record_key",
+    "entity_key",
+    "time_key",
+]
 TransformationOperation = Literal[
     "filter",
     "aggregate",
@@ -58,6 +67,7 @@ class IntentSpec(TypedDict):
 class OutputColumn(TypedDict):
     name: str
     source_fields: list[str]
+    role: NotRequired[OutputColumnRole]
 
 
 class TransformationAuthorization(TypedDict):
@@ -87,10 +97,36 @@ class OutputSpec(TypedDict):
     expected_row_count: int | None
 
 
+class ExecutionSource(TypedDict):
+    path: str
+    table_or_path: NotRequired[str]
+    source_type: NotRequired[str]
+
+
+class SupportingField(TypedDict):
+    name: str
+    source_fields: list[str]
+    purpose: Literal["selector", "filter", "join", "context"]
+
+
+class ExecutionOperation(TypedDict):
+    operation: TransformationOperation
+    description: str
+    authorization: NotRequired[TransformationAuthorization]
+    authorization_fact_ids: NotRequired[list[str]]
+
+
+class ExecutionSpec(TypedDict):
+    sources: list[ExecutionSource]
+    supporting_fields: list[SupportingField]
+    operations: list[ExecutionOperation]
+
+
 class KnowledgeRule(TypedDict):
     rule_type: KnowledgeRuleType
     quote: str
     source_path: str
+    fact_id: NotRequired[str]
 
 
 class ContextSource(TypedDict):
@@ -130,7 +166,7 @@ def _clean_texts(items: list[str]) -> list[str]:
     return [text for item in items if (text := _clean_text(item))]
 
 
-@tool("analyze_plan")
+@tool("analyze_plan", description=load_tool_prompt("analyze_plan"))
 def analyze_plan_tool(
     intent: IntentSpec,
     output_spec: OutputSpec,
@@ -141,8 +177,19 @@ def analyze_plan_tool(
     tool_call_id: Annotated[str, InjectedToolCallId],
     schema_version: Literal["1.0"] = "1.0",
     delegation_candidates: list[str] | None = None,
+    execution_spec: ExecutionSpec | None = None,
 ) -> Command[BenchmarkDeepAgentState] | ToolMessage:
-    """Create or revise a traceable plan after inspecting knowledge and task data."""
+    """Create or revise a traceable plan after inspecting knowledge and task data.
+
+    output_spec.columns is the final answer schema only. Put selector fields,
+    filter keys, join keys, and source-row context fields that are not returned
+    in execution_spec.supporting_fields.
+
+    When only part of knowledge is usable, keep the usable quoted rules or
+    fact_ids and document unresolved bindings in knowledge_issue plus
+    cross_validated_inference. Mark knowledge unavailable/invalid only when no
+    relevant rule can be trusted.
+    """
 
     requirements = [
         {
@@ -164,6 +211,11 @@ def analyze_plan_tool(
         {
             "name": _clean_text(item["name"]),
             "source_fields": _clean_texts(item["source_fields"]),
+            **(
+                {"role": item["role"]}
+                if "role" in item and _clean_text(item["role"])
+                else {}
+            ),
         }
         for item in output_spec["columns"]
     ]
@@ -235,6 +287,11 @@ def analyze_plan_tool(
             "rule_type": item["rule_type"],
             "quote": _clean_text(item["quote"]),
             "source_path": _clean_text(item["source_path"]).replace("\\", "/"),
+            **(
+                {"fact_id": _clean_text(item["fact_id"])}
+                if "fact_id" in item and _clean_text(item["fact_id"])
+                else {}
+            ),
         }
         for item in evidence["knowledge_rules"]
     ]
@@ -257,14 +314,6 @@ def analyze_plan_tool(
                 "Non-authoritative knowledge requires an explicit knowledge_issue.",
                 tool_call_id,
             )
-        if len({item["path"] for item in context_sources}) < 2:
-            return _error(
-                (
-                    "Non-authoritative knowledge requires at least two distinct "
-                    "context sources for cross-validation."
-                ),
-                tool_call_id,
-            )
         if not cross_validated_inference:
             return _error(
                 (
@@ -282,6 +331,68 @@ def analyze_plan_tool(
             "revision.version must be positive and revision.reason is required.",
             tool_call_id,
         )
+
+    normalized_execution_spec: ExecutionSpec | None = None
+    if isinstance(execution_spec, Mapping):
+        normalized_execution_spec = {
+            "sources": [
+                {
+                    "path": _clean_text(item.get("path")).replace("\\", "/"),
+                    **(
+                        {"table_or_path": _clean_text(item.get("table_or_path"))}
+                        if _clean_text(item.get("table_or_path"))
+                        else {}
+                    ),
+                    **(
+                        {"source_type": _clean_text(item.get("source_type"))}
+                        if _clean_text(item.get("source_type"))
+                        else {}
+                    ),
+                }
+                for item in execution_spec.get("sources", [])
+                if isinstance(item, Mapping) and _clean_text(item.get("path"))
+            ],
+            "supporting_fields": [
+                {
+                    "name": _clean_text(item.get("name")),
+                    "source_fields": _clean_texts(item.get("source_fields", [])),
+                    "purpose": item.get("purpose"),
+                }
+                for item in execution_spec.get("supporting_fields", [])
+                if isinstance(item, Mapping) and _clean_text(item.get("name"))
+            ],
+            "operations": [
+                {
+                    "operation": item.get("operation"),
+                    "description": _clean_text(item.get("description")),
+                    **(
+                        {
+                            "authorization": {
+                                "source": item.get("authorization", {}).get("source"),
+                                "quote": _clean_text(
+                                    item.get("authorization", {}).get("quote")
+                                ),
+                            }
+                        }
+                        if isinstance(item.get("authorization"), Mapping)
+                        else {}
+                    ),
+                    **(
+                        {
+                            "authorization_fact_ids": _clean_texts(
+                                item.get("authorization_fact_ids", [])
+                            )
+                        }
+                        if item.get("authorization_fact_ids") is not None
+                        else {}
+                    ),
+                }
+                for item in execution_spec.get("operations", [])
+                if isinstance(item, Mapping)
+                and _clean_text(item.get("description"))
+                and _clean_text(item.get("operation"))
+            ],
+        }
 
     plan = {
         "schema_version": schema_version,
@@ -322,6 +433,8 @@ def analyze_plan_tool(
         "steps": normalized_steps,
         "delegation_candidates": _clean_texts(delegation_candidates or []),
     }
+    if normalized_execution_spec is not None:
+        plan["execution_spec"] = normalized_execution_spec
     return Command(
         update={
             "analysis_plan": plan,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -40,6 +41,13 @@ QUESTION_STRUCTURE_SCHEMA: dict[str, Any] = {
         "calculations": [],
         "output_columns": [],
     },
+    "intent_operators": [
+        {
+            "quote": "exact substring from original_question",
+            "operation": "aggregate | sort | limit | derive",
+            "operator_type": "distribution | average | selector | calculation",
+        }
+    ],
     "output": {
         "row_grain_hint": "source_records | aggregated_records | unspecified",
         "requested_columns": [],
@@ -58,6 +66,9 @@ structured representation of the user's wording.
 Rules:
 - Every quote must be an exact substring of original_question.
 - Put only explicit wording into target_constraints and conditions.
+- Every condition item must be an object with quote, value, condition_type, and
+  explicitness. If you cannot cite an exact substring, set quote to null and
+  keep the wording only in value.
 - If wording may imply something but does not explicitly request it, put that in
   ambiguities instead of conditions.
 - Do not invent aggregation, filtering, sorting, row grain, or output columns.
@@ -109,6 +120,7 @@ def _fallback_structure(question: str, *, reason: str) -> dict[str, Any]:
             "requested_columns": [],
             "preserve_source_rows": "unknown",
         },
+        "intent_operators": _detect_intent_operators(question),
         "ambiguities": [reason],
     }
 
@@ -134,13 +146,134 @@ def _dict_value(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+_CONDITION_TYPE_BY_KEY = {
+    "filters": "filter",
+    "time_ranges": "time_range",
+    "groupings": "grouping",
+    "orderings": "ordering",
+    "limits": "limit",
+    "calculations": "calculation",
+    "output_columns": "output_column",
+}
+
+_INTENT_OPERATOR_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    ("分布", "aggregate", "distribution"),
+    ("distribution", "aggregate", "distribution"),
+    ("平均", "aggregate", "average"),
+    ("均值", "aggregate", "average"),
+    ("average", "aggregate", "average"),
+    ("mean", "aggregate", "average"),
+    ("最高", "sort", "selector"),
+    ("最大", "sort", "selector"),
+    ("最低", "sort", "selector"),
+    ("最小", "sort", "selector"),
+    ("最近", "sort", "selector"),
+    ("最新", "sort", "selector"),
+    ("highest", "sort", "selector"),
+    ("maximum", "sort", "selector"),
+    ("minimum", "sort", "selector"),
+    ("most recent", "sort", "selector"),
+    ("first", "limit", "selector"),
+    ("last", "limit", "selector"),
+)
+
+
+def _exact_substring(value: Any, question: str) -> str | None:
+    text = str(value or "").strip()
+    return text if text and text in question else None
+
+
+def _condition_value(item: Any) -> str:
+    if isinstance(item, Mapping):
+        for key in ("value", "description", "statement", "quote"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                return text
+        return ""
+    return str(item or "").strip()
+
+
+def _normalize_condition_item(item: Any, *, key: str, question: str) -> dict[str, Any]:
+    condition_type = _CONDITION_TYPE_BY_KEY.get(key, key)
+    if isinstance(item, Mapping):
+        quote = _exact_substring(item.get("quote"), question)
+        value = _condition_value(item)
+        explicitness = str(item.get("explicitness") or "")
+        if explicitness not in {"explicit", "ambiguous"}:
+            explicitness = "explicit" if quote else "unquoted_hint"
+        return {
+            "quote": quote,
+            "value": value,
+            "condition_type": str(item.get("condition_type") or condition_type),
+            "explicitness": explicitness,
+        }
+    return {
+        "quote": None,
+        "value": str(item or "").strip(),
+        "condition_type": condition_type,
+        "explicitness": "unquoted_hint",
+    }
+
+
+def _detect_intent_operators(question: str) -> list[dict[str, str]]:
+    operators: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    question_folded = question.casefold()
+    for token, operation, operator_type in _INTENT_OPERATOR_PATTERNS:
+        index = question_folded.find(token.casefold())
+        if index < 0:
+            continue
+        quote = question[index : index + len(token)]
+        key = (quote, operation)
+        if key in seen:
+            continue
+        seen.add(key)
+        operators.append(
+            {
+                "quote": quote,
+                "operation": operation,
+                "operator_type": operator_type,
+            }
+        )
+        if operator_type == "selector" and operation == "sort":
+            limit_key = (quote, "limit")
+            if limit_key not in seen:
+                seen.add(limit_key)
+                operators.append(
+                    {
+                        "quote": quote,
+                        "operation": "limit",
+                        "operator_type": operator_type,
+                    }
+                )
+    return operators
+
+
+def _ensure_exact_quotes(items: list[Any], question: str) -> list[Any]:
+    normalized_items: list[Any] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            normalized_items.append(item)
+            continue
+        item_dict = dict(item)
+        quote = item_dict.get("quote")
+        if quote and not _exact_substring(quote, question):
+            item_dict["quote"] = None
+        normalized_items.append(item_dict)
+    return normalized_items
+
+
 def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
     normalized = {
         "schema_version": str(raw.get("schema_version") or "1.0"),
         "original_question": str(raw.get("original_question") or question),
-        "targets": _list_value(raw.get("targets")),
-        "target_constraints": _list_value(raw.get("target_constraints")),
+        "targets": _ensure_exact_quotes(_list_value(raw.get("targets")), question),
+        "target_constraints": _ensure_exact_quotes(
+            _list_value(raw.get("target_constraints")),
+            question,
+        ),
         "conditions": _dict_value(raw.get("conditions")),
+        "intent_operators": _list_value(raw.get("intent_operators")),
         "output": _dict_value(raw.get("output")),
         "ambiguities": _list_value(raw.get("ambiguities")),
     }
@@ -160,12 +293,50 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
         "calculations",
         "output_columns",
     ]:
-        conditions[key] = _list_value(conditions.get(key))
+        conditions[key] = [
+            _normalize_condition_item(item, key=key, question=question)
+            for item in _list_value(conditions.get(key))
+            if isinstance(item, Mapping) or str(item or "").strip()
+        ]
+
+    existing_operators = [
+        item
+        for item in normalized["intent_operators"]
+        if isinstance(item, Mapping)
+        and _exact_substring(item.get("quote"), question)
+        and str(item.get("operation") or "").strip()
+    ]
+    detected_operators = _detect_intent_operators(question)
+    operator_keys = {
+        (str(item.get("quote")), str(item.get("operation")))
+        for item in existing_operators
+    }
+    for item in detected_operators:
+        key = (item["quote"], item["operation"])
+        if key not in operator_keys:
+            existing_operators.append(item)
+            operator_keys.add(key)
+    normalized["intent_operators"] = [dict(item) for item in existing_operators]
 
     output = normalized["output"]
     output["row_grain_hint"] = str(output.get("row_grain_hint") or "unspecified")
     output["requested_columns"] = _list_value(output.get("requested_columns"))
     output["preserve_source_rows"] = str(output.get("preserve_source_rows") or "unknown")
+    if output["row_grain_hint"] not in {
+        "source_records",
+        "aggregated_records",
+        "unspecified",
+    }:
+        output["row_grain_hint"] = "unspecified"
+    if output["preserve_source_rows"] not in {"true", "false", "unknown"}:
+        output["preserve_source_rows"] = "unknown"
+    if (
+        output["row_grain_hint"] == "aggregated_records"
+        and not conditions["calculations"]
+        and not conditions["groupings"]
+    ):
+        output["row_grain_hint"] = "source_records"
+        output["preserve_source_rows"] = "true"
     return normalized
 
 

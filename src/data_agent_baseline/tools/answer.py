@@ -28,11 +28,23 @@ def validate_prepared_answer(
         )
     expected_row_count = output_spec.get("expected_row_count")
     if expected_row_count is not None and len(rows) != expected_row_count:
+        detail = ""
+        if (
+            output_spec.get("row_policy") == "preserve"
+            and not output_spec.get("transformations")
+        ):
+            detail = (
+                " The active plan preserves observed source rows with no "
+                "authorized transformations; submit one answer row per observed "
+                "source record instead of aggregating, filtering, sorting, "
+                "deduplicating, or changing expected_row_count to fit this answer."
+            )
         return (
             None,
             (
                 "answer row count must match "
                 f"analysis_plan.output_spec.expected_row_count={expected_row_count}."
+                f"{detail}"
             ),
         )
 

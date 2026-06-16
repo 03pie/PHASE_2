@@ -61,6 +61,18 @@ def summarize_tool_call(tool_call: dict[str, Any], *, include_args: bool) -> dic
     return summary
 
 
+def serialize_tool_definition(tool: Any) -> dict[str, Any]:
+    """Record the model-visible tool definition in a stable JSON shape."""
+
+    if isinstance(tool, dict):
+        return json_safe(tool)
+    return {
+        "name": str(getattr(tool, "name", "")),
+        "description": str(getattr(tool, "description", "") or ""),
+        "args": json_safe(getattr(tool, "args", {}) or {}),
+    }
+
+
 def summarize_message(message: BaseMessage, *, include_tool_args: bool = False) -> dict[str, Any]:
     """记录消息摘要，避免每轮 trace 重复完整上下文和工具输出。"""
 
@@ -94,6 +106,21 @@ def summarize_message(message: BaseMessage, *, include_tool_args: bool = False) 
         summary["status"] = str(getattr(message, "status", "success"))
 
     return json_safe(summary)
+
+
+def tool_action_input(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """Render the trace action input for model-requested tool calls."""
+
+    return {
+        "tool_calls": [
+            {
+                "name": str(tool_call.get("name") or ""),
+                "tool_call_id": str(tool_call.get("tool_call_id") or "") or None,
+                "args": json_safe(tool_call.get("args")),
+            }
+            for tool_call in tool_calls
+        ]
+    }
 
 
 def serialize_tool_result(value: ToolMessage | Command[Any]) -> dict[str, Any]:
@@ -214,16 +241,33 @@ class TraceEventCollector:
         *,
         scope: str,
         llm_call_index: int,
-        input_message: dict[str, Any],
+        system_message: BaseMessage | None,
+        messages: list[BaseMessage],
+        tools: list[Any],
+        tool_choice: Any,
     ) -> None:
+        input_messages = [
+            *([serialize_message(system_message)] if system_message is not None else []),
+            *(serialize_message(message) for message in messages),
+        ]
+        llm_input = {
+            "scope": scope,
+            "llm_call_index": llm_call_index,
+            "messages": input_messages,
+            "tools": [
+                serialize_tool_definition(tool)
+                for tool in tools
+            ],
+            "tool_choice": json_safe(tool_choice),
+        }
         with self._lock:
             event = TraceEvent(
                 action="llm_pending",
                 scope=scope,
                 llm_call_index=llm_call_index,
                 thought="",
-                action_input={"message": input_message},
-                raw_response={},
+                action_input={},
+                raw_response={"llm_input": llm_input},
                 observation={"status": "requesting", "tool_calls": []},
                 ok=True,
             )
@@ -244,7 +288,10 @@ class TraceEventCollector:
         with self._lock:
             event = self._llm_events[llm_call_index]
             event.thought = visible_text
-            event.raw_response = {"message": output_message}
+            event.raw_response = {
+                **event.raw_response,
+                "message": output_message,
+            }
             tool_names: list[str] = []
             for message in messages:
                 if not isinstance(message, AIMessage):
@@ -267,6 +314,8 @@ class TraceEventCollector:
                         }
                     )
             event.action = "+".join(tool_names) if tool_names else "llm_response"
+            if tool_calls:
+                event.action_input = tool_action_input(tool_calls)
             event.observation = {
                 "status": "tools_pending" if tool_calls else "completed",
                 "tool_calls": tool_calls,
@@ -390,15 +439,13 @@ class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
             messages=request.messages,
             llm_call_index=call_index,
         )
-        input_message = request.messages[-1] if request.messages else None
         self.collector.start_llm_call(
             scope=self.scope,
             llm_call_index=call_index,
-            input_message=(
-                summarize_message(input_message)
-                if input_message is not None
-                else {}
-            ),
+            system_message=request.system_message,
+            messages=request.messages,
+            tools=list(getattr(request, "tools", []) or []),
+            tool_choice=getattr(request, "tool_choice", None),
         )
         try:
             response = handler(request)
@@ -419,7 +466,7 @@ class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
             messages=response.result,
             visible_text=response_text,
             output_message=(
-                summarize_message(response.result[-1], include_tool_args=True)
+                serialize_message(response.result[-1])
                 if response.result
                 else {}
             ),

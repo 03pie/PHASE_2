@@ -8,6 +8,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     error,
     navigate_json_path,
@@ -148,7 +149,7 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
 
     context_root = (workspace / "context").resolve()
 
-    @tool("read_json")
+    @tool("read_json", description=load_tool_prompt("read_json"))
     def read_json(
         path: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
@@ -156,7 +157,7 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
         start_item: int = 0,
         max_items: int = 50,
     ) -> Any:
-        """Read a JSON file with optional path navigation and pagination."""
+        """Run the read_json tool."""
 
         resolved, path_error = resolve_context_path(
             context_root,

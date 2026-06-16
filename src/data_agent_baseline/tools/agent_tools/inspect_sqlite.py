@@ -7,6 +7,7 @@ from typing import Annotated, Any
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools._helpers import (
     DB_SUFFIXES,
     error,
@@ -17,20 +18,19 @@ from data_agent_baseline.tools._helpers import (
     virtual_path,
 )
 
-
 def create_inspect_sqlite_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create a SQLite schema/sample inspection tool."""
 
     context_root = (workspace / "context").resolve()
 
-    @tool("inspect_sqlite")
+    @tool("inspect_sqlite", description=load_tool_prompt("inspect_sqlite"))
     def inspect_sqlite(
         path: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         table: str = "",
         sample_rows: int = 5,
     ) -> Any:
-        """Inspect SQLite tables, columns, row counts, and optional sample rows."""
+        """Run the inspect_sqlite tool."""
 
         resolved, path_error = resolve_context_path(
             context_root,

@@ -17,6 +17,7 @@ from data_agent_baseline.agents.deep_state import (
     BenchmarkDeepAgentState,
     DeepAgentConfig,
 )
+from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools.answer import validate_prepared_answer
 
 
@@ -178,13 +179,13 @@ def _load_prepared_answer(
 def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """创建绑定到当前临时工作区的 execute_python 模型工具。"""
 
-    @tool("execute_python")
+    @tool("execute_python", description=load_tool_prompt("execute_python"))
     def execute_python(
         code: str,
         state: Annotated[dict[str, Any], InjectedState],
         tool_call_id: Annotated[str, InjectedToolCallId],
     ) -> ToolMessage | Command[BenchmarkDeepAgentState]:
-        """Execute Python; call set_answer(columns, rows) to submit computed data."""
+        """Run the execute_python tool."""
 
         if not code.strip():
             return ToolMessage(
