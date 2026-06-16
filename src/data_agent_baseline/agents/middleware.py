@@ -1,8 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
-from difflib import SequenceMatcher
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -44,138 +43,6 @@ _INJECTED_KNOWLEDGE_PATTERN = re.compile(
     r"<context_knowledge>\s*(.*?)\s*</context_knowledge>",
     re.DOTALL,
 )
-_USER_TRANSFORMATION_REQUIREMENT_TYPES = {
-    "filter": frozenset({"filter"}),
-    "aggregate": frozenset({"calculation"}),
-    "derive": frozenset({"calculation"}),
-    "sort": frozenset({"ordering"}),
-    "limit": frozenset({"limit"}),
-    "deduplicate": frozenset({"deduplication"}),
-    "reshape": frozenset({"reshape"}),
-}
-_KNOWLEDGE_TRANSFORMATION_RULE_TYPES = {
-    "filter": frozenset({"filter"}),
-    "aggregate": frozenset({"calculation"}),
-    "derive": frozenset({"calculation"}),
-    "sort": frozenset({"output"}),
-    "limit": frozenset({"output"}),
-    "deduplicate": frozenset({"output"}),
-    "reshape": frozenset({"output"}),
-}
-_KNOWLEDGE_FACT_KINDS_BY_OPERATION = {
-    "filter": frozenset({"filter_rule", "example_query"}),
-    "aggregate": frozenset({"calculation", "example_query", "output_rule"}),
-    "derive": frozenset({"calculation", "example_query"}),
-    "sort": frozenset({"ordering_rule", "example_query", "output_rule"}),
-    "limit": frozenset({"ordering_rule", "example_query", "output_rule"}),
-    "deduplicate": frozenset({"output_rule", "example_query"}),
-    "reshape": frozenset({"output_rule", "example_query"}),
-}
-_OPERATION_CONDITION_KEYS = {
-    "filter": "filters",
-    "aggregate": "calculations",
-    "derive": "calculations",
-    "sort": "orderings",
-    "limit": "limits",
-    "deduplicate": "deduplications",
-    "reshape": "reshapes",
-}
-_ACTION_CLAIM_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
-    "filter": (
-        re.compile(
-            r"\b(?:can|could|would|should|will|need\s+to|i\s+will|i\s+should)\s+"
-            r"select\s+(?:representative|matching|only|national|source\s+)?"
-            r"(?:rows?|records?)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\bselect\s+(?:representative|matching|only|national|source\s+)"
-            r"(?:rows?|records?)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:filter|select|keep|retain|return)\s+(?:only\s+)?"
-            r"(?:the\s+)?(?:rows?|records?|source\s+rows?)?\s*"
-            r"(?:where|with|matching|for)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"\breturn\s+only\s+(?:the\s+)?(?:rows?|records?)\b", re.IGNORECASE),
-        re.compile(r"(?:筛选|过滤|只保留|仅保留|只返回|仅返回).{0,40}(?:记录|行|数据)"),
-    ),
-    "aggregate": (
-        re.compile(
-            r"\b(?:can|could|would|should|will|need\s+to|i\s+will|i\s+should)\s+"
-            r"(?:aggregate|sum|total|roll\s*up)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:calculate|compute|derive|produce|create|return|report)\s+"
-            r"(?:the\s+)?(?:sum|total|aggregate)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:calculate|compute)\s+(?:the\s+)?sum\s+"
-            r"(?:across|of|from|over)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:sum|aggregate|total|roll\s*up)\s+(?:all\s+)?"
-            r"(?:source\s+)?(?:rows|records|values|provinces|provincial)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"\bgroup\s+by\b", re.IGNORECASE),
-        re.compile(r"(?:计算|求取|求和|汇总|加总|合计|聚合).{0,40}(?:记录|行|值|省|地区|全国|总量)"),
-    ),
-    "derive": (
-        re.compile(
-            r"\b(?:calculate|compute|derive|create|produce)\s+"
-            r"(?:(?:a|an|the)\s+)?(?:ratio|rate|share|percentage|growth|"
-            r"difference|delta|change|index|indicator|derived)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"(?:派生|计算|生成).{0,40}(?:比例|占比|率|增速|增长|差值|变化|指标|新列)"),
-    ),
-    "sort": (
-        re.compile(
-            r"\b(?:sort|order|rank)\s+(?:the\s+)?"
-            r"(?:rows|records|values|data|result|results)?\s*"
-            r"(?:by|ascending|descending|from)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"\border\s+by\b", re.IGNORECASE),
-        re.compile(r"(?:排序|按.{1,40}排序|降序|升序|排名)"),
-    ),
-    "limit": (
-        re.compile(
-            r"\b(?:limit|keep|return|select|take)\s+(?:the\s+)?"
-            r"(?:top|bottom|first|last|latest|earliest)\s+\d+\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"\b(?:top|bottom)\s+\d+\b", re.IGNORECASE),
-        re.compile(r"(?:前|后|最新|最早)\s*\d+\s*(?:条|个|行|年)"),
-    ),
-    "deduplicate": (
-        re.compile(r"\b(?:deduplicate|de-duplicate|remove\s+duplicates|distinct)\b", re.IGNORECASE),
-        re.compile(r"(?:去重|删除重复|唯一值)"),
-    ),
-    "reshape": (
-        re.compile(
-            r"\b(?:pivot|unpivot|transpose|reshape|wide\s+format|long\s+format)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"(?:透视|转置|宽表|长表|重塑)"),
-    ),
-}
-_OUTPUT_COLUMN_REQUIREMENT_TYPES = frozenset(
-    {
-        "calculation",
-        "entity",
-        "grouping",
-        "measure",
-        "output_column",
-    }
-)
-_CONTEXT_COLUMN_ROLES = frozenset({"entity_key", "record_key", "time_key"})
 _REVISION_FIELDS = (
     "intent",
     "output_spec",
@@ -215,15 +82,15 @@ class _DiscoveryState:
         return bool(self.context_sources)
 
     def tool_policy(self) -> tuple[set[str], str | None]:
-        """根据已掌握的信息决定下一轮可见工具及是否强制调用。"""
+        """Choose visible tools and optional forced tool choice."""
 
         if not self.context_ready:
             return set(_SOURCE_DISCOVERY_TOOLS), None
-        return {"analyze_plan"}, "analyze_plan"
+        return set(_SOURCE_DISCOVERY_TOOLS) | {"analyze_plan"}, None
 
 
 def tool_name(value: Any) -> str:
-    """兼容 LangChain 工具对象和字典形式的工具定义。"""
+    """Return a tool name from LangChain tool objects or dict definitions."""
 
     if isinstance(value, dict):
         return str(value.get("name") or value.get("function", {}).get("name") or "")
@@ -231,7 +98,7 @@ def tool_name(value: Any) -> str:
 
 
 def _invalid_tool_name(response: ModelResponse[Any]) -> str | None:
-    """识别只有格式错误工具调用、没有可执行调用的模型响应。"""
+    """Detect a response with only invalid, unparsable tool calls."""
 
     for message in response.result:
         if not isinstance(message, AIMessage):
@@ -246,7 +113,7 @@ def _retry_invalid_tool_call(
     handler: Callable[[ModelRequest[None]], ModelResponse[Any]],
     response: ModelResponse[Any],
 ) -> ModelResponse[Any]:
-    """让模型纠正一次工具参数格式，避免图把解析失败误判为正常结束。"""
+    """Let the model retry once when tool-call JSON was malformed."""
 
     invalid_name = _invalid_tool_name(response)
     if invalid_name is None:
@@ -553,170 +420,6 @@ def _canonicalize_preserve_output_policy(
     )
 
 
-def _canonical_requirements_from_question_structure(
-    state: Mapping[str, Any],
-) -> list[dict[str, str]] | None:
-    if not state.get("question_structure_enforced"):
-        return None
-    structure = state.get("question_structure")
-    if not isinstance(structure, Mapping):
-        return None
-
-    question_text = str(
-        structure.get("original_question") or state.get("original_request") or ""
-    )
-    requirements: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def append_requirement(
-        *,
-        quote: Any,
-        requirement_type: str | None,
-        statement: Any,
-    ) -> None:
-        quote_text = str(quote or "").strip()
-        statement_text = str(statement or "").strip()
-        if not quote_text or not requirement_type:
-            return
-        if question_text and quote_text not in question_text:
-            return
-        key = (quote_text, requirement_type)
-        if key in seen:
-            return
-        seen.add(key)
-        requirements.append(
-            {
-                "statement": statement_text or f"{requirement_type}: {quote_text}",
-                "requirement_type": requirement_type,
-                "quote": quote_text,
-            }
-        )
-
-    target_type_map = {
-        "entity": "entity",
-        "measure": "measure",
-        "record_set": "output",
-    }
-    for target in structure.get("targets") or []:
-        if not isinstance(target, Mapping):
-            continue
-        requirement_type = target_type_map.get(str(target.get("target_type") or ""))
-        append_requirement(
-            quote=target.get("quote"),
-            requirement_type=requirement_type,
-            statement=target.get("description") or target.get("name"),
-        )
-
-    constraint_type_map = {
-        "entity": "entity",
-        "filter": "filter",
-        "geography": "entity",
-        "grouping": "grouping",
-        "limit": "limit",
-        "ordering": "ordering",
-        "output_shape": "output",
-        "scope": "entity",
-        "time_range": "time_range",
-    }
-    for constraint in structure.get("target_constraints") or []:
-        if not isinstance(constraint, Mapping):
-            continue
-        constraint_type = str(constraint.get("constraint_type") or "")
-        requirement_type = constraint_type_map.get(constraint_type)
-        statement_parts = [
-            constraint_type,
-            str(constraint.get("value") or "").strip(),
-        ]
-        append_requirement(
-            quote=constraint.get("quote"),
-            requirement_type=requirement_type,
-            statement=": ".join(part for part in statement_parts if part),
-        )
-
-    condition_type_map = {
-        "calculations": "calculation",
-        "filters": "filter",
-        "groupings": "grouping",
-        "limits": "limit",
-        "orderings": "ordering",
-        "output_columns": "output_column",
-        "time_ranges": "time_range",
-    }
-    conditions = structure.get("conditions") or {}
-    if isinstance(conditions, Mapping):
-        for key, requirement_type in condition_type_map.items():
-            for item in conditions.get(key) or []:
-                if isinstance(item, Mapping):
-                    quote = item.get("quote")
-                    statement = (
-                        item.get("description")
-                        or item.get("statement")
-                        or item.get("value")
-                        or key
-                    )
-                else:
-                    quote = item
-                    statement = key
-                append_requirement(
-                    quote=quote,
-                    requirement_type=requirement_type,
-                    statement=statement,
-                )
-
-    operator_type_map = {
-        "aggregate": "calculation",
-        "derive": "calculation",
-        "sort": "ordering",
-        "limit": "limit",
-    }
-    for operator in structure.get("intent_operators") or []:
-        if not isinstance(operator, Mapping):
-            continue
-        operation = str(operator.get("operation") or "")
-        requirement_type = operator_type_map.get(operation)
-        append_requirement(
-            quote=operator.get("quote"),
-            requirement_type=requirement_type,
-            statement=f"{operation}: {operator.get('operator_type') or operator.get('quote')}",
-        )
-        if operation == "aggregate" and str(operator.get("operator_type") or "") == "distribution":
-            append_requirement(
-                quote=operator.get("quote"),
-                requirement_type="grouping",
-                statement=f"{operation}: distribution group key",
-            )
-
-    return requirements or None
-
-
-def _canonicalize_intent_requirements(request: ToolCallRequest) -> ToolCallRequest:
-    canonical_requirements = _canonical_requirements_from_question_structure(
-        request.state
-    )
-    if not canonical_requirements:
-        return request
-    arguments = request.tool_call.get("args")
-    if not isinstance(arguments, Mapping):
-        return request
-    intent = arguments.get("intent")
-    if not isinstance(intent, Mapping):
-        return request
-    if intent.get("requirements") == canonical_requirements:
-        return request
-    return request.override(
-        tool_call={
-            **request.tool_call,
-            "args": {
-                **dict(arguments),
-                "intent": {
-                    **dict(intent),
-                    "requirements": canonical_requirements,
-                },
-            },
-        }
-    )
-
-
 def _canonicalize_revision(request: ToolCallRequest) -> ToolCallRequest:
     arguments = request.tool_call.get("args")
     if not isinstance(arguments, Mapping):
@@ -785,7 +488,7 @@ def _injected_knowledge_content(messages: list[BaseMessage]) -> str | None:
 
 
 def _normalized_quote_text(value: str) -> str:
-    """仅忽略 Markdown 和标点差异，用于定位唯一的原始知识行。"""
+    """Normalize markdown and punctuation for exact quote localization."""
 
     return " ".join(
         re.sub(r"[^\w\u4e00-\u9fff]+", " ", value, flags=re.UNICODE)
@@ -794,19 +497,11 @@ def _normalized_quote_text(value: str) -> str:
     )
 
 
-def _quote_tokens(value: str) -> set[str]:
-    return {
-        token
-        for token in _normalized_quote_text(value).split()
-        if len(token) > 1 or re.search(r"[\u4e00-\u9fff]", token)
-    }
-
-
 def _canonical_knowledge_quote(
     quote: str,
     knowledge_content: str | None,
 ) -> str | None:
-    """把格式被简化的引用还原为 knowledge 中唯一存在的原始行。"""
+    """Resolve a simplified quote only when it maps to one knowledge line."""
 
     if not knowledge_content:
         return None
@@ -822,34 +517,7 @@ def _canonical_knowledge_quote(
     ]
     if len(matches) == 1:
         return matches[0]
-
-    quote_tokens = _quote_tokens(quote)
-    if len(quote_tokens) < 3:
-        return None
-    fuzzy_matches: list[tuple[float, str]] = []
-    for line in knowledge_content.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        normalized_line = _normalized_quote_text(stripped)
-        line_tokens = _quote_tokens(stripped)
-        if not line_tokens:
-            continue
-        token_recall = len(quote_tokens & line_tokens) / len(quote_tokens)
-        sequence_ratio = SequenceMatcher(
-            None,
-            normalized_quote,
-            normalized_line,
-        ).ratio()
-        score = max(token_recall, sequence_ratio)
-        if score >= 0.82:
-            fuzzy_matches.append((score, stripped))
-
-    if not fuzzy_matches:
-        return None
-    best_score = max(score for score, _ in fuzzy_matches)
-    best_matches = [line for score, line in fuzzy_matches if score == best_score]
-    return best_matches[0] if len(best_matches) == 1 else None
+    return None
 
 
 
@@ -857,7 +525,7 @@ def _canonicalize_plan_quotes(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
 ) -> ToolCallRequest:
-    """将可唯一定位的 knowledge 引用替换成真实原文后再校验和落盘。"""
+    """Replace uniquely located knowledge quotes before validation."""
 
     raw_arguments = request.tool_call.get("args") or {}
     if not isinstance(raw_arguments, Mapping):
@@ -868,6 +536,31 @@ def _canonicalize_plan_quotes(
         return request
     evidence = dict(raw_evidence)
     changed = False
+    if str(evidence.get("knowledge_status") or "") != "authoritative":
+        context_sources = [
+            source
+            for source in evidence.get("context_sources") or []
+            if not (
+                isinstance(source, Mapping)
+                and str(source.get("path") or "").replace("\\", "/").lower()
+                == "/context/knowledge.md"
+            )
+        ]
+        if context_sources != evidence.get("context_sources"):
+            evidence["context_sources"] = context_sources
+            changed = True
+        if evidence.get("knowledge_rules"):
+            evidence["knowledge_rules"] = []
+            changed = True
+        if changed:
+            arguments["evidence"] = evidence
+            return request.override(
+                tool_call={
+                    **request.tool_call,
+                    "args": arguments,
+                }
+            )
+        return request
 
     knowledge_facts_by_id = {
         fact.fact_id: fact for fact in parse_knowledge_content(discovery.knowledge_content)
@@ -908,7 +601,7 @@ def _canonicalize_plan_quotes(
 
 
 def _context_sources(tool: str, arguments: dict[str, Any]) -> set[str]:
-    """从成功的探索调用中提取实际检查过的上下文来源。"""
+    """Extract context sources inspected by successful discovery calls."""
 
     if tool in {
         "grep_file",
@@ -940,7 +633,7 @@ def _context_sources(tool: str, arguments: dict[str, Any]) -> set[str]:
 
 
 def _discovery_state(messages: list[BaseMessage]) -> _DiscoveryState:
-    """汇总计划前已经检查的 knowledge 和独立数据来源。"""
+    """Summarize knowledge and context sources observed before planning."""
 
     tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
     injected_knowledge = _injected_knowledge_content(messages)
@@ -1032,474 +725,11 @@ def _plan_error(
     return _tool_error(request, f"Invalid analysis plan: {content}")
 
 
-def _plan_rejection_payload(
-    *,
-    code: str,
-    json_path: str,
-    operation: str,
-    offending_text: str,
-    field_text: str,
-    facts: list[str],
-    required_fix: str,
-    intent_reconsideration: Mapping[str, Any],
-) -> str:
-    return json.dumps(
-        {
-            "code": code,
-            "json_path": json_path,
-            "operation": operation,
-            "offending_text": offending_text,
-            "field_text": field_text,
-            "facts": facts,
-            "intent_reconsideration": dict(intent_reconsideration),
-            "required_fix": required_fix,
-        },
-        ensure_ascii=False,
-    )
-
-
-def _free_text_plan_fields(arguments: Mapping[str, Any]) -> list[tuple[str, str]]:
-    fields: list[tuple[str, str]] = []
-    evidence = arguments.get("evidence") or {}
-    if isinstance(evidence, Mapping):
-        inference = str(evidence.get("cross_validated_inference") or "").strip()
-        if inference:
-            fields.append(("/evidence/cross_validated_inference", inference))
-
-    intent = arguments.get("intent") or {}
-    if isinstance(intent, Mapping):
-        for index, item in enumerate(intent.get("unresolved") or []):
-            text = str(item or "").strip()
-            if text:
-                fields.append((f"/intent/unresolved/{index}", text))
-
-    for index, item in enumerate(arguments.get("steps") or []):
-        text = str(item or "").strip()
-        if text:
-            fields.append((f"/steps/{index}", text))
-
-    return fields
-
-
-def _detect_action_claim(text: str) -> tuple[str, str] | None:
-    for operation, patterns in _ACTION_CLAIM_PATTERNS.items():
-        for pattern in patterns:
-            match = pattern.search(text)
-            if match is not None:
-                return operation, match.group(0)
-    return None
-
-
-def _operation_is_authorized(
-    operation: str,
-    *,
-    requirement_types_by_quote: Mapping[str, set[str]],
-    rule_quotes_by_type: Mapping[str, set[str]],
-    declared_operations: set[str],
-) -> bool:
-    if operation in declared_operations:
-        return True
-
-    user_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(operation, frozenset())
-    if any(
-        requirement_type in user_types
-        for requirement_types in requirement_types_by_quote.values()
-        for requirement_type in requirement_types
-    ):
-        return True
-
-    rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(operation, frozenset())
-    return any(rule_quotes_by_type.get(rule_type) for rule_type in rule_types)
-
-
-def _authorization_facts(
-    *,
-    arguments: Mapping[str, Any],
-    operation: str,
-    json_path: str,
-    offending_text: str,
-    original_request: str,
-    requirement_types_by_quote: Mapping[str, set[str]],
-    rule_quotes_by_type: Mapping[str, set[str]],
-    declared_operations: set[str],
-    question_conditions: Mapping[str, list[Any]] | None,
-) -> list[str]:
-    user_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(operation, frozenset())
-    rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(operation, frozenset())
-    facts = [
-        f"Original request text: {original_request!r}.",
-        (
-            "Plan intent quotes from the original request are "
-            f"{sorted(requirement_types_by_quote)}."
-        ),
-        (
-            f"{json_path} contains an execution claim for {operation!r}: "
-            f"{offending_text!r}."
-        ),
-        (
-            "Observed user requirement types are "
-            f"{sorted({item for values in requirement_types_by_quote.values() for item in values})}; "
-            f"{operation!r} requires one of {sorted(user_types)}."
-        ),
-        (
-            "Observed knowledge rule types are "
-            f"{sorted(rule_quotes_by_type)}; {operation!r} requires one of "
-            f"{sorted(rule_types)}."
-        ),
-        (
-            "Declared authorized transformations are "
-            f"{sorted(declared_operations)}."
-        ),
-    ]
-    evidence = arguments.get("evidence") or {}
-    if isinstance(evidence, Mapping):
-        for source in evidence.get("context_sources") or []:
-            if not isinstance(source, Mapping):
-                continue
-            path = str(source.get("path") or "").strip()
-            observations = [
-                str(item).strip()
-                for item in source.get("observations") or []
-                if str(item).strip()
-            ]
-            if path and observations:
-                facts.append(
-                    f"Observed source facts from {path}: "
-                    + " | ".join(observations[:4])
-                )
-    condition_key = _OPERATION_CONDITION_KEYS.get(operation)
-    if question_conditions is not None and condition_key is not None:
-        facts.append(
-            "question_structure.conditions."
-            f"{condition_key} has "
-            f"{len(question_conditions.get(condition_key, []))} item(s)."
-        )
-    if question_conditions is not None:
-        facts.append(
-            "question_structure captured explicit transformation conditions as "
-            + json.dumps(
-                {
-                    key: len(question_conditions.get(key, []))
-                    for key in (
-                        "filters",
-                        "calculations",
-                        "orderings",
-                        "limits",
-                        "groupings",
-                        "output_columns",
-                    )
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-            + "."
-        )
-    return facts
-
-
-def _intent_reconsideration_payload(
-    *,
-    operation: str,
-    json_path: str,
-    offending_text: str,
-    original_request: str,
-    requirement_types_by_quote: Mapping[str, set[str]],
-    question_conditions: Mapping[str, list[Any]] | None,
-) -> dict[str, Any]:
-    condition_key = _OPERATION_CONDITION_KEYS.get(operation)
-    condition_count = (
-        len(question_conditions.get(condition_key, []))
-        if question_conditions is not None and condition_key is not None
-        else None
-    )
-    return {
-        "issue": (
-            "The plan is using an observed data capability as if it were part of "
-            "the user's intent."
-        ),
-        "trigger": {
-            "json_path": json_path,
-            "operation": operation,
-            "text": offending_text,
-        },
-        "source_text_to_reinterpret": {
-            "original_request": original_request,
-            "requirement_quotes": [
-                {"quote": quote, "requirement_type": requirement_type}
-                for quote, requirement_types in requirement_types_by_quote.items()
-                for requirement_type in sorted(requirement_types)
-            ],
-        },
-        "fact_based_questions": [
-            (
-                "Did the user explicitly ask for this operation, or did it arise "
-                "only because the observed source grain/scope differs from the "
-                "wording of the question?"
-            ),
-            (
-                "Is there an existing source row or field that satisfies the "
-                "requested scope without deriving, filtering, sorting, limiting, "
-                "deduplicating, or reshaping rows?"
-            ),
-            (
-                "If the source grain does not exactly match the requested scope, "
-                "should the plan preserve source rows and record the scope "
-                "mismatch instead of synthesizing a new answer?"
-            ),
-        ],
-        "condition_count": condition_count,
-        "allowed_revisions": [
-            (
-                "Keep the original user requirement quotes, but revise the "
-                "interpretation to a source-record retrieval plan when the "
-                "question asks for records and no transformation is authorized."
-            ),
-            (
-                "Move a transformation into output_spec.transformations only if "
-                "it can cite an explicit user quote or an observed knowledge rule "
-                "that authorizes that operation."
-            ),
-            (
-                "When the data scope/grain is mismatched, state the mismatch in "
-                "intent.unresolved and evidence as a fact, then preserve source "
-                "row grain."
-            ),
-        ],
-    }
-
-
-def _validate_free_text_action_claims(
-    request: ToolCallRequest,
-    *,
-    arguments: Mapping[str, Any],
-    requirement_types_by_quote: Mapping[str, set[str]],
-    rule_quotes_by_type: Mapping[str, set[str]],
-    declared_operations: set[str],
-    question_conditions: Mapping[str, list[Any]] | None,
-) -> ToolMessage | None:
-    original_request = str(request.state.get("original_request") or "")
-    for json_path, text in _free_text_plan_fields(arguments):
-        action_claim = _detect_action_claim(text)
-        if action_claim is None:
-            continue
-        operation, offending_text = action_claim
-        if _operation_is_authorized(
-            operation,
-            requirement_types_by_quote=requirement_types_by_quote,
-            rule_quotes_by_type=rule_quotes_by_type,
-            declared_operations=declared_operations,
-        ):
-            continue
-
-        facts = _authorization_facts(
-            arguments=arguments,
-            operation=operation,
-            json_path=json_path,
-            offending_text=offending_text,
-            original_request=original_request,
-            requirement_types_by_quote=requirement_types_by_quote,
-            rule_quotes_by_type=rule_quotes_by_type,
-            declared_operations=declared_operations,
-            question_conditions=question_conditions,
-        )
-        return _plan_error(
-            request,
-            _plan_rejection_payload(
-                code="UNAUTHORIZED_PLAN_ACTION",
-                json_path=json_path,
-                operation=operation,
-                offending_text=offending_text,
-                field_text=text,
-                facts=facts,
-                intent_reconsideration=_intent_reconsideration_payload(
-                    operation=operation,
-                    json_path=json_path,
-                    offending_text=offending_text,
-                    original_request=original_request,
-                    requirement_types_by_quote=requirement_types_by_quote,
-                    question_conditions=question_conditions,
-                ),
-                required_fix=(
-                    "Reconsider the intent against the observed facts. If the "
-                    "operation was inferred only to reconcile a source grain/scope "
-                    "mismatch, revise the plan to preserve source rows and explain "
-                    "the mismatch. If the operation is genuinely intended, declare "
-                    "it in output_spec.transformations with a valid user or "
-                    "knowledge authorization."
-                ),
-            ),
-        )
-
-    return None
-
-
-def _question_structure_conditions(state: Mapping[str, Any]) -> dict[str, list[Any]] | None:
-    if not state.get("question_structure_enforced"):
-        return None
-    structure = state.get("question_structure")
-    if not isinstance(structure, Mapping):
-        return None
-    conditions = structure.get("conditions")
-    if not isinstance(conditions, Mapping):
-        return {}
-    return {
-        str(key): value
-        for key, value in conditions.items()
-        if isinstance(value, list)
-    }
-
-
-def _question_structure_target_count(state: Mapping[str, Any]) -> int | None:
-    if not state.get("question_structure_enforced"):
-        return None
-    structure = state.get("question_structure")
-    if not isinstance(structure, Mapping):
-        return None
-    targets = structure.get("targets")
-    return len(targets) if isinstance(targets, list) else 0
-
-
-def _quoted_requirement_support(state: Mapping[str, Any]) -> set[tuple[str, str]] | None:
-    """Return quote/type pairs produced by the isolated question structure."""
-
-    if not state.get("question_structure_enforced"):
-        return None
-    structure = state.get("question_structure")
-    if not isinstance(structure, Mapping):
-        return None
-
-    question_text = str(
-        structure.get("original_question") or state.get("original_request") or ""
-    )
-    supported: set[tuple[str, str]] = set()
-
-    target_type_map = {
-        "entity": "entity",
-        "measure": "measure",
-        "record_set": "output",
-    }
-    for target in structure.get("targets") or []:
-        if not isinstance(target, Mapping):
-            continue
-        quote = str(target.get("quote") or "").strip()
-        requirement_type = target_type_map.get(str(target.get("target_type") or ""))
-        if quote and requirement_type and (not question_text or quote in question_text):
-            supported.add((quote, requirement_type))
-
-    constraint_type_map = {
-        "entity": "entity",
-        "filter": "filter",
-        "geography": "entity",
-        "grouping": "grouping",
-        "limit": "limit",
-        "ordering": "ordering",
-        "output_shape": "output",
-        "scope": "entity",
-        "time_range": "time_range",
-    }
-    for constraint in structure.get("target_constraints") or []:
-        if not isinstance(constraint, Mapping):
-            continue
-        quote = str(constraint.get("quote") or "").strip()
-        requirement_type = constraint_type_map.get(
-            str(constraint.get("constraint_type") or "")
-        )
-        if quote and requirement_type and (not question_text or quote in question_text):
-            supported.add((quote, requirement_type))
-
-    condition_type_map = {
-        "calculations": "calculation",
-        "filters": "filter",
-        "groupings": "grouping",
-        "limits": "limit",
-        "orderings": "ordering",
-        "output_columns": "output_column",
-        "time_ranges": "time_range",
-    }
-    conditions = structure.get("conditions") or {}
-    if isinstance(conditions, Mapping):
-        for key, requirement_type in condition_type_map.items():
-            for item in conditions.get(key) or []:
-                quote = (
-                    str(item.get("quote") or "").strip()
-                    if isinstance(item, Mapping)
-                    else str(item or "").strip()
-                )
-                if quote and (not question_text or quote in question_text):
-                    supported.add((quote, requirement_type))
-
-    operator_type_map = {
-        "aggregate": "calculation",
-        "derive": "calculation",
-        "sort": "ordering",
-        "limit": "limit",
-    }
-    for operator in structure.get("intent_operators") or []:
-        if not isinstance(operator, Mapping):
-            continue
-        quote = str(operator.get("quote") or "").strip()
-        operation = str(operator.get("operation") or "")
-        requirement_type = operator_type_map.get(operation)
-        if quote and requirement_type and (not question_text or quote in question_text):
-            supported.add((quote, requirement_type))
-        if (
-            quote
-            and operation == "aggregate"
-            and str(operator.get("operator_type") or "") == "distribution"
-            and (not question_text or quote in question_text)
-        ):
-            supported.add((quote, "grouping"))
-
-    return supported
-
-
-def _question_structure_context_capacity(
-    state: Mapping[str, Any],
-) -> dict[str, int] | None:
-    """Return how many source-row context columns the isolated question supports."""
-
-    if not state.get("question_structure_enforced"):
-        return None
-    structure = state.get("question_structure")
-    if not isinstance(structure, Mapping):
-        return None
-
-    capacities = {role: 0 for role in _CONTEXT_COLUMN_ROLES}
-    constraints = structure.get("target_constraints") or []
-    for constraint in constraints:
-        if not isinstance(constraint, Mapping):
-            continue
-        constraint_type = str(constraint.get("constraint_type") or "")
-        if constraint_type == "time_range":
-            capacities["time_key"] += 1
-        if constraint_type in {"entity", "geography", "scope"}:
-            capacities["entity_key"] += 1
-
-    conditions = structure.get("conditions") or {}
-    if isinstance(conditions, Mapping):
-        capacities["time_key"] += len(conditions.get("time_ranges") or [])
-        capacities["entity_key"] += len(conditions.get("filters") or [])
-        capacities["entity_key"] += len(conditions.get("groupings") or [])
-
-    output = structure.get("output") or {}
-    if isinstance(output, Mapping):
-        if str(output.get("row_grain_hint") or "") == "source_records":
-            capacities["record_key"] += 1
-        if str(output.get("preserve_source_rows") or "") == "true":
-            capacities["record_key"] += 1
-
-    return capacities
-
-
-def _column_role(column: Any) -> str:
-    return str(column.get("role") or "") if isinstance(column, Mapping) else ""
-
-
 def _validate_plan_contract(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
 ) -> ToolMessage | None:
-    """用可核验的引用和状态约束计划，不推断自然语言语义。"""
+    """Validate plans using explicit quotes and observed state only."""
 
     arguments = request.tool_call.get("args") or {}
     if not isinstance(arguments, Mapping):
@@ -1645,28 +875,6 @@ def _validate_plan_contract(
                         f"final output_spec.columns: {overlap}."
                     ),
                 )
-    output_column_capacity = sum(
-        1
-        for requirement_types in requirement_types_by_quote.values()
-        for requirement_type in requirement_types
-        if requirement_type in _OUTPUT_COLUMN_REQUIREMENT_TYPES
-    )
-    if output_column_capacity > 0 and len(target_output_columns) > output_column_capacity:
-        return _plan_error(
-            request,
-            (
-                "output_spec.columns is final answer only. Move selector, "
-                "filter, join, or context fields to execution_spec.supporting_fields; "
-                f"got {len(target_output_columns)} final columns but "
-                f"{output_column_capacity} answer-bearing requirement(s)."
-            ),
-        )
-    if output_column_capacity > 0 and not target_output_columns:
-        return _plan_error(
-            request,
-            "at least one non-context output column must satisfy the requested target.",
-        )
-    question_conditions = _question_structure_conditions(request.state)
     if transformations and row_policy != "transform":
         return _plan_error(
             request,
@@ -1694,59 +902,31 @@ def _validate_plan_contract(
                 "preserve plans cannot define sort keys.",
             )
 
-    supported_requirements = _quoted_requirement_support(request.state)
-
     def user_authorization_error(operation: str, quote: str) -> str | None:
-        requirement_types = requirement_types_by_quote.get(quote, set())
-        allowed_types = _USER_TRANSFORMATION_REQUIREMENT_TYPES.get(
-            operation, frozenset()
-        )
-        if not (requirement_types & allowed_types):
+        del operation
+        if not quote or quote not in original_request:
             return (
-                f"user authorization for {operation!r} must cite an explicit "
-                f"requirement typed as one of {sorted(allowed_types)}."
-            )
-        if supported_requirements is not None and not any(
-            (quote, requirement_type) in supported_requirements
-            for requirement_type in requirement_types & allowed_types
-        ):
-            return (
-                f"user authorization for {operation!r} must be supported "
-                "by the isolated question structure with the same quote "
-                "and requirement type."
+                "user authorization must cite an exact quote from "
+                "original_request."
             )
         return None
 
     def knowledge_authorization_error(operation: str, quote: str) -> str | None:
-        allowed_rule_types = _KNOWLEDGE_TRANSFORMATION_RULE_TYPES.get(
-            operation, frozenset()
-        )
-        authorized_quotes = set().union(
-            *(
-                rule_quotes_by_type.get(rule_type, set())
-                for rule_type in allowed_rule_types
-            )
-        )
-        if quote not in authorized_quotes:
+        del operation
+        authorized_quotes = {
+            quote
+            for quotes in rule_quotes_by_type.values()
+            for quote in quotes
+        }
+        if not quote or quote not in authorized_quotes:
             return (
-                f"knowledge authorization for {operation!r} must cite an "
-                f"observed rule typed as one of {sorted(allowed_rule_types)}."
+                "knowledge authorization must cite an observed knowledge quote."
             )
         return None
 
     def fact_authorizes_operation(operation: str, fact_id: str) -> bool:
-        fact = knowledge_facts_by_id.get(fact_id)
-        if fact is None:
-            return False
-        allowed_kinds = _KNOWLEDGE_FACT_KINDS_BY_OPERATION.get(
-            operation, frozenset()
-        )
-        fact_operations = {
-            item.strip()
-            for item in str(fact.operation or "").split(",")
-            if item.strip()
-        }
-        return fact.kind in allowed_kinds or operation in fact_operations
+        del operation
+        return fact_id in knowledge_facts_by_id
 
     for transformation in transformations:
         if not isinstance(transformation, dict):
@@ -1769,7 +949,6 @@ def _validate_plan_contract(
                 "context evidence cannot authorize a transformation.",
             )
 
-    execution_operations: set[str] = set()
     if isinstance(execution_spec, Mapping):
         for index, operation_item in enumerate(execution_spec.get("operations") or []):
             if not isinstance(operation_item, Mapping):
@@ -1816,25 +995,6 @@ def _validate_plan_contract(
                         "or a valid KnowledgeFact.fact_id."
                     ),
                 )
-            execution_operations.add(operation)
-
-    declared_operations = {
-        str(transformation.get("operation") or "")
-        for transformation in transformations
-        if isinstance(transformation, Mapping)
-        and str(transformation.get("operation") or "")
-    } | execution_operations
-    free_text_error = _validate_free_text_action_claims(
-        request,
-        arguments=arguments,
-        requirement_types_by_quote=requirement_types_by_quote,
-        rule_quotes_by_type=rule_quotes_by_type,
-        declared_operations=declared_operations,
-        question_conditions=question_conditions,
-    )
-    if free_text_error is not None:
-        return free_text_error
-
     revision = arguments.get("revision") or {}
     if not isinstance(revision, Mapping):
         return _plan_error(request, "revision must be a JSON object.")
@@ -1892,7 +1052,7 @@ def _validate_plan_contract(
 
 
 class AnswerMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
-    """计算结果进入状态后直接完成，不再要求模型复述完整表格。"""
+    """End the graph once a prepared answer is available."""
 
     state_schema = BenchmarkDeepAgentState
 
@@ -1915,7 +1075,7 @@ class AnswerMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
 
 
 class CustomSystemPromptMiddleware(AgentMiddleware[Any, None, Any]):
-    """在工具注入后替换系统提示词，避免 SDK 默认提示词进入模型请求。"""
+    """Replace SDK system prompts after tool injection."""
 
     def __init__(self, prompt: str) -> None:
         super().__init__()
@@ -1934,7 +1094,7 @@ class CustomSystemPromptMiddleware(AgentMiddleware[Any, None, Any]):
 
 
 class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
-    """强制执行 Discovery -> Plan -> Todos，并允许执行中修订计划。"""
+    """Enforce Discovery -> Plan -> Todos and allow revisions."""
 
     state_schema = BenchmarkDeepAgentState
     tools = [analyze_plan_tool]
@@ -1984,17 +1144,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                     request,
                     "Only discovery tools are available before analyze_plan.",
                 )
-            if current_tool_name in _SOURCE_DISCOVERY_TOOLS:
-                if discovery.context_ready:
-                    return _tool_error(
-                        request,
-                        (
-                            "Discovery is already sufficient for the current "
-                            "question_structure and context evidence. Call "
-                            "analyze_plan instead of exploring another source."
-                        ),
-                    )
-
         if current_tool_name == "analyze_plan":
             assert discovery is not None
             if not (discovery.knowledge_ready and discovery.context_ready):
@@ -2005,7 +1154,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                         "required independent data sources."
                     ),
             )
-            request = _canonicalize_intent_requirements(request)
             request = _canonicalize_plan_quotes(request, discovery)
             request = _canonicalize_preserve_expected_row_count(request)
             request = _canonicalize_preserve_output_policy(request)
@@ -2032,7 +1180,7 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
 
 
 class DisabledToolGuardMiddleware(AgentMiddleware[Any, None, Any]):
-    """拒绝执行官方 profile 已排除的内置工具。"""
+    """Reject built-in tools excluded from the benchmark harness."""
 
     def wrap_tool_call(
         self,
@@ -2054,7 +1202,7 @@ class DisabledToolGuardMiddleware(AgentMiddleware[Any, None, Any]):
 
 
 def workspace_permissions() -> list[FilesystemPermission]:
-    """上下文只读；scratch 由后端默认规则管理。"""
+    """Allow read-only context access; scratch is managed by the backend."""
 
     context_paths = ["/context/**"]
     return [
