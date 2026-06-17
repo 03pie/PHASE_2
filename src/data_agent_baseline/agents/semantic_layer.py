@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import sqlite3
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -36,6 +37,9 @@ BindingConfidence = Literal[
 
 DB_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 DOC_SUFFIXES = {".log", ".md", ".pdf", ".txt"}
+_TIME_EXPRESSION_PATTERN = re.compile(
+    r"[近第]?[0-9一二三四五六七八九十百千万两]+[年月日季周]+"
+)
 
 
 @dataclass(frozen=True)
@@ -77,7 +81,29 @@ def _virtual_path(path: Path, context_root: Path) -> str:
 
 
 def _normalize_name(value: str | None) -> str:
-    return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _semantic_tokens(value: str | None) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    tokens = {
+        token
+        for token in re.findall(r"[0-9a-z_]{2,}", text)
+        if token
+    }
+    for sequence in re.findall(r"[\u3400-\u9fff]+", text):
+        if len(sequence) < 2:
+            continue
+        tokens.add(sequence)
+        for size in (2, 3, 4):
+            if len(sequence) < size:
+                continue
+            tokens.update(
+                sequence[index : index + size]
+                for index in range(0, len(sequence) - size + 1)
+            )
+    return tokens
 
 
 def _split_markdown_row(line: str) -> list[str] | None:
@@ -134,6 +160,37 @@ def _fields_from_text(text: str) -> list[str]:
         if value not in fields:
             fields.append(value)
     return fields
+
+
+def _time_terms_from_text(text: str) -> list[str]:
+    terms: list[str] = []
+    for match in _TIME_EXPRESSION_PATTERN.finditer(text):
+        term = match.group(0).lstrip("近第")
+        if term and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _knowledge_fact_terms(fact: KnowledgeFact) -> list[str]:
+    terms: list[str] = []
+    for value in (
+        fact.logical_table,
+        fact.logical_field,
+        fact.operation,
+        fact.quote,
+    ):
+        if value:
+            terms.append(value)
+    row = _split_markdown_row(fact.quote)
+    if row is not None:
+        terms.extend(row)
+    terms.extend(_fields_from_text(fact.quote))
+    terms.extend(_time_terms_from_text(fact.quote))
+    return [
+        term
+        for term in dict.fromkeys(str(item).strip() for item in terms)
+        if _normalize_name(term)
+    ]
 
 
 def _status_for_fact(
@@ -530,27 +587,39 @@ def _line_evidence(
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
+    term_values = [str(term) for term in terms]
     normalized_terms = [
         _normalize_name(term)
-        for term in terms
+        for term in term_values
         if _normalize_name(term)
     ]
-    if not normalized_terms:
+    term_tokens = set().union(*(_semantic_tokens(term) for term in term_values))
+    if not normalized_terms and not term_tokens:
         return []
-    evidence: list[dict[str, Any]] = []
+    scored_evidence: list[tuple[int, int, dict[str, Any]]] = []
     for index, line in enumerate(lines):
         normalized_line = _normalize_name(line)
-        if not any(term in normalized_line for term in normalized_terms):
+        line_tokens = _semantic_tokens(line)
+        matched_terms = sorted(term_tokens & line_tokens)
+        exact_score = sum(
+            max(6, len(term))
+            for term in normalized_terms
+            if term and term in normalized_line
+        )
+        score = exact_score + len(matched_terms)
+        if score <= 0:
             continue
-        evidence.append(
-            {
+        payload: dict[str, Any] = {
                 "line_number": index + 1,
                 "content": line[:300],
-            }
-        )
-        if len(evidence) >= 5:
-            break
-    return evidence
+                "score": score,
+        }
+        if matched_terms:
+            payload["matched_terms"] = matched_terms[:8]
+        scored_evidence.append((score, index, payload))
+    scored_evidence.sort(key=lambda item: (-item[0], item[1]))
+    source_ordered = sorted(scored_evidence[:20], key=lambda item: item[1])
+    return [payload for _, _, payload in source_ordered[:5]]
 
 
 def _binding_payload(
@@ -573,11 +642,21 @@ def query_semantic_context(
 ) -> dict[str, Any]:
     semantic = build_semantic_context(context_root)
     query_norm = _normalize_name(query)
-    candidates = [
-        binding
-        for binding in semantic.bindings
-        if _matches_query(binding, query_norm)
-    ]
+    candidate_terms: dict[tuple[str, str], list[str]] = {}
+
+    def add_candidate_terms(binding: PhysicalBinding, terms: Iterable[str]) -> None:
+        key = (binding.source_path, binding.table_or_path)
+        current = candidate_terms.setdefault(key, [query])
+        for term in terms:
+            if term and term not in current:
+                current.append(term)
+
+    candidates = []
+    for binding in semantic.bindings:
+        if not _matches_query(binding, query_norm):
+            continue
+        candidates.append(binding)
+        add_candidate_terms(binding, [query])
     candidate_keys = {
         (binding.source_path, binding.table_or_path)
         for binding in candidates
@@ -585,11 +664,13 @@ def query_semantic_context(
     for fact in semantic.facts:
         fact_field = _normalize_name(fact.logical_field)
         fact_table = _normalize_name(fact.logical_table)
+        fact_quote = _normalize_name(fact.quote)
         if not query_norm:
             continue
         if not (
             (fact_field and (query_norm in fact_field or fact_field in query_norm))
             or (fact_table and (query_norm in fact_table or fact_table in query_norm))
+            or (fact_quote and query_norm in fact_quote)
         ):
             continue
         if not fact_table:
@@ -598,10 +679,10 @@ def query_semantic_context(
             if _normalize_name(binding.logical_name) != fact_table:
                 continue
             key = (binding.source_path, binding.table_or_path)
-            if key in candidate_keys:
-                continue
-            candidates.append(binding)
-            candidate_keys.add(key)
+            add_candidate_terms(binding, _knowledge_fact_terms(fact))
+            if key not in candidate_keys:
+                candidates.append(binding)
+                candidate_keys.add(key)
     candidates.sort(key=lambda binding: _binding_score(binding, query_norm))
     candidates = candidates[:max_matches]
 
@@ -621,7 +702,13 @@ def query_semantic_context(
             continue
         logical_bindings.setdefault(logical, [])
         for binding in matches:
-            logical_bindings[logical].append(asdict(binding))
+            logical_bindings[logical].append(
+                _binding_payload(
+                    binding,
+                    context_root,
+                    _knowledge_fact_terms(fact),
+                )
+            )
 
     def fact_related(fact: KnowledgeFact) -> bool:
         if not query_norm:
@@ -651,7 +738,11 @@ def query_semantic_context(
 
     return {
         "source_candidates": [
-            _binding_payload(binding, context_root, [query])
+            _binding_payload(
+                binding,
+                context_root,
+                candidate_terms.get((binding.source_path, binding.table_or_path), [query]),
+            )
             for binding in candidates
         ],
         "logical_bindings": logical_bindings,

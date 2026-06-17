@@ -29,14 +29,22 @@ from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
 from data_agent_baseline.tools.agent_tools.execute_python import (
     create_execute_python_tool,
 )
+from data_agent_baseline.tools.agent_tools.extract_narrative_records import (
+    create_extract_narrative_records_tool,
+)
 from data_agent_baseline.tools.agent_tools.inspect_sqlite import (
     create_inspect_sqlite_tool,
 )
+from data_agent_baseline.tools.agent_tools.grep_file import create_grep_file_tool
+from data_agent_baseline.tools.agent_tools.query_schema import create_query_schema_tool
 from data_agent_baseline.tools.agent_tools.read_doc import create_read_doc_tool
 from data_agent_baseline.tools.agent_tools.read_json import create_read_json_tool
+from data_agent_baseline.tools.answer import validate_prepared_answer
 
 DISCOVERY_TOOLS = {
+    "execute_sql",
     "execute_python",
+    "extract_narrative_records",
     "grep_file",
     "inspect_sqlite",
     "query_schema",
@@ -253,6 +261,18 @@ class ScriptedChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
+class FailingChatModel(ScriptedChatModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        del messages, stop, run_manager, kwargs
+        raise RuntimeError("boom")
+
+
 def _tool_response(
     name: str,
     args: dict[str, Any],
@@ -289,7 +309,15 @@ def _answer_response(
             "code": (
                 "import json\n"
                 f"payload = json.loads({payload!r})\n"
-                "set_answer(payload['columns'], payload['rows'])\n"
+                "columns = payload['columns']\n"
+                "rows = payload['rows']\n"
+                "audit = {\n"
+                "    'source_paths': ['/context/data.txt'],\n"
+                "    'operations': ['scripted_result'],\n"
+                "    'output_row_count': len(rows),\n"
+                "    'output_hash': answer_hash(columns, rows),\n"
+                "}\n"
+                "set_answer(columns, rows, audit=audit)\n"
             )
         },
         tool_call_id,
@@ -359,6 +387,17 @@ def _tool_call(result: Any, tool_call_id: str) -> tuple[Any, dict[str, Any]]:
         for step, tool_call in _tool_calls(result)
         if tool_call.get("tool_call_id") == tool_call_id
     )
+
+
+def _command_tool_message(result: Any) -> ToolMessage:
+    if isinstance(result, ToolMessage):
+        return result
+    update = getattr(result, "update", None)
+    if isinstance(update, dict):
+        messages = update.get("messages")
+        if isinstance(messages, list) and messages and isinstance(messages[0], ToolMessage):
+            return messages[0]
+    raise AssertionError(f"Expected ToolMessage or Command with ToolMessage, got {result!r}")
 
 
 @pytest.fixture
@@ -658,6 +697,971 @@ def test_semantic_layer_extracts_facts_and_same_basename_sources(tmp_path: Path)
     assert any("status=narrative_only" in issue for issue in semantic["binding_issues"])
 
 
+def test_semantic_layer_uses_unicode_terms_for_narrative_evidence(tmp_path: Path) -> None:
+    context_dir = tmp_path / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "# Table `mf_netvalueperformancehis`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | 近十年累计回报率 | % |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "\n".join(
+            [
+                "短期表现摘要。",
+                "档案 266 的十年回报率为 166.097944%。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    semantic = query_semantic_context(context_dir, "十年", max_matches=10)
+
+    candidate = next(
+        item
+        for item in semantic["source_candidates"]
+        if item["source_path"] == "/context/doc/mf_netvalueperformancehis.md"
+    )
+    assert any(
+        "十年回报率" in line["content"]
+        for line in candidate.get("line_evidence", [])
+    )
+
+
+def test_query_schema_observes_narrative_line_evidence(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "# Table `mf_netvalueperformancehis`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | 近十年累计回报率 | % |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "档案 266 的十年回报率为 166.097944%。",
+        encoding="utf-8",
+    )
+    tool = create_query_schema_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "query_schema",
+            "id": "schema-narrative",
+            "args": {"field": "十年", "state": {}},
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert any(
+        candidate["source_path"] == "/context/doc/mf_netvalueperformancehis.md"
+        for candidate in payload["source_candidates"]
+    )
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["path"] == "/context/doc/mf_netvalueperformancehis.md"
+    assert observed[0]["observed_by"] == "query_schema"
+    assert "十年回报率" in observed[0]["matched_lines"][0]["content"]
+
+
+def test_grep_file_observes_matched_sources(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context" / "doc"
+    context_dir.mkdir(parents=True)
+    context_dir.joinpath("performance.md").write_text(
+        "档案 266 的十年回报率为 166.097944%。",
+        encoding="utf-8",
+    )
+    tool = create_grep_file_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "grep_file",
+            "id": "grep-narrative",
+            "args": {
+                "pattern": "十年回报率",
+                "path": "/context/doc/performance.md",
+                "output_mode": "files_with_matches",
+                "state": {},
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["path"] == "/context/doc/performance.md"
+    assert observed[0]["match_count"] == 1
+    assert observed[0]["observed_by"] == "grep_file"
+    assert "166.097944" in observed[0]["matched_lines"][0]["content"]
+
+
+def test_query_schema_narrative_observation_can_drive_plan(tmp_path: Path) -> None:
+    task_dir = tmp_path / "task_narrative"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "Use the observed source value exactly.",
+                "# Table `mf_netvalueperformancehis`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | 近十年累计回报率 | % |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "档案 266 的十年回报率为 166.097944%。",
+        encoding="utf-8",
+    )
+    question = "我能看一下基金的十年回报率数据吗"
+    plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `RRInTenYear` | 近十年累计回报率 | % |",
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("RRInTenYear", ["RRInTenYear"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "query_schema",
+                {"field": "十年"},
+                "schema-narrative-plan",
+            ),
+            _tool_response("analyze_plan", plan, "narrative-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "narrative-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(\n"
+                        "    ['RRInTenYear'],\n"
+                        "    [[166.097944]],\n"
+                        "    audit={\n"
+                        "        'source_paths': "
+                        "['/context/doc/mf_netvalueperformancehis.md'],\n"
+                        "        'operations': ['source_bound_projection'],\n"
+                        "    },\n"
+                        ")\n"
+                    )
+                },
+                "narrative-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_narrative",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "narrative-plan")
+    assert plan_call["ok"] is True
+    _, schema_call = _tool_call(result, "schema-narrative-plan")
+    observed = schema_call["result"]["update"]["observed_sources"]
+    assert observed[0]["path"] == "/context/doc/mf_netvalueperformancehis.md"
+
+
+def test_observed_narrative_source_blocks_unavailable_plan(tmp_path: Path) -> None:
+    task_dir = tmp_path / "task_narrative_guard"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "Use the observed source value exactly.",
+                "# Table `mf_netvalueperformancehis`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | 近十年累计回报率 | % |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "档案 266 的十年回报率为 166.097944%。",
+        encoding="utf-8",
+    )
+    question = "我能看一下基金的十年回报率数据吗"
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_status="unavailable",
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("message", [])],
+    )
+    invalid_plan["evidence"]["knowledge_issue"] = "rrintenyear is narrative_only."
+    invalid_plan["evidence"]["cross_validated_inference"] = (
+        "Claim the requested data is unavailable."
+    )
+    valid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `RRInTenYear` | 近十年累计回报率 | % |",
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("RRInTenYear", ["RRInTenYear"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "query_schema",
+                {"field": "十年"},
+                "schema-narrative-guard",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "unavailable-plan"),
+            _tool_response("analyze_plan", valid_plan, "available-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "narrative-guard-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(\n"
+                        "    ['RRInTenYear'],\n"
+                        "    [[166.097944]],\n"
+                        "    audit={\n"
+                        "        'source_paths': "
+                        "['/context/doc/mf_netvalueperformancehis.md'],\n"
+                        "        'operations': ['source_bound_projection'],\n"
+                        "    },\n"
+                        ")\n"
+                    )
+                },
+                "narrative-guard-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_narrative_guard",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "unavailable-plan")
+    assert invalid_call["status"] == "error"
+    assert "observed narrative sources" in invalid_call["result"]["content"]
+    _, valid_call = _tool_call(result, "available-plan")
+    assert valid_call["ok"] is True
+
+
+def test_read_doc_narrative_binding_blocks_unavailable_plan(tmp_path: Path) -> None:
+    task_dir = tmp_path / "task_read_doc_narrative_guard"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "Use the observed source value exactly.",
+                "# Table `mf_netvalueperformancehis`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | ten-year cumulative return rate | % |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "\n".join(
+            [
+                "The opening line is background material.",
+                "Archive 266 has a ten-year return rate of 166.097944%.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    question = "Show me the fund ten-year return rate data."
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_status="unavailable",
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("message", [])],
+    )
+    invalid_plan["evidence"]["knowledge_issue"] = "rrintenyear is narrative_only."
+    valid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `RRInTenYear` | ten-year cumulative return rate | % |",
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("RRInTenYear", ["RRInTenYear"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/doc/mf_netvalueperformancehis.md", "max_lines": 1},
+                "read-doc-narrative-guard",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "read-doc-unavailable-plan"),
+            _tool_response("analyze_plan", valid_plan, "read-doc-available-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "read-doc-narrative-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(\n"
+                        "    ['RRInTenYear'],\n"
+                        "    [[166.097944]],\n"
+                        "    audit={\n"
+                        "        'source_paths': "
+                        "['/context/doc/mf_netvalueperformancehis.md'],\n"
+                        "        'operations': ['source_bound_projection'],\n"
+                        "    },\n"
+                        ")\n"
+                    )
+                },
+                "read-doc-narrative-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_read_doc_narrative_guard",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "read-doc-unavailable-plan")
+    assert invalid_call["status"] == "error"
+    assert "observed narrative sources" in invalid_call["result"]["content"]
+    _, valid_call = _tool_call(result, "read-doc-available-plan")
+    assert valid_call["ok"] is True
+
+
+def test_knowledge_field_fact_canonicalizes_semantic_neighbor_source_field(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_knowledge_field_guard"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `mf_netvalueperformancehis` | `rrintenyear` | ten-year cumulative return rate (%) |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "Archive 266 has a ten-year return rate of 166.097944%.",
+        encoding="utf-8",
+    )
+    question = "Show me the fund ten-year return rate data."
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `rrintenyear` | ten-year cumulative return rate (%) |",
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("FundReturn", ["FundReturn"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/doc/mf_netvalueperformancehis.md"},
+                "knowledge-field-guard-doc",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "semantic-neighbor-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "knowledge-field-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(\n"
+                        "    ['RRInTenYear'],\n"
+                        "    [[166.097944]],\n"
+                        "    audit={\n"
+                        "        'source_paths': "
+                        "['/context/doc/mf_netvalueperformancehis.md'],\n"
+                        "        'operations': ['source_bound_projection'],\n"
+                        "    },\n"
+                        ")\n"
+                    )
+                },
+                "knowledge-field-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_knowledge_field_guard",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "semantic-neighbor-plan")
+    assert plan_call["ok"] is True
+    plan = plan_call["result"]["update"]["analysis_plan"]
+    assert plan["output_spec"]["columns"] == [
+        {"name": "FundReturn", "source_fields": ["rrintenyear"]}
+    ]
+    assert plan["execution_spec"]["source_bindings"] == [
+        {
+            "fact_id": "kf_1",
+            "logical_table": "mf_netvalueperformancehis",
+            "source_field": "rrintenyear",
+            "source_paths": ["/context/doc/mf_netvalueperformancehis.md"],
+        }
+    ]
+    assert any(
+        rule.get("fact_id") == "kf_1"
+        for rule in plan["evidence"]["knowledge_rules"]
+    )
+
+
+def test_observed_target_field_fact_must_bind_narrative_source(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_target_field_binding"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    json_dir = context_dir / "json"
+    doc_dir.mkdir(parents=True)
+    json_dir.mkdir()
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `mf_netvalueperformancehis` | `rrintenyear` | ten-year return rate |",
+                "| `mf_fundarchives` | `secuabbr` | fund display name |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "Archive 266 has a ten-year return rate of 166.097944%.\n",
+        encoding="utf-8",
+    )
+    json_dir.joinpath("mf_fundreturnrank.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"IndexCycle": "ten-year", "FundReturn": 75.07, "SecuAbbr": "ETF"}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    question = "Show me the fund ten-year return rate data."
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `mf_fundarchives` | `secuabbr` | fund display name |",
+        context_paths=["/context/json/mf_fundreturnrank.json"],
+        columns=[("return_rate", ["FundReturn"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/doc/mf_netvalueperformancehis.md"},
+                "target-field-doc",
+            ),
+            _tool_response(
+                "read_json",
+                {"path": "/context/json/mf_fundreturnrank.json"},
+                "target-field-json",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "omitted-target-field-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Extract source-bound field", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "target-field-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(\n"
+                        "    ['RRInTenYear'],\n"
+                        "    [[166.097944]],\n"
+                        "    audit={\n"
+                        "        'source_paths': "
+                        "['/context/doc/mf_netvalueperformancehis.md'],\n"
+                        "        'operations': ['source_bound_projection'],\n"
+                        "    },\n"
+                        ")\n"
+                    )
+                },
+                "target-field-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_target_field_binding",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "omitted-target-field-plan")
+    assert plan_call["ok"] is True
+    plan = plan_call["result"]["update"]["analysis_plan"]
+    assert {
+        source["path"] for source in plan["execution_spec"]["sources"]
+    } == {"/context/doc/mf_netvalueperformancehis.md"}
+    assert {
+        source["path"] for source in plan["evidence"]["context_sources"]
+    } == {
+        "/context/json/mf_fundreturnrank.json",
+        "/context/doc/mf_netvalueperformancehis.md",
+    }
+    assert plan["execution_spec"]["source_bindings"] == [
+        {
+            "fact_id": "kf_1",
+            "logical_table": "mf_netvalueperformancehis",
+            "source_field": "rrintenyear",
+            "source_paths": ["/context/doc/mf_netvalueperformancehis.md"],
+        }
+    ]
+
+    _, audit_error = validate_prepared_answer(
+        ["RRInTenYear"],
+        [[75.07]],
+        plan,
+        {
+            "source_paths": ["/context/json/mf_fundreturnrank.json"],
+            "operations": ["filter(IndexCycle='ten-year')"],
+        },
+    )
+    assert audit_error is not None
+    assert "source_bindings" in audit_error
+
+    _, mixed_audit_error = validate_prepared_answer(
+        ["RRInTenYear"],
+        [[75.07]],
+        plan,
+        {
+            "source_paths": [
+                "/context/doc/mf_netvalueperformancehis.md",
+                "/context/json/mf_fundreturnrank.json",
+            ],
+            "operations": ["copy source-bound value"],
+        },
+    )
+    assert mixed_audit_error is not None
+    assert "source-bound-only outputs" in mixed_audit_error
+
+
+def test_target_field_fact_requires_binding_discovery_before_plan(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_binding_discovery"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    json_dir = context_dir / "json"
+    doc_dir.mkdir(parents=True)
+    json_dir.mkdir()
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `mf_netvalueperformancehis` | `rrintenyear` | ten-year return rate |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "Archive 266 has a ten-year return rate of 166.097944%.\n",
+        encoding="utf-8",
+    )
+    json_dir.joinpath("mf_fundreturnrank.json").write_text(
+        json.dumps(
+            {"records": [{"IndexCycle": "ten-year", "FundReturn": 75.07}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    question = "Show me the fund ten-year return rate data."
+    json_only_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote=(
+            "| `mf_netvalueperformancehis` | `rrintenyear` | ten-year return rate |"
+        ),
+        context_paths=["/context/json/mf_fundreturnrank.json"],
+        columns=[("RRInTenYear", ["rrintenyear"])],
+    )
+    valid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote=(
+            "| `mf_netvalueperformancehis` | `rrintenyear` | ten-year return rate |"
+        ),
+        context_paths=["/context/doc/mf_netvalueperformancehis.md"],
+        columns=[("RRInTenYear", ["rrintenyear"])],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_json",
+                {"path": "/context/json/mf_fundreturnrank.json"},
+                "binding-discovery-json",
+            ),
+            _tool_response("analyze_plan", json_only_plan, "json-only-field-plan"),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/doc/mf_netvalueperformancehis.md"},
+                "binding-discovery-doc",
+            ),
+            _tool_response("analyze_plan", valid_plan, "discovered-field-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Extract source-bound field", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "binding-discovery-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(\n"
+                        "    ['RRInTenYear'],\n"
+                        "    [[166.097944]],\n"
+                        "    audit={\n"
+                        "        'source_paths': "
+                        "['/context/doc/mf_netvalueperformancehis.md'],\n"
+                        "        'operations': ['source_bound_projection'],\n"
+                        "    },\n"
+                        ")\n"
+                    )
+                },
+                "binding-discovery-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_binding_discovery",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "json-only-field-plan")
+    assert invalid_call["status"] == "error"
+    assert "physical binding discovery" in invalid_call["result"]["content"]
+    _, valid_call = _tool_call(result, "discovered-field-plan")
+    assert valid_call["ok"] is True
+
+
+def test_extract_narrative_records_preserves_source_bound_rows(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `fund_perf` | `rrintenyear` | ten-year return rate |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("fund_perf.md").write_text(
+        "\n".join(
+            [
+                "Archive 1 Alpha. The ten-year return rate was reviewed and confirmed as 12.345678%.",
+                "Archive 2 Beta. The ten-year return rate data is missing.",
+                "Archive 3 Gamma and Archive 4 Delta have ten-year return rate data unavailable.",
+                "Since inception results start here. Archive 1 Alpha returned 99%.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plan = _plan_args(
+        requirement_quote="Show ten-year return rate.",
+        knowledge_quote="| `fund_perf` | `rrintenyear` | ten-year return rate |",
+        context_paths=["/context/doc/fund_perf.md"],
+        columns=[("RRInTenYear", ["rrintenyear"])],
+        expected_row_count=4,
+    )
+    plan["execution_spec"] = {
+        "sources": [
+            {
+                "path": "/context/doc/fund_perf.md",
+                "source_type": "doc",
+                "table_or_path": "/context/doc/fund_perf.md",
+            }
+        ],
+        "supporting_fields": [],
+        "operations": [],
+        "source_bindings": [
+            {
+                "fact_id": "kf_1",
+                "logical_table": "fund_perf",
+                "source_field": "rrintenyear",
+                "source_paths": ["/context/doc/fund_perf.md"],
+            }
+        ],
+    }
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-narrative",
+            "args": {
+                "source_path": "/context/doc/fund_perf.md",
+                "source_field": "rrintenyear",
+                "column": "RRInTenYear",
+                "state": {"analysis_plan": plan},
+            },
+        }
+    )
+
+    result = _command_tool_message(command)
+    assert result.status == "success"
+    prepared = getattr(command, "update", {})["prepared_answer"]
+    assert prepared.columns == ["RRInTenYear"]
+    assert prepared.rows == [["12.345678"], [""], [""], [""]]
+
+
+def test_extract_narrative_records_tool_can_submit_after_plan(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_extract_narrative"
+    context_dir = task_dir / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `fund_perf` | `rrintenyear` | ten-year return rate |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("fund_perf.md").write_text(
+        "\n".join(
+            [
+                "Archive 1 Alpha. The ten-year return rate was finally 12.345678%.",
+                "Archive 2 Beta. The ten-year return rate is unavailable.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    question = "Show ten-year return rate."
+    plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `fund_perf` | `rrintenyear` | ten-year return rate |",
+        context_paths=["/context/doc/fund_perf.md"],
+        columns=[("RRInTenYear", ["rrintenyear"])],
+        expected_row_count=2,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/doc/fund_perf.md"},
+                "extract-source-doc",
+            ),
+            _tool_response("analyze_plan", plan, "extract-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Extract narrative rows", "status": "in_progress"},
+                        {"content": "Submit", "status": "pending"},
+                    ]
+                },
+                "extract-todos",
+            ),
+            _tool_response(
+                "extract_narrative_records",
+                {
+                    "source_path": "/context/doc/fund_perf.md",
+                    "source_field": "rrintenyear",
+                    "column": "RRInTenYear",
+                },
+                "extract-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_extract_narrative",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["RRInTenYear"]
+    assert result.answer.rows == [["12.345678"], [""]]
+
+
+def test_preserve_output_columns_must_cite_source_fields(
+    public_task: PublicTask,
+) -> None:
+    invalid_plan = _plan_args(columns=[("value", [])])
+    valid_plan = _plan_args(columns=[("value", ["value"])])
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "source-field-guard-doc",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "missing-source-field-plan"),
+            _tool_response("analyze_plan", valid_plan, "source-field-plan"),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Compute and validate", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "source-field-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "set_answer(['value'], [['hello from context']])\n"},
+                "source-field-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "missing-source-field-plan")
+    assert invalid_call["status"] == "error"
+    assert "must cite source_fields" in invalid_call["result"]["content"]
+    _, valid_call = _tool_call(result, "source-field-plan")
+    assert valid_call["ok"] is True
+
+
 def test_question_structure_limits_plan_output_columns(
     public_task: PublicTask,
 ) -> None:
@@ -715,11 +1719,11 @@ def test_question_structure_limits_plan_output_columns(
     assert result.answer.columns == ["value"]
     _, invalid_call = _tool_call(result, "limited-invalid-plan")
     _, valid_call = _tool_call(result, "limited-valid-plan")
-    assert invalid_call["status"] == "pending"
+    assert invalid_call["status"] == "error"
     assert valid_call["ok"] is True
 
 
-def test_question_structure_blocks_unlisted_user_calculation(
+def test_question_structure_does_not_block_quoted_user_calculation(
     tmp_path: Path,
 ) -> None:
     task_dir = tmp_path / "task_total"
@@ -755,10 +1759,6 @@ def test_question_structure_blocks_unlisted_user_calculation(
             "authorization": {"source": "user", "quote": "total"},
         }
     ]
-    valid_plan = _plan_args(
-        requirement_quote="Return the total observed value.",
-        columns=[("value", ["value"])],
-    )
     model = ScriptedChatModel(
         auto_discovery_plan=False,
         responses=[
@@ -769,7 +1769,6 @@ def test_question_structure_blocks_unlisted_user_calculation(
                 "calculation-source",
             ),
             _tool_response("analyze_plan", invalid_plan, "calculation-invalid-plan"),
-            _tool_response("analyze_plan", valid_plan, "calculation-valid-plan"),
             _tool_response(
                 "write_todos",
                 {
@@ -794,10 +1793,8 @@ def test_question_structure_blocks_unlisted_user_calculation(
     ).run(task)
 
     assert result.succeeded
-    _, invalid_call = _tool_call(result, "calculation-invalid-plan")
-    _, valid_call = _tool_call(result, "calculation-valid-plan")
-    assert invalid_call["status"] == "pending"
-    assert valid_call["ok"] is True
+    _, plan_call = _tool_call(result, "calculation-invalid-plan")
+    assert plan_call["ok"] is True
 
 
 def test_discovery_does_not_keyword_block_tool_arguments(
@@ -912,8 +1909,8 @@ def test_analyze_plan_is_unavailable_before_discovery(
     assert "analyze_plan" not in model.bound_tool_sets[0]
     assert model.bound_tool_sets[0] == DISCOVERY_TOOLS
     assert "analyze_plan" in model.bound_tool_sets[1]
-    assert model.bound_tool_sets[1] == PLAN_ONLY_TOOLS
-    assert model.bound_tool_choices[1] == "analyze_plan"
+    assert model.bound_tool_sets[1] == DISCOVERY_TOOLS | {"analyze_plan"}
+    assert model.bound_tool_choices[1] is None
     _, plan_call = _tool_call(result, "plan-call")
     assert plan_call["args"]["evidence"]["knowledge_status"] == "authoritative"
     assert plan_call["args"]["evidence"]["knowledge_rules"] == [
@@ -1174,6 +2171,181 @@ def test_markdown_knowledge_quote_is_canonicalized(
     assert "| `value` | Use the observed source value exactly. |" in plan_content
 
 
+def test_knowledge_authorization_quote_is_canonicalized(
+    public_task: PublicTask,
+) -> None:
+    public_task.context_dir.joinpath("knowledge.md").write_text(
+        "| `value` | Use the observed source value exactly. |\n",
+        encoding="utf-8",
+    )
+    plan = _plan_args(
+        transformations=[
+            {
+                "operation": "derive",
+                "description": "Apply the knowledge rule.",
+                "authorization": {
+                    "source": "knowledge",
+                    "quote": "value: Use the observed source value exactly.",
+                },
+            }
+        ],
+        knowledge_quote="value: Use the observed source value exactly.",
+        expected_row_count=1,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/knowledge.md"},
+                "auth-canonical-knowledge",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "auth-canonical-source",
+            ),
+            _tool_response(
+                "analyze_plan",
+                plan,
+                "auth-canonical-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "auth-canonical-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["done"]],
+                tool_call_id="auth-canonical-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "auth-canonical-plan")
+    transformation = plan_call["result"]["update"]["analysis_plan"]["output_spec"][
+        "transformations"
+    ][0]
+    assert transformation["authorization"]["quote"] == (
+        "| `value` | Use the observed source value exactly. |"
+    )
+
+
+def test_user_authorization_quote_is_canonicalized_from_expression(
+    public_task: PublicTask,
+) -> None:
+    question = "我能看一下基金的十年回报率数据吗"
+    plan = _plan_args(
+        requirement_quote="基金的十年回报率数据",
+        transformations=[
+            {
+                "operation": "filter",
+                "description": "Filter to the requested ten-year records.",
+                "authorization": {"source": "user", "quote": "IndexCycle='十年'"},
+            }
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(
+                target_quote=question,
+                target_constraints=[
+                    {
+                        "quote": "十年",
+                        "constraint_type": "time_range",
+                        "value": "10 years",
+                        "explicitness": "explicit",
+                    }
+                ],
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "user-auth-expression-source",
+            ),
+            _tool_response("analyze_plan", plan, "user-auth-expression-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "user-auth-expression-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["done"]],
+                tool_call_id="user-auth-expression-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "user-auth-expression-plan")
+    transformation = plan_call["result"]["update"]["analysis_plan"]["output_spec"][
+        "transformations"
+    ][0]
+    assert transformation["authorization"]["quote"] == "十年"
+
+
+def test_unknown_knowledge_fact_id_is_dropped_when_quote_is_observed(
+    public_task: PublicTask,
+) -> None:
+    public_task.context_dir.joinpath("knowledge.md").write_text(
+        "| `value` | Use the observed source value exactly. |\n",
+        encoding="utf-8",
+    )
+    plan = _plan_args()
+    plan["evidence"]["knowledge_rules"][0]["fact_id"] = "missing-fact-id"
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/knowledge.md"},
+                "unknown-fact-knowledge",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "unknown-fact-source",
+            ),
+            _tool_response("analyze_plan", plan, "unknown-fact-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "unknown-fact-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "unknown-fact-plan")
+    saved_rule = plan_call["result"]["update"]["analysis_plan"]["evidence"][
+        "knowledge_rules"
+    ][0]
+    assert plan_call["ok"] is True
+    assert "fact_id" not in saved_rule
+
+
 def test_empty_knowledge_content_does_not_break_quote_canonicalization() -> None:
     assert _canonical_knowledge_quote("missing quote", None) is None
 
@@ -1261,10 +2433,10 @@ def test_invalid_plan_tool_json_is_retried(
     assert retried_plan["ok"] is True
 
 
-def test_semantic_knowledge_cannot_authorize_aggregation(
+def test_observed_knowledge_quote_can_authorize_aggregation(
     public_task: PublicTask,
 ) -> None:
-    invalid_plan = _plan_args(
+    plan = _plan_args(
         transformations=[
             {
                 "operation": "aggregate",
@@ -1289,8 +2461,7 @@ def test_semantic_knowledge_cannot_authorize_aggregation(
                 {"path": "/context/data.txt"},
                 "semantic-source",
             ),
-            _tool_response("analyze_plan", invalid_plan, "semantic-aggregate"),
-            _tool_response("analyze_plan", _plan_args(), "preserve-plan"),
+            _tool_response("analyze_plan", plan, "semantic-aggregate"),
             _tool_response(
                 "write_todos",
                 {
@@ -1308,14 +2479,14 @@ def test_semantic_knowledge_cannot_authorize_aggregation(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    _, preserve_plan = _tool_call(result, "preserve-plan")
-    assert preserve_plan["ok"] is True
+    _, plan_call = _tool_call(result, "semantic-aggregate")
+    assert plan_call["ok"] is True
 
 
-def test_generic_output_requirement_cannot_authorize_aggregation(
+def test_exact_user_quote_can_authorize_aggregation(
     public_task: PublicTask,
 ) -> None:
-    invalid_plan = _plan_args(
+    plan = _plan_args(
         requirement_quote="Return the observed value.",
         transformations=[
             {
@@ -1341,8 +2512,7 @@ def test_generic_output_requirement_cannot_authorize_aggregation(
                 {"path": "/context/data.txt"},
                 "output-source",
             ),
-            _tool_response("analyze_plan", invalid_plan, "output-aggregate"),
-            _tool_response("analyze_plan", _plan_args(), "output-preserve"),
+            _tool_response("analyze_plan", plan, "output-aggregate"),
             _tool_response(
                 "write_todos",
                 {
@@ -1360,9 +2530,8 @@ def test_generic_output_requirement_cannot_authorize_aggregation(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    assert model.bound_tool_sets[3] == PLAN_ONLY_TOOLS
-    _, preserve_plan = _tool_call(result, "output-preserve")
-    assert preserve_plan["ok"] is True
+    _, plan_call = _tool_call(result, "output-aggregate")
+    assert plan_call["ok"] is True
 
 
 @pytest.mark.parametrize(
@@ -1382,7 +2551,7 @@ def test_generic_output_requirement_cannot_authorize_aggregation(
         ),
     ],
 )
-def test_free_text_plan_actions_without_authorization_are_rejected(
+def test_free_text_plan_actions_are_not_keyword_rejected(
     public_task: PublicTask,
     claim: str,
     operation: str,
@@ -1402,7 +2571,6 @@ def test_free_text_plan_actions_without_authorization_are_rejected(
                 invalid_plan,
                 f"invalid-{operation}-claim",
             ),
-            _tool_response("analyze_plan", _plan_args(), f"valid-{operation}-plan"),
             _tool_response(
                 "write_todos",
                 {
@@ -1420,18 +2588,8 @@ def test_free_text_plan_actions_without_authorization_are_rejected(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    _, invalid_call = _tool_call(result, f"invalid-{operation}-claim")
-    error_text = invalid_call["result"]["content"]
-    assert invalid_call["status"] == "error"
-    assert "UNAUTHORIZED_PLAN_ACTION" in error_text
-    assert f'"operation": "{operation}"' in error_text
-    assert "/evidence/cross_validated_inference" in error_text
-    assert claim.split(".", maxsplit=1)[0] in error_text
-    assert "intent_reconsideration" in error_text
-    assert "Original request text" in error_text
-    assert "Return the observed value." in error_text
-    assert "Observed source facts" in error_text
-    assert "Reconsider the intent" in error_text
+    _, plan_call = _tool_call(result, f"invalid-{operation}-claim")
+    assert plan_call["ok"] is True
 
 
 def test_free_text_factual_aggregate_description_is_not_rejected(
@@ -1664,7 +2822,7 @@ def test_invalid_knowledge_allows_single_relevant_source(
     assert model.bound_tool_sets[:4] == [
         DISCOVERY_TOOLS,
         DISCOVERY_TOOLS,
-        PLAN_ONLY_TOOLS,
+        PLAN_TOOLS,
         {"write_todos"},
     ]
     _, plan_call = _tool_call(result, "invalid-knowledge-plan")
@@ -1773,8 +2931,8 @@ def test_discovery_forces_plan_after_context_is_ready(
     result = DeepAgent(model=model).run(public_task)
 
     assert result.succeeded
-    assert model.bound_tool_sets[2] == PLAN_ONLY_TOOLS
-    assert model.bound_tool_choices[2] == "analyze_plan"
+    assert model.bound_tool_sets[2] == PLAN_TOOLS
+    assert model.bound_tool_choices[2] is None
 
 
 def test_invalid_answer_returns_tool_error_and_can_be_corrected(
@@ -1795,8 +2953,151 @@ def test_invalid_answer_returns_tool_error_and_can_be_corrected(
     assert invalid_call["name"] == "execute_python"
     assert invalid_call["ok"] is False
     assert invalid_step.ok is False
-    assert "exactly match" in json.dumps(invalid_call["result"])
+    assert "non-empty" in json.dumps(invalid_call["result"])
     assert result.steps[-1].ok is True
+
+
+def test_unexpected_graph_exception_returns_failed_result(
+    public_task: PublicTask,
+) -> None:
+    model = FailingChatModel(responses=[], auto_discovery_plan=False)
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=False),
+    ).run(public_task)
+
+    assert not result.succeeded
+    assert result.failure_reason == "Deep Agent failed with RuntimeError: boom"
+
+
+def test_direct_set_answer_tool_accepts_json_strings_and_stamps_audit(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the highest observed value."
+    plan = _plan_args(
+        requirement_quote=question,
+        transformations=[
+            {
+                "operation": "sort",
+                "description": "Use highest as the selector operation.",
+                "authorization": {"source": "user", "quote": "highest"},
+            }
+        ],
+        expected_row_count=1,
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "direct-set-source",
+            ),
+            _tool_response("analyze_plan", plan, "direct-set-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "direct-set-todos",
+            ),
+            _tool_response(
+                "set_answer",
+                {
+                    "columns": '["value"]',
+                    "rows": '[["done"]]',
+                    "audit": json.dumps(
+                        {
+                            "source_paths": ["/context/data.txt"],
+                            "operations": [{"operation": "sort"}],
+                            "output_row_count": 99,
+                            "output_hash": "stale",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                "direct-set-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["done"]]
+    _, answer_call = _tool_call(result, "direct-set-answer")
+    assert answer_call["name"] == "set_answer"
+    assert answer_call["ok"] is True
+
+
+def test_execute_python_auto_captures_result_dict_after_plan(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "auto-capture-source",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "auto-capture-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "auto-capture-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "columns = ['value']\n"
+                        "rows = [['intermediate cursor row']]\n"
+                        "result = {'columns': ['value'], 'rows': [['captured']]}\n"
+                        "print('ready')\n"
+                    )
+                },
+                "auto-capture-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["captured"]]
+    _, answer_call = _tool_call(result, "auto-capture-answer")
+    assert answer_call["ok"] is True
+
+
+def test_answer_column_alias_and_redundant_columns_are_accepted(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        responses=[
+            _answer_response(
+                columns=["alias_value", "source_note"],
+                rows=[["correct", "extra"]],
+                tool_call_id="alias-answer",
+            ),
+        ]
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["alias_value", "source_note"]
+    assert result.answer.rows == [["correct", "extra"]]
 
 
 def test_empty_answer_rows_are_rejected(public_task: PublicTask) -> None:
@@ -1862,6 +3163,401 @@ def test_expected_answer_row_count_is_enforced(public_task: PublicTask) -> None:
     assert wrong_step.ok is False
     assert wrong_call["ok"] is False
     assert "expected_row_count=2" in json.dumps(wrong_call["result"])
+
+
+def test_failed_set_answer_saves_answer_candidate_for_recovery(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args(expected_row_count=2)
+    revised_plan = _plan_args(expected_row_count=1)
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "candidate-source",
+            ),
+            _tool_response("analyze_plan", plan, "candidate-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "candidate-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["candidate"]],
+                tool_call_id="candidate-wrong-row-count",
+            ),
+            _tool_response(
+                "analyze_plan",
+                revised_plan,
+                "candidate-replan",
+            ),
+            _tool_response(
+                "finalize_answer_candidate",
+                {"column_indexes": [0], "columns": ["value"]},
+                "candidate-finalize",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["candidate"]]
+    _, wrong_call = _tool_call(result, "candidate-wrong-row-count")
+    assert wrong_call["ok"] is False
+    assert wrong_call["result"]["update"]["answer_candidate"]["rows"] == [
+        ["candidate"]
+    ]
+    assert "candidate_saved" in json.dumps(wrong_call["result"])
+
+
+def test_pre_plan_set_answer_candidate_can_be_finalized_after_plan(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "open('/context/data.txt', encoding='utf-8').read()\n"
+                        "set_answer(['value'], [['early candidate']])\n"
+                    )
+                },
+                "early-candidate",
+            ),
+            _tool_response("analyze_plan", _plan_args(expected_row_count=1), "early-plan"),
+            _tool_response(
+                "finalize_answer_candidate",
+                {"column_indexes": "[0]", "columns": "[\"value\"]"},
+                "early-finalize",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["early candidate"]]
+    _, early_call = _tool_call(result, "early-candidate")
+    assert early_call["ok"] is False
+    assert early_call["result"]["update"]["answer_candidate"]["rows"] == [
+        ["early candidate"]
+    ]
+
+
+def test_finalize_answer_candidate_accepts_json_encoded_lists(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args(expected_row_count=2)
+    revised_plan = _plan_args(expected_row_count=1)
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "json-list-candidate-source",
+            ),
+            _tool_response("analyze_plan", plan, "json-list-candidate-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "json-list-candidate-todos",
+            ),
+            _answer_response(
+                columns=["value", "extra"],
+                rows=[["candidate", "ignored"]],
+                tool_call_id="json-list-candidate-wrong-row-count",
+            ),
+            _tool_response(
+                "analyze_plan",
+                revised_plan,
+                "json-list-candidate-replan",
+            ),
+            _tool_response(
+                "finalize_answer_candidate",
+                {
+                    "column_indexes": "[0]",
+                    "columns": "[{\"name\": \"value\", \"role\": \"measure\"}]",
+                },
+                "json-list-candidate-finalize",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["value"]
+    assert result.answer.rows == [["candidate"]]
+
+
+def test_execute_python_set_answer_normalizes_column_specs(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "column-spec-source",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "column-spec-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "column-spec-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "open('/context/data.txt', encoding='utf-8').read()\n"
+                        "columns = [{'name': 'value', 'role': 'measure'}]\n"
+                        "rows = [{'value': 'normalized'}]\n"
+                        "set_answer(columns, rows)\n"
+                    )
+                },
+                "column-spec-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["value"]
+    assert result.answer.rows == [["normalized"]]
+
+
+def test_transform_candidate_projection_updates_execution_audit(
+    public_task: PublicTask,
+) -> None:
+    transformations = [
+        {
+            "operation": "aggregate",
+            "description": "Aggregate from the source.",
+            "authorization": {
+                "source": "user",
+                "quote": "Return the observed value.",
+            },
+        }
+    ]
+    plan = _plan_args(transformations=transformations, expected_row_count=2)
+    revised_plan = _plan_args(transformations=transformations, expected_row_count=1)
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "projection-source",
+            ),
+            _tool_response("analyze_plan", plan, "projection-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "projection-todos",
+            ),
+            _answer_response(
+                columns=["value", "extra"],
+                rows=[["candidate", "ignored"]],
+                tool_call_id="projection-wrong-row-count",
+            ),
+            _tool_response(
+                "analyze_plan",
+                revised_plan,
+                "projection-replan",
+            ),
+            _tool_response(
+                "finalize_answer_candidate",
+                {"column_indexes": [0], "columns": ["value"]},
+                "projection-finalize",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["candidate"]]
+    _, wrong_call = _tool_call(result, "projection-wrong-row-count")
+    assert wrong_call["ok"] is False
+    assert wrong_call["result"]["update"]["answer_candidate"]["columns"] == [
+        "value",
+        "extra",
+    ]
+
+
+def test_transform_answer_requires_execution_audit(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args(
+        transformations=[
+            {
+                "operation": "aggregate",
+                "description": "Aggregate from the source.",
+                "authorization": {
+                    "source": "user",
+                    "quote": "Return the observed value.",
+                },
+            }
+        ],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "audit-source",
+            ),
+            _tool_response("analyze_plan", plan, "audit-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "audit-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "set_answer(['value'], [['without audit']])\n"},
+                "missing-audit-answer",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["with audit"]],
+                tool_call_id="audited-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    missing_step, missing_call = _tool_call(result, "missing-audit-answer")
+    assert missing_step.ok is False
+    assert missing_call["ok"] is False
+    assert "execution audit" in json.dumps(missing_call["result"])
+    assert missing_call["result"]["update"]["answer_candidate"]["rows"] == [
+        ["without audit"]
+    ]
+
+
+def test_set_answer_stamps_transform_audit_hash(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args(
+        transformations=[
+            {
+                "operation": "aggregate",
+                "description": "Aggregate from the source.",
+                "authorization": {
+                    "source": "user",
+                    "quote": "Return the observed value.",
+                },
+            }
+        ],
+        expected_row_count=1,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "stamp-audit-source",
+            ),
+            _tool_response("analyze_plan", plan, "stamp-audit-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "stamp-audit-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "columns = ['value']\n"
+                        "rows = [['with audit']]\n"
+                        "set_answer(columns, rows, audit={\n"
+                        "    'source_paths': ['/context/data.txt'],\n"
+                        "    'operations': ['aggregate'],\n"
+                        "    'output_row_count': 999,\n"
+                        "    'output_hash': 'wrong',\n"
+                        "})\n"
+                    )
+                },
+                "stamp-audit-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["with audit"]]
+
+
+def test_execute_python_synthesizes_transform_audit_from_context_paths(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args(
+        transformations=[
+            {
+                "operation": "filter",
+                "description": "Filter to the requested source row.",
+                "authorization": {
+                    "source": "user",
+                    "quote": "Return the observed value.",
+                },
+            }
+        ],
+        expected_row_count=1,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "synth-audit-source",
+            ),
+            _tool_response("analyze_plan", plan, "synth-audit-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "synth-audit-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "open('/context/data.txt', encoding='utf-8').read()\n"
+                        "set_answer(['value'], [['synthesized audit']])\n"
+                    )
+                },
+                "synth-audit-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [["synthesized audit"]]
 
 
 def test_preserve_plan_derives_expected_row_count_from_json(
@@ -2023,7 +3719,71 @@ def test_preserve_plan_reuses_observed_row_count_on_revision(
     assert revision_info["changed_fields"] == []
 
 
-def test_question_structure_canonicalizes_plan_requirements(
+def test_observed_sqlite_table_source_drives_preserve_row_count(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_sqlite_observed"
+    context_dir = task_dir / "context"
+    context_dir.mkdir(parents=True)
+    (context_dir / "knowledge.md").write_text(
+        "Use the observed source value exactly.\n",
+        encoding="utf-8",
+    )
+    with closing(sqlite3.connect(context_dir / "sample.sqlite")) as connection:
+        connection.execute("CREATE TABLE metrics (name TEXT, value INTEGER)")
+        connection.executemany(
+            "INSERT INTO metrics (name, value) VALUES (?, ?)",
+            [("alpha", 1), ("beta", 2)],
+        )
+        connection.commit()
+    task = PublicTask(
+        record=TaskRecord(
+            task_id="task_sqlite_observed",
+            difficulty="easy",
+            question="Return the observed value.",
+        ),
+        assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "inspect_sqlite",
+                {
+                    "path": "/context/sample.sqlite",
+                    "table": "metrics",
+                    "sample_rows": 1,
+                },
+                "observed-sqlite-table",
+            ),
+            _tool_response(
+                "analyze_plan",
+                _plan_args(context_paths=["/context/sample.sqlite::metrics"]),
+                "sqlite-table-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Prepare", "status": "in_progress"}]},
+                "sqlite-table-todos",
+            ),
+            _answer_response(columns=["value"], rows=[[1], [2]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    _, source_call = _tool_call(result, "observed-sqlite-table")
+    observed = source_call["result"]["update"]["observed_sources"]
+    assert "/context/sample.sqlite::metrics" in {
+        source["path"] for source in observed
+    }
+    _, plan_call = _tool_call(result, "sqlite-table-plan")
+    output_spec = plan_call["result"]["update"]["analysis_plan"]["output_spec"]
+    assert output_spec["expected_row_count"] == 2
+
+
+def test_question_structure_does_not_rewrite_plan_requirements(
     public_task: PublicTask,
 ) -> None:
     plan = _plan_args(
@@ -2108,23 +3868,7 @@ def test_question_structure_canonicalizes_plan_requirements(
     requirements = plan_call["result"]["update"]["analysis_plan"]["intent"][
         "requirements"
     ]
-    assert requirements == [
-        {
-            "statement": "Return the observed value.",
-            "requirement_type": "measure",
-            "quote": "China tertiary GDP these records",
-        },
-        {
-            "statement": "geography: China",
-            "requirement_type": "entity",
-            "quote": "China",
-        },
-        {
-            "statement": "time_range: these years",
-            "requirement_type": "time_range",
-            "quote": "these",
-        },
-    ]
+    assert requirements == plan["intent"]["requirements"]
 
 
 def test_unrequested_output_columns_are_rejected(public_task: PublicTask) -> None:
@@ -2255,6 +3999,352 @@ def test_execution_spec_supporting_selector_field_is_not_final_output(
     ]
 
 
+def test_execution_spec_drops_supporting_fields_that_overlap_outputs(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args(columns=[("value", ["value"])])
+    plan["execution_spec"] = {
+        "sources": [{"path": "/context/data.txt"}],
+        "supporting_fields": [
+            {"name": "value", "source_fields": ["value"], "purpose": "context"},
+            {"name": "selector", "source_fields": ["selector"], "purpose": "selector"},
+        ],
+        "operations": [],
+    }
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "overlap-support-source",
+            ),
+            _tool_response("analyze_plan", plan, "overlap-support-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "overlap-support-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "overlap-support-plan")
+    assert plan_call["ok"] is True
+    supporting_fields = plan_call["result"]["update"]["analysis_plan"][
+        "execution_spec"
+    ]["supporting_fields"]
+    assert supporting_fields == [
+        {"name": "selector", "source_fields": ["selector"], "purpose": "selector"}
+    ]
+
+
+def test_analyze_plan_normalizes_non_object_execution_spec(
+    public_task: PublicTask,
+) -> None:
+    plan = _plan_args()
+    plan["execution_spec"] = []
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "list-execution-spec-source",
+            ),
+            _tool_response("analyze_plan", plan, "list-execution-spec-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "list-execution-spec-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "list-execution-spec-plan")
+    assert plan_call["ok"] is True
+    assert "execution_spec" not in plan_call["result"]["update"]["analysis_plan"]
+
+
+def test_execute_sql_is_allowed_during_discovery(public_task: PublicTask) -> None:
+    with closing(sqlite3.connect(public_task.context_dir / "sample.sqlite")) as connection:
+        connection.execute(
+            "INSERT INTO metrics (name, value) VALUES (?, ?)",
+            ("alpha", 1),
+        )
+        connection.commit()
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "execute_sql",
+                {
+                    "path": "/context/sample.sqlite",
+                    "sql": "SELECT COUNT(*) AS row_count FROM metrics",
+                },
+                "discovery-sql",
+            ),
+            _tool_response("analyze_plan", _plan_args(context_paths=["/context/sample.sqlite"]), "sql-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "sql-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, sql_call = _tool_call(result, "discovery-sql")
+    assert sql_call["ok"] is True
+
+
+def test_execute_sql_observed_table_source_can_drive_plan(
+    public_task: PublicTask,
+) -> None:
+    with closing(sqlite3.connect(public_task.context_dir / "sample.sqlite")) as connection:
+        connection.executemany(
+            "INSERT INTO metrics (name, value) VALUES (?, ?)",
+            [("alpha", 1), ("beta", 2)],
+        )
+        connection.commit()
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "execute_sql",
+                {
+                    "path": "/context/sample.sqlite",
+                    "sql": "SELECT value FROM metrics ORDER BY name",
+                },
+                "sql-observed-table",
+            ),
+            _tool_response(
+                "analyze_plan",
+                _plan_args(
+                    context_paths=["/context/sample.sqlite::metrics"],
+                    expected_row_count=2,
+                ),
+                "sql-observed-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "sql-observed-todos",
+            ),
+            _answer_response(columns=["value"], rows=[[1], [2]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, sql_call = _tool_call(result, "sql-observed-table")
+    observed = sql_call["result"]["update"]["observed_sources"]
+    table_source = next(
+        source for source in observed if source["path"].endswith("::metrics")
+    )
+    assert sql_call["ok"] is True
+    assert table_source["observed_by"] == "execute_sql"
+    assert table_source["row_count"] == 2
+    assert table_source["fields"] == ["name", "value"]
+    _, plan_call = _tool_call(result, "sql-observed-plan")
+    assert plan_call["ok"] is True
+
+
+def test_execute_sql_result_can_prepare_preserve_answer(
+    public_task: PublicTask,
+) -> None:
+    with closing(sqlite3.connect(public_task.context_dir / "sample.sqlite")) as connection:
+        connection.executemany(
+            "INSERT INTO metrics (name, value) VALUES (?, ?)",
+            [("alpha", 1), ("beta", 2)],
+        )
+        connection.commit()
+    plan = _plan_args(
+        context_paths=["/context/sample.sqlite::metrics"],
+        columns=[("value", ["value"])],
+        expected_row_count=2,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "inspect_sqlite",
+                {
+                    "path": "/context/sample.sqlite",
+                    "table": "metrics",
+                    "sample_rows": 1,
+                },
+                "sql-preserve-source",
+            ),
+            _tool_response("analyze_plan", plan, "sql-preserve-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "sql-preserve-todos",
+            ),
+            _tool_response(
+                "execute_sql",
+                {
+                    "path": "/context/sample.sqlite",
+                    "sql": "SELECT value FROM metrics ORDER BY name",
+                },
+                "sql-preserve-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.columns == ["value"]
+    assert result.answer.rows == [[1.0], [2.0]]
+    _, sql_call = _tool_call(result, "sql-preserve-answer")
+    assert sql_call["ok"] is True
+    assert "prepared_answer" in sql_call["result"]["update"]
+
+
+def test_execute_sql_result_can_prepare_transform_answer(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the highest observed value."
+    public_task.context_dir.joinpath("knowledge.md").write_text(
+        "Use the observed source value exactly.\n",
+        encoding="utf-8",
+    )
+    with closing(sqlite3.connect(public_task.context_dir / "sample.sqlite")) as connection:
+        connection.executemany(
+            "INSERT INTO metrics (name, value) VALUES (?, ?)",
+            [("alpha", 1), ("beta", 2)],
+        )
+        connection.commit()
+    plan = _plan_args(
+        requirement_quote=question,
+        context_paths=["/context/sample.sqlite::metrics"],
+        columns=[("value", ["value"])],
+        transformations=[
+            {
+                "operation": "sort",
+                "description": "Use highest as the selector operation.",
+                "authorization": {"source": "user", "quote": "highest"},
+            },
+            {
+                "operation": "limit",
+                "description": "Keep the highest row.",
+                "authorization": {"source": "user", "quote": "highest"},
+            },
+        ],
+        expected_row_count=1,
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "inspect_sqlite",
+                {
+                    "path": "/context/sample.sqlite",
+                    "table": "metrics",
+                    "sample_rows": 1,
+                },
+                "sql-transform-source",
+            ),
+            _tool_response("analyze_plan", plan, "sql-transform-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "sql-transform-todos",
+            ),
+            _tool_response(
+                "execute_sql",
+                {
+                    "path": "/context/sample.sqlite",
+                    "sql": "SELECT value FROM metrics ORDER BY value DESC LIMIT 1",
+                },
+                "sql-transform-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    assert result.answer is not None
+    assert result.answer.rows == [[2.0]]
+    _, sql_call = _tool_call(result, "sql-transform-answer")
+    assert sql_call["ok"] is True
+    messages = sql_call["result"]["update"]["messages"]
+    assert messages[0]["name"] == "execute_sql"
+
+
+def test_transformations_canonicalize_row_policy(public_task: PublicTask) -> None:
+    question = "Return the highest observed value."
+    plan = _plan_args(
+        requirement_quote=question,
+        transformations=[
+            {
+                "operation": "sort",
+                "description": "Use highest as the selector operation.",
+                "authorization": {"source": "user", "quote": "highest"},
+            }
+        ],
+    )
+    plan["output_spec"]["row_policy"] = "preserve"
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "row-policy-source",
+            ),
+            _tool_response("analyze_plan", plan, "row-policy-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "row-policy-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "row-policy-plan")
+    assert plan_call["ok"] is True
+    assert (
+        plan_call["result"]["update"]["analysis_plan"]["output_spec"]["row_policy"]
+        == "transform"
+    )
+
+
 def test_execution_spec_rejects_unauthorized_operations(public_task: PublicTask) -> None:
     invalid_plan = _plan_args()
     invalid_plan["execution_spec"] = {
@@ -2299,6 +4389,200 @@ def test_execution_spec_rejects_unauthorized_operations(public_task: PublicTask)
     assert invalid_call["status"] == "error"
     assert "requires an exact user quote" in invalid_call["result"]["content"]
     assert valid_call["ok"] is True
+
+
+def test_execution_operations_inherit_transformation_authorization(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the highest observed value."
+    plan = _plan_args(
+        requirement_quote=question,
+        transformations=[
+            {
+                "operation": "sort",
+                "description": "Use highest as the selector operation.",
+                "authorization": {"source": "user", "quote": "highest"},
+            }
+        ],
+    )
+    plan["execution_spec"] = {
+        "sources": [{"path": "/context/data.txt"}],
+        "supporting_fields": [],
+        "operations": [
+            {
+                "operation": "sort",
+                "description": "Implement output_spec.transformations.sort.",
+            }
+        ],
+    }
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "inherited-auth-source",
+            ),
+            _tool_response("analyze_plan", plan, "inherited-auth-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "inherited-auth-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "inherited-auth-plan")
+    assert plan_call["ok"] is True
+
+
+def test_execution_spec_allows_structured_join_operation(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the observed value."
+    public_task.context_dir.joinpath("left.txt").write_text("id,value\n1,a\n", encoding="utf-8")
+    public_task.context_dir.joinpath("right.txt").write_text("id,value\n1,b\n", encoding="utf-8")
+    plan = _plan_args(
+        requirement_quote=question,
+        context_paths=["/context/left.txt", "/context/right.txt"],
+    )
+    plan["execution_spec"] = {
+        "sources": [
+            {"path": "/context/left.txt", "source_type": "doc"},
+            {"path": "/context/right.txt", "source_type": "doc"},
+        ],
+        "supporting_fields": [
+            {
+                "name": "left_id",
+                "source_fields": ["id"],
+                "purpose": "join",
+            },
+            {
+                "name": "right_id",
+                "source_fields": ["id"],
+                "purpose": "join",
+            },
+        ],
+        "operations": [
+            {
+                "operation": "join",
+                "description": "Join the two observed sources on their id fields.",
+                "authorization": {"source": "user", "quote": question},
+                "left_source": "/context/left.txt",
+                "right_source": "/context/right.txt",
+                "left_key": "id",
+                "right_key": "id",
+                "how": "inner",
+            }
+        ],
+    }
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/left.txt"},
+                "join-left-source",
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/right.txt"},
+                "join-right-source",
+            ),
+            _tool_response("analyze_plan", plan, "join-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "join-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["joined"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "join-plan")
+    assert plan_call["ok"] is True
+    operation = plan_call["result"]["update"]["analysis_plan"]["execution_spec"][
+        "operations"
+    ][0]
+    assert operation["operation"] == "join"
+    assert operation["left_key"] == "id"
+
+
+def test_execution_spec_rejects_join_with_unobserved_source(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the observed value."
+    public_task.context_dir.joinpath("left.txt").write_text("id,value\n1,a\n", encoding="utf-8")
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        context_paths=["/context/left.txt"],
+    )
+    invalid_plan["execution_spec"] = {
+        "sources": [
+            {"path": "/context/left.txt", "source_type": "doc"},
+            {"path": "/context/missing.txt", "source_type": "doc"},
+        ],
+        "supporting_fields": [],
+        "operations": [
+            {
+                "operation": "join",
+                "description": "Join an unobserved source.",
+                "authorization": {"source": "user", "quote": question},
+                "left_source": "/context/left.txt",
+                "right_source": "/context/missing.txt",
+                "left_key": "id",
+                "right_key": "id",
+            }
+        ],
+    }
+    valid_plan = _plan_args(
+        requirement_quote=question,
+        context_paths=["/context/left.txt"],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/left.txt"},
+                "join-observed-source",
+            ),
+            _tool_response(
+                "analyze_plan",
+                invalid_plan,
+                "invalid-join-plan",
+            ),
+            _tool_response("analyze_plan", valid_plan, "valid-after-join-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "valid-after-join-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "invalid-join-plan")
+    assert invalid_call["ok"] is False
+    assert "unobserved sources" in invalid_call["result"]["content"]
 
 
 def test_preserve_plan_allows_source_context_columns(
@@ -2373,7 +4657,7 @@ def test_preserve_plan_allows_source_context_columns(
 
 def test_task_2_preserves_source_rows_without_aggregation() -> None:
     repository_root = Path(__file__).resolve().parents[1]
-    task_dir = repository_root / "data" / "public" / "input" / "task_2"
+    task_dir = repository_root / "data" / "input" / "task_2"
     context_dir = task_dir / "context"
     task_record = json.loads(
         task_dir.joinpath("task.json").read_text(encoding="utf-8")
@@ -2395,8 +4679,9 @@ def test_task_2_preserves_source_rows_without_aggregation() -> None:
         "Project EndDate, Province, and ThirdIndustryGDP while preserving source rows",
         "Validate source-shaped rows and submit",
     ]
+    question_quote = task_record["question"]
     plan = _plan_args(
-        requirement_quote="第三产业国内生产总值",
+        requirement_quote=question_quote,
         knowledge_quote="GDP contribution from the tertiary (services) sector",
         context_paths=["/context/json/ed_grossdomesticproduct.json"],
         columns=[
@@ -2412,7 +4697,7 @@ def test_task_2_preserves_source_rows_without_aggregation() -> None:
     plan["intent"]["requirements"][0] = {
         "statement": "Return the historical third-industry GDP records.",
         "requirement_type": "measure",
-        "quote": "第三产业国内生产总值",
+        "quote": question_quote,
     }
     plan["intent"]["unresolved"] = [
         (
@@ -2433,7 +4718,7 @@ def test_task_2_preserves_source_rows_without_aggregation() -> None:
         auto_discovery_plan=False,
         responses=[
             _question_structure_response(
-                target_quote="第三产业国内生产总值",
+                target_quote=question_quote,
                 target_constraints=[
                     {
                         "quote": "我国",
@@ -2793,10 +5078,12 @@ def test_read_json_returns_paged_functional_view(tmp_path: Path) -> None:
             "type": "tool_call",
             "name": "read_json",
             "id": "paged-json",
-            "args": {"path": "/context/records.json", "max_items": 2},
+            "args": {"path": "/context/records.json", "max_items": 2, "state": {}},
         }
     )
 
+    command = result
+    result = _command_tool_message(result)
     assert result.status == "success"
     payload = json.loads(result.content)
     assert payload["selected_path"] == "records"
@@ -2808,6 +5095,10 @@ def test_read_json_returns_paged_functional_view(tmp_path: Path) -> None:
     assert "data" not in payload
     assert "records" not in payload
     assert payload["schema"]["fields"]["value"]["types"] == ["int", "null"]
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["path"] == "/context/records.json"
+    assert observed[0]["row_count"] == 3
+    assert observed[0]["fields"] == ["id", "value", "other"]
 
 
 def test_read_doc_defaults_to_paged_window(tmp_path: Path) -> None:
@@ -2828,10 +5119,12 @@ def test_read_doc_defaults_to_paged_window(tmp_path: Path) -> None:
             "type": "tool_call",
             "name": "read_doc",
             "id": "paged-doc",
-            "args": {"path": "/context/doc/large.md"},
+            "args": {"path": "/context/doc/large.md", "state": {}},
         }
     )
 
+    command = result
+    result = _command_tool_message(result)
     assert result.status == "success"
     payload = json.loads(result.content)
     assert payload["returned_lines"] == 120
@@ -2840,6 +5133,70 @@ def test_read_doc_defaults_to_paged_window(tmp_path: Path) -> None:
     assert payload["truncated"] is True
     assert "   120->line 120" in payload["content"]
     assert "   121->line 121" not in payload["content"]
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["path"] == "/context/doc/large.md"
+    assert observed[0]["line_count"] == 200
+
+
+def test_read_doc_surfaces_semantic_windows_from_question(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "# Table `mf_netvalueperformancehis`",
+                "| Column | Semantic Definition | Unit |",
+                "|---|---|---|",
+                "| `RRInTenYear` | 近十年累计回报率 | % |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("mf_netvalueperformancehis.md").write_text(
+        "\n".join(
+            [
+                "背景说明。",
+                "档案 266 的十年回报率为 166.097944%。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tool = create_read_doc_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "read_doc",
+            "id": "semantic-window-doc",
+            "args": {
+                "path": "/context/doc/mf_netvalueperformancehis.md",
+                "max_lines": 1,
+                "state": {
+                    "original_request": "我能看一下基金的十年回报率数据吗",
+                    "question_structure": {
+                        "target_constraints": [
+                            {"quote": "十年", "value": "ten_years"}
+                        ]
+                    },
+                },
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    payload = json.loads(message.content)
+    assert "semantic_windows" in payload
+    assert "十年回报率" in payload["semantic_windows"][0]["content"]
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["logical_name"] == "mf_netvalueperformancehis"
+    assert "十年回报率" in observed[0]["matched_lines"][0]["content"]
 
 
 def test_inspect_sqlite_overview_omits_sample_rows(tmp_path: Path) -> None:
@@ -2864,9 +5221,11 @@ def test_inspect_sqlite_overview_omits_sample_rows(tmp_path: Path) -> None:
             "type": "tool_call",
             "name": "inspect_sqlite",
             "id": "sqlite-overview",
-            "args": {"path": "/context/db/sample.sqlite"},
+            "args": {"path": "/context/db/sample.sqlite", "state": {}},
         }
     )
+    overview_command = overview
+    overview = _command_tool_message(overview)
     detail = tool.invoke(
         {
             "type": "tool_call",
@@ -2876,9 +5235,12 @@ def test_inspect_sqlite_overview_omits_sample_rows(tmp_path: Path) -> None:
                 "path": "/context/db/sample.sqlite",
                 "table": "metrics",
                 "sample_rows": 1,
+                "state": getattr(overview_command, "update", {}),
             },
         }
     )
+    detail_command = detail
+    detail = _command_tool_message(detail)
 
     assert overview.status == "success"
     overview_payload = json.loads(overview.content)
@@ -2893,6 +5255,16 @@ def test_inspect_sqlite_overview_omits_sample_rows(tmp_path: Path) -> None:
     assert detail_payload["tables"]["metrics"]["sample_rows"] == [
         {"id": 1, "value": "alpha"}
     ]
+    observed = getattr(detail_command, "update", {})["observed_sources"]
+    assert {source["path"] for source in observed} == {
+        "/context/db/sample.sqlite",
+        "/context/db/sample.sqlite::metrics",
+    }
+    table_source = next(
+        source for source in observed if source["path"].endswith("::metrics")
+    )
+    assert table_source["row_count"] == 2
+    assert table_source["fields"] == ["id", "value"]
 
 
 def test_python_tool_schema_keeps_answer_rows_out_of_model_input(
@@ -2995,8 +5367,8 @@ def test_unavailable_tools_are_hidden_from_main_and_subagent(public_task: Public
     assert model.bound_tool_sets
     assert model.bound_tool_sets[0] == DISCOVERY_TOOLS
     assert model.bound_tool_choices[0] is None
-    assert model.bound_tool_sets[1] == PLAN_ONLY_TOOLS
-    assert model.bound_tool_choices[1] == "analyze_plan"
+    assert model.bound_tool_sets[1] == PLAN_TOOLS
+    assert model.bound_tool_choices[1] is None
     assert model.bound_tool_sets[2] == {"write_todos"}
     assert model.bound_tool_choices[2] == "write_todos"
     hidden_tools = {

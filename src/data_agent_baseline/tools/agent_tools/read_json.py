@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.prompts.loader import load_tool_prompt
@@ -15,6 +16,10 @@ from data_agent_baseline.tools._helpers import (
     resolve_context_path,
     success,
     virtual_path,
+)
+from data_agent_baseline.tools.observed_sources import (
+    observed_sources_command,
+    sample_hash,
 )
 
 _DEFAULT_COLLECTION_KEYS = ("records", "items", "rows", "data", "values")
@@ -153,6 +158,7 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     def read_json(
         path: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict[str, Any], InjectedState],
         json_path: str = "",
         start_item: int = 0,
         max_items: int = 50,
@@ -192,6 +198,10 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                 "selected": _json_summary(selected),
             }
 
+            source_fields: list[str] = []
+            row_count: int | None = None
+            selected_path = ""
+            sample_value: Any = selected
             if collection_items is not None:
                 page_items, has_more = _window_items(
                     collection_items,
@@ -199,6 +209,12 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                     max_items,
                 )
                 selected_path = _join_json_path(json_path, collection_path)
+                schema = _field_schema(collection_items)
+                fields = schema.get("fields")
+                if isinstance(fields, Mapping):
+                    source_fields = [str(field) for field in fields.keys()]
+                row_count = len(collection_items)
+                sample_value = page_items
                 payload.update(
                     {
                         "selected_path": selected_path,
@@ -208,11 +224,13 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                         "start_item": start_item,
                         "has_more": has_more,
                         "truncated": start_item > 0 or has_more,
-                        "schema": _field_schema(collection_items),
+                        "schema": schema,
                         "metadata": _parent_metadata(selected, collection_path),
                     }
                 )
             else:
+                if isinstance(selected, Mapping):
+                    source_fields = [str(field) for field in selected.keys()]
                 payload.update(
                     {
                         "data": selected,
@@ -223,11 +241,26 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                         ),
                     }
                 )
-            return success(
+            message = success(
                 name="read_json",
                 tool_call_id=tool_call_id,
                 payload=payload,
                 max_output_bytes=config.max_output_bytes,
+            )
+            return observed_sources_command(
+                state=state,
+                message=message,
+                sources=[
+                    {
+                        "path": payload["path"],
+                        "source_type": "json",
+                        "row_count": row_count,
+                        "fields": source_fields,
+                        "selected_path": selected_path,
+                        "sample_hash": sample_hash(sample_value),
+                        "observed_by": "read_json",
+                    }
+                ],
             )
         except Exception as exc:
             return error(

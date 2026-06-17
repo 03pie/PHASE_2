@@ -171,11 +171,16 @@ def run_task_command(
 def run_benchmark_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    task_id: list[str] | None = typer.Option(
+        None,
+        "--task-id",
+        help="Task id to include; repeat for multiple tasks.",
+    ),
 ) -> None:
     """Run the Deep Agent baseline on multiple tasks from the config selection."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    task_total = len(dataset.iter_tasks())
+    task_total = len(dataset.iter_tasks(task_ids=task_id))
     if limit is not None:
         task_total = min(task_total, limit)
     effective_workers = app_config.run.max_workers
@@ -247,6 +252,7 @@ def run_benchmark_command(
             run_output_dir, artifacts = run_benchmark(
                 config=app_config,
                 limit=limit,
+                task_ids=task_id,
                 progress_callback=on_task_complete,
             )
         except (ValueError, FileExistsError) as exc:

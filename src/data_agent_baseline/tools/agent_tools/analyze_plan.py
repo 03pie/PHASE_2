@@ -51,6 +51,16 @@ TransformationOperation = Literal[
     "deduplicate",
     "reshape",
 ]
+ExecutionOperationName = Literal[
+    "filter",
+    "aggregate",
+    "derive",
+    "sort",
+    "limit",
+    "deduplicate",
+    "reshape",
+    "join",
+]
 
 
 class IntentRequirement(TypedDict):
@@ -110,16 +120,29 @@ class SupportingField(TypedDict):
 
 
 class ExecutionOperation(TypedDict):
-    operation: TransformationOperation
+    operation: ExecutionOperationName
     description: str
     authorization: NotRequired[TransformationAuthorization]
     authorization_fact_ids: NotRequired[list[str]]
+    left_source: NotRequired[str]
+    right_source: NotRequired[str]
+    left_key: NotRequired[str]
+    right_key: NotRequired[str]
+    how: NotRequired[Literal["inner", "left", "right", "outer"]]
+
+
+class SourceBinding(TypedDict):
+    fact_id: str
+    logical_table: str
+    source_field: str
+    source_paths: list[str]
 
 
 class ExecutionSpec(TypedDict):
     sources: list[ExecutionSource]
     supporting_fields: list[SupportingField]
     operations: list[ExecutionOperation]
+    source_bindings: NotRequired[list[SourceBinding]]
 
 
 class KnowledgeRule(TypedDict):
@@ -334,6 +357,21 @@ def analyze_plan_tool(
 
     normalized_execution_spec: ExecutionSpec | None = None
     if isinstance(execution_spec, Mapping):
+        source_bindings = [
+            {
+                "fact_id": _clean_text(item.get("fact_id")),
+                "logical_table": _clean_text(item.get("logical_table")),
+                "source_field": _clean_text(item.get("source_field")),
+                "source_paths": [
+                    path.replace("\\", "/")
+                    for path in _clean_texts(item.get("source_paths", []))
+                ],
+            }
+            for item in execution_spec.get("source_bindings", [])
+            if isinstance(item, Mapping)
+            and _clean_text(item.get("source_field"))
+            and _clean_texts(item.get("source_paths", []))
+        ]
         normalized_execution_spec = {
             "sources": [
                 {
@@ -366,6 +404,31 @@ def analyze_plan_tool(
                     "operation": item.get("operation"),
                     "description": _clean_text(item.get("description")),
                     **(
+                        {"left_source": _clean_text(item.get("left_source"))}
+                        if _clean_text(item.get("left_source"))
+                        else {}
+                    ),
+                    **(
+                        {"right_source": _clean_text(item.get("right_source"))}
+                        if _clean_text(item.get("right_source"))
+                        else {}
+                    ),
+                    **(
+                        {"left_key": _clean_text(item.get("left_key"))}
+                        if _clean_text(item.get("left_key"))
+                        else {}
+                    ),
+                    **(
+                        {"right_key": _clean_text(item.get("right_key"))}
+                        if _clean_text(item.get("right_key"))
+                        else {}
+                    ),
+                    **(
+                        {"how": item.get("how")}
+                        if _clean_text(item.get("how"))
+                        else {}
+                    ),
+                    **(
                         {
                             "authorization": {
                                 "source": item.get("authorization", {}).get("source"),
@@ -393,6 +456,8 @@ def analyze_plan_tool(
                 and _clean_text(item.get("operation"))
             ],
         }
+        if source_bindings:
+            normalized_execution_spec["source_bindings"] = source_bindings
 
     plan = {
         "schema_version": schema_version,

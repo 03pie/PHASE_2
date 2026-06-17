@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,12 @@ from data_agent_baseline.tools.agent_tools.execute_sql import create_execute_sql
 from data_agent_baseline.tools.agent_tools.execute_python import (
     create_execute_python_tool,
 )
+from data_agent_baseline.tools.agent_tools.finalize_answer_candidate import (
+    finalize_answer_candidate_tool,
+)
+from data_agent_baseline.tools.agent_tools.extract_narrative_records import (
+    create_extract_narrative_records_tool,
+)
 from data_agent_baseline.tools.agent_tools.grep_file import create_grep_file_tool
 from data_agent_baseline.tools.agent_tools.inspect_sqlite import (
     create_inspect_sqlite_tool,
@@ -59,6 +66,7 @@ from data_agent_baseline.tools.agent_tools.query_schema import create_query_sche
 from data_agent_baseline.tools.agent_tools.read_csv import create_read_csv_tool
 from data_agent_baseline.tools.agent_tools.read_doc import create_read_doc_tool
 from data_agent_baseline.tools.agent_tools.read_json import create_read_json_tool
+from data_agent_baseline.tools.agent_tools.set_answer import set_answer_tool
 from data_agent_baseline.tools.agent_tools.task import (
     format_task_prompt_entry,
     task_tool_description_overrides,
@@ -70,6 +78,7 @@ from data_agent_baseline.tools.agent_tools.write_todos import (
 )
 
 _TOOL_DESCRIPTION_LIMIT = 260
+_WORKSPACE_CLEANUP_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 
 def _normalize_answer(value: Any) -> AnswerTable | None:
@@ -134,6 +143,19 @@ def _register_benchmark_harness_profile(model: BaseChatModel) -> None:
             extra_middleware=build_write_todos_middleware,
         ),
     )
+
+
+def _remove_workspace_with_retry(path: Path) -> None:
+    for delay_seconds in (*_WORKSPACE_CLEANUP_RETRY_DELAYS_SECONDS, 0.0):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _compact_text(value: Any, *, limit: int = _TOOL_DESCRIPTION_LIMIT) -> str:
@@ -255,9 +277,11 @@ class DeepAgent:
             create_execute_sql_tool(workspace, self.config),
             create_grep_file_tool(workspace, self.config),
             create_query_schema_tool(workspace, self.config),
+            create_extract_narrative_records_tool(workspace, self.config),
         ]
         rate_limiter = ModelCallRateLimiter(self.config.model_call_interval_seconds)
         execution_tools = [*data_tools, execute_python_tool]
+        main_tools = [*execution_tools, set_answer_tool, finalize_answer_candidate_tool]
         subagent_description = (
             "Handle a focused, complex data-analysis or verification subtask. "
             "Returns findings with source files, calculation rules, assumptions, "
@@ -291,7 +315,7 @@ class DeepAgent:
         main_prompt = _inject_tool_descriptions(
             self.system_prompt,
             _build_tool_descriptions(
-                tools=execution_tools,
+                tools=main_tools,
                 include_plan_tools=True,
                 include_todo_tool=True,
                 subagents=subagents,
@@ -299,7 +323,7 @@ class DeepAgent:
         )
         return create_deep_agent(
             model=self.model,
-            tools=execution_tools,
+            tools=main_tools,
             system_prompt=None,
             backend=backend,
             permissions=workspace_permissions(),
@@ -337,8 +361,8 @@ class DeepAgent:
         )
 
         # 每个任务复制到独立临时目录，保证上下文只读且任务之间互不污染。
-        with tempfile.TemporaryDirectory(prefix=f"dabench-{task.task_id}-") as temp_dir:
-            workspace = Path(temp_dir)
+        workspace = Path(tempfile.mkdtemp(prefix=f"dabench-{task.task_id}-"))
+        try:
             shutil.copytree(task.context_dir, workspace / "context")
             (workspace / "scratch").mkdir()
             graph = self._create_graph(workspace, collector)
@@ -397,6 +421,20 @@ class DeepAgent:
                 if trace_callback is not None:
                     trace_callback(failed_result, "failed")
                 return failed_result
+            except Exception as exc:
+                failed_result = AgentRunResult(
+                    task_id=task.task_id,
+                    answer=None,
+                    steps=collector.snapshot(),
+                    failure_reason=(
+                        f"Deep Agent failed with {type(exc).__name__}: {exc}"
+                    ),
+                )
+                if trace_callback is not None:
+                    trace_callback(failed_result, "failed")
+                return failed_result
+        finally:
+            _remove_workspace_with_retry(workspace)
 
         messages = _messages_from_state(result)
         answer = _normalize_answer(result.get("answer"))

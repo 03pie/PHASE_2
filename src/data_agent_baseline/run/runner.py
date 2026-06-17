@@ -149,6 +149,19 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
     _write_text_file(path, buffer.getvalue(), fallback_direct=False)
 
 
+def _is_prepared_answer(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    columns = value.get("columns")
+    rows = value.get("rows")
+    return (
+        isinstance(columns, list)
+        and bool(columns)
+        and isinstance(rows, list)
+        and bool(rows)
+    )
+
+
 def _failure_run_result_payload(
     task_id: str,
     failure_reason: str,
@@ -163,6 +176,16 @@ def _failure_run_result_payload(
                 partial_payload = loaded_payload
         except (OSError, json.JSONDecodeError):
             partial_payload = {}
+
+    partial_answer = partial_payload.get("answer")
+    if _is_prepared_answer(partial_answer):
+        return {
+            "task_id": task_id,
+            "answer": partial_answer,
+            "steps": partial_payload.get("steps", []),
+            "failure_reason": None,
+            "succeeded": True,
+        }
 
     return {
         "task_id": task_id,
@@ -229,18 +252,20 @@ def _run_single_task_in_subprocess(
     connection: Connection,
 ) -> None:
     try:
-        connection.send(
-            {
-                "ok": True,
-                "run_result": _run_single_task_core(
-                    task_id=task_id,
-                    config=config,
-                    trace_path=trace_path,
-                ),
-            }
-        )
+        payload = {
+            "ok": True,
+            "run_result": _run_single_task_core(
+                task_id=task_id,
+                config=config,
+                trace_path=trace_path,
+            ),
+        }
     except BaseException as exc:  # noqa: BLE001
-        connection.send({"ok": False, "error": str(exc)})
+        payload = {"ok": False, "error": str(exc)}
+    try:
+        connection.send(payload)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
     finally:
         connection.close()
 
@@ -410,6 +435,7 @@ def run_benchmark(
     config: AppConfig,
     model: BaseChatModel | None = None,
     limit: int | None = None,
+    task_ids: list[str] | None = None,
     progress_callback: Callable[[TaskRunArtifacts], None] | None = None,
 ) -> tuple[Path, list[TaskRunArtifacts]]:
     effective_run_id, run_output_dir = create_run_output_dir(
@@ -417,7 +443,7 @@ def run_benchmark(
     )
 
     dataset = DABenchPublicDataset(config.dataset.root_path)
-    tasks = dataset.iter_tasks()
+    tasks = dataset.iter_tasks(task_ids=task_ids)
     if limit is not None:
         tasks = tasks[:limit]
 

@@ -149,6 +149,20 @@ def serialize_tool_result(value: ToolMessage | Command[Any]) -> dict[str, Any]:
     }
 
 
+def command_has_error_message(value: Command[Any]) -> bool:
+    update = value.update
+    if not isinstance(update, dict):
+        return False
+    messages = update.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, ToolMessage)
+        and getattr(message, "status", "success") == "error"
+        for message in messages
+    )
+
+
 @dataclass(slots=True)
 class TraceEvent:
     """trace 内部事件；最终由 collector 转换成公共 StepRecord。"""
@@ -491,8 +505,11 @@ class LlmTraceMiddleware(AgentMiddleware[Any, None, Any]):
 
         serialized_result = serialize_tool_result(result)
         ok = not (
-            isinstance(result, ToolMessage)
-            and getattr(result, "status", "success") == "error"
+            (
+                isinstance(result, ToolMessage)
+                and getattr(result, "status", "success") == "error"
+            )
+            or (isinstance(result, Command) and command_has_error_message(result))
         )
         self.collector.complete_tool_call(
             tool_call_id=tool_call_id,

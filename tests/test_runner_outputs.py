@@ -3,9 +3,11 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing
+import time
 from pathlib import Path
 from typing import Any
 
+import data_agent_baseline.run.runner as runner_module
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatResult
@@ -265,3 +267,98 @@ def test_subprocess_result_is_received_before_join(
     assert result["answer"] == {"columns": ["value"], "rows": [["one"]]}
     assert len(result["steps"][0]["payload"]) == 250_000
     assert not multiprocessing.active_children()
+
+
+def _write_answer_trace_then_sleep(
+    task_id: str,
+    config: AppConfig,
+    trace_path: Path,
+    connection: Any,
+) -> None:
+    del config, connection
+    trace_path.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "answer": {"columns": ["value"], "rows": [["one"]]},
+                "steps": [{"action": "execute_python"}],
+                "failure_reason": None,
+                "succeeded": False,
+                "status": "running",
+            }
+        ),
+        encoding="utf-8",
+    )
+    time.sleep(5)
+
+
+def test_timeout_preserves_prepared_answer_from_trace(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    config = AppConfig(
+        dataset=DatasetConfig(root_path=dataset_root),
+        agent=AgentConfig(),
+        run=RunConfig(output_dir=tmp_path / "runs", task_timeout_seconds=2),
+    )
+    trace_path = tmp_path / "trace.json"
+    monkeypatch.setattr(
+        "data_agent_baseline.run.runner._run_single_task_in_subprocess",
+        _write_answer_trace_then_sleep,
+    )
+
+    result = _run_single_task_with_timeout(
+        task_id="task_1",
+        config=config,
+        trace_path=trace_path,
+    )
+
+    assert result["succeeded"] is True
+    assert result["failure_reason"] is None
+    assert result["answer"] == {"columns": ["value"], "rows": [["one"]]}
+    assert not multiprocessing.active_children()
+
+
+class BrokenPipeConnection:
+    closed: bool = False
+
+    def send(self, payload: dict[str, Any]) -> None:
+        del payload
+        raise BrokenPipeError()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_subprocess_send_ignores_closed_parent_pipe(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = AppConfig(
+        dataset=DatasetConfig(root_path=tmp_path / "dataset"),
+        agent=AgentConfig(),
+        run=RunConfig(output_dir=tmp_path / "runs"),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_run_single_task_core",
+        lambda **kwargs: {
+            "task_id": kwargs["task_id"],
+            "answer": {"columns": ["value"], "rows": [["one"]]},
+            "steps": [],
+            "failure_reason": None,
+            "succeeded": True,
+        },
+    )
+    connection = BrokenPipeConnection()
+
+    runner_module._run_single_task_in_subprocess(
+        "task_1",
+        config,
+        tmp_path / "trace.json",
+        connection,
+    )
+
+    assert connection.closed

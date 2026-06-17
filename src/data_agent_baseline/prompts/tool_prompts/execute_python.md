@@ -1,1 +1,1 @@
-Run isolated Python over /context data and /scratch outputs; call set_answer(columns, rows) to submit the final table.
+Run isolated Python over /context data and /scratch outputs; call set_answer to submit the final table. Direct source-preserving projection may call set_answer(columns, rows). Transformed answers should call set_answer(columns, rows, audit={...}) with source_paths and operations; output_row_count and output_hash are stamped automatically from the submitted table.

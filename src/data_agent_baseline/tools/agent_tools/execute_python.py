@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,7 +19,13 @@ from data_agent_baseline.agents.deep_state import (
     DeepAgentConfig,
 )
 from data_agent_baseline.prompts.loader import load_tool_prompt
-from data_agent_baseline.tools.answer import validate_prepared_answer
+from data_agent_baseline.tools.answer import (
+    answer_value_hash,
+    normalize_answer_columns,
+    validate_prepared_answer,
+)
+
+_CONTEXT_PATH_RE = re.compile(r"/context/[^\s\"'<>),;\]]+")
 
 
 def _build_shell_environment() -> dict[str, str]:
@@ -102,13 +109,24 @@ def _rewrite_virtual_python_paths(code: str, workspace: Path) -> str:
     return ast.unparse(rewritten)
 
 
-def _answer_helper_source(result_path: Path) -> str:
+def _extract_context_paths(code: str) -> set[str]:
+    return {
+        path.replace("\\", "/").rstrip(".,")
+        for path in _CONTEXT_PATH_RE.findall(code)
+        if not path.lower().endswith("/knowledge.md")
+    }
+
+
+def _answer_helper_source(result_path: Path, *, auto_capture: bool) -> str:
     """向隔离脚本注入结果提交函数，完整数据只写入临时工作区。"""
 
-    return f"""
+    context_root = result_path.parent.parent / "context"
+    helper_source = f"""
+import hashlib as __answer_hashlib
 import json as __answer_json
 import math as __answer_math
 from pathlib import Path as __AnswerPath
+__ContextRoot = __AnswerPath({str(context_root)!r}).resolve()
 
 def __normalize_answer_value(value):
     if value is None or isinstance(value, (str, bool, int)):
@@ -131,35 +149,209 @@ def __normalize_answer_value(value):
             pass
     return str(value)
 
-def set_answer(columns, rows):
+def __normalize_answer_column(column):
+    if isinstance(column, dict):
+        for key in ("name", "column", "field", "source_field"):
+            value = column.get(key)
+            if value is None or isinstance(value, (list, tuple, dict)):
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return str(column)
+
+def answer_hash(columns, rows):
     payload = {{
-        "columns": [str(column) for column in columns],
+        "columns": [__normalize_answer_column(column) for column in columns],
         "rows": __normalize_answer_value(list(rows)),
+    }}
+    encoded = __answer_json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return __answer_hashlib.sha256(encoded).hexdigest()
+
+def __virtualize_audit_source(value):
+    text = str(value)
+    table_suffix = ""
+    path_text = text
+    if "::" in text:
+        path_text, table_name = text.split("::", 1)
+        table_suffix = "::" + table_name
+    try:
+        resolved = __AnswerPath(path_text).resolve()
+        relative = resolved.relative_to(__ContextRoot)
+    except (OSError, ValueError):
+        return text.replace("\\\\", "/")
+    return "/context/" + relative.as_posix() + table_suffix
+
+def __normalize_answer_audit(audit):
+    audit = __normalize_answer_value(audit)
+    if not isinstance(audit, dict):
+        return audit
+    normalized = dict(audit)
+    for key in ("source_paths", "sources"):
+        values = normalized.get(key)
+        if isinstance(values, list):
+            normalized[key] = [__virtualize_audit_source(item) for item in values]
+    return normalized
+
+def set_answer(columns, rows, audit=None):
+    normalized_columns = [__normalize_answer_column(column) for column in columns]
+    normalized_rows = __normalize_answer_value(list(rows))
+    normalized_audit = __normalize_answer_audit(audit)
+    if isinstance(normalized_audit, dict):
+        normalized_audit["output_row_count"] = len(normalized_rows)
+        normalized_audit["output_hash"] = answer_hash(normalized_columns, normalized_rows)
+    payload = {{
+        "columns": normalized_columns,
+        "rows": normalized_rows,
+        "audit": normalized_audit,
     }}
     __AnswerPath({str(result_path)!r}).write_text(
         __answer_json.dumps(payload, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
+
 """
+    if not auto_capture:
+        return helper_source
+    return helper_source + f"""
+def __auto_capture_answer():
+    result_file = __AnswerPath({str(result_path)!r})
+    if result_file.exists():
+        return
+    namespace = globals()
+    for candidate_name in ("result", "set_answer_result"):
+        candidate = namespace.get(candidate_name)
+        if isinstance(candidate, dict) and "columns" in candidate and "rows" in candidate:
+            try:
+                set_answer(
+                    candidate["columns"],
+                    candidate["rows"],
+                    audit=candidate.get("audit"),
+                )
+            except Exception:
+                pass
+            return
+    if "columns" in namespace and "rows" in namespace:
+        try:
+            set_answer(namespace["columns"], namespace["rows"], audit=namespace.get("audit"))
+        except Exception:
+            pass
+
+import atexit as __answer_atexit
+__answer_atexit.register(__auto_capture_answer)
+"""
+
+
+def _plan_is_transform(analysis_plan: dict[str, Any]) -> bool:
+    output_spec = analysis_plan.get("output_spec") or {}
+    return (
+        isinstance(output_spec, dict)
+        and (
+            output_spec.get("row_policy") == "transform"
+            or bool(output_spec.get("transformations"))
+        )
+    )
+
+
+def _plan_has_source_bindings(analysis_plan: dict[str, Any]) -> bool:
+    execution_spec = analysis_plan.get("execution_spec") or {}
+    return (
+        isinstance(execution_spec, dict)
+        and isinstance(execution_spec.get("source_bindings"), list)
+        and bool(execution_spec["source_bindings"])
+    )
+
+
+def _plan_operation_labels(analysis_plan: dict[str, Any]) -> list[Any]:
+    execution_spec = analysis_plan.get("execution_spec") or {}
+    if isinstance(execution_spec, dict):
+        operations = execution_spec.get("operations")
+        if isinstance(operations, list) and operations:
+            return operations
+    output_spec = analysis_plan.get("output_spec") or {}
+    if isinstance(output_spec, dict):
+        transformations = output_spec.get("transformations")
+        if isinstance(transformations, list) and transformations:
+            return transformations
+    return []
+
+
+def _source_aliases(path: str) -> set[str]:
+    normalized = path.replace("\\", "/")
+    aliases = {normalized}
+    if "::" in normalized:
+        aliases.add(normalized.split("::", 1)[0])
+    return aliases
+
+
+def _declared_plan_sources(analysis_plan: dict[str, Any]) -> set[str]:
+    declared: set[str] = set()
+    for section_name in ("evidence", "execution_spec"):
+        section = analysis_plan.get(section_name) or {}
+        if not isinstance(section, dict):
+            continue
+        key = "context_sources" if section_name == "evidence" else "sources"
+        for source in section.get(key) or []:
+            if not isinstance(source, dict):
+                continue
+            path = str(source.get("path") or "").strip()
+            if path:
+                declared.update(_source_aliases(path))
+    return declared
+
+
+def _synthesize_execution_audit(
+    *,
+    analysis_plan: dict[str, Any],
+    code_context_paths: set[str],
+    columns: list[str],
+    rows: list[list[Any]],
+) -> dict[str, Any] | None:
+    if not (_plan_is_transform(analysis_plan) or _plan_has_source_bindings(analysis_plan)):
+        return None
+    operations = _plan_operation_labels(analysis_plan)
+    if not operations and not _plan_has_source_bindings(analysis_plan):
+        return None
+    declared_sources = _declared_plan_sources(analysis_plan)
+    source_paths = sorted(
+        path
+        for path in code_context_paths
+        if not declared_sources or _source_aliases(path) & declared_sources
+    )
+    if not source_paths:
+        return None
+    return {
+        "source_paths": source_paths,
+        "operations": operations or ["source_bound_projection"],
+        "output_row_count": len(rows),
+        "output_hash": answer_value_hash(columns, rows),
+        "audit_origin": "execute_python_static_context_paths",
+    }
 
 
 def _load_prepared_answer(
     result_path: Path,
     analysis_plan: dict[str, Any] | None,
-) -> tuple[Any | None, str | None]:
+    code_context_paths: set[str],
+) -> tuple[Any | None, str | None, dict[str, Any] | None]:
     if not result_path.exists():
-        return None, None
-    if analysis_plan is None:
-        return None, "set_answer requires a successful analysis_plan first."
+        return None, None, None
     try:
         payload = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return None, f"set_answer produced an unreadable result: {exc}"
+        return None, f"set_answer produced an unreadable result: {exc}", None
     columns = payload.get("columns")
     rows = payload.get("rows")
+    audit = payload.get("audit")
     if not isinstance(columns, list) or not isinstance(rows, list):
-        return None, "set_answer requires list columns and list rows."
-    normalized_columns = [str(column) for column in columns]
+        return None, "set_answer requires list columns and list rows.", None
+    normalized_columns = normalize_answer_columns(columns)
     if all(isinstance(row, dict) for row in rows):
         normalized_rows = [
             [row.get(column) for column in normalized_columns]
@@ -168,12 +360,36 @@ def _load_prepared_answer(
     elif all(isinstance(row, list) for row in rows):
         normalized_rows = [list(row) for row in rows]
     else:
-        return None, "set_answer rows must contain only row lists or row objects."
-    return validate_prepared_answer(
+        return None, "set_answer rows must contain only row lists or row objects.", None
+    candidate = {
+        "columns": normalized_columns,
+        "rows": normalized_rows,
+        "audit": audit,
+        "column_count": len(normalized_columns),
+        "row_count": len(normalized_rows),
+        "code_context_paths": sorted(code_context_paths),
+    }
+    if analysis_plan is None:
+        answer_error = "set_answer requires a successful analysis_plan first."
+        candidate["validation_error"] = answer_error
+        return None, answer_error, candidate
+    if not isinstance(audit, dict):
+        audit = _synthesize_execution_audit(
+            analysis_plan=analysis_plan,
+            code_context_paths=code_context_paths,
+            columns=normalized_columns,
+            rows=normalized_rows,
+        )
+        candidate["audit"] = audit
+    prepared_answer, answer_error = validate_prepared_answer(
         normalized_columns,
         normalized_rows,
         analysis_plan,
+        audit if isinstance(audit, dict) else None,
     )
+    if answer_error is not None:
+        candidate["validation_error"] = answer_error
+    return prepared_answer, answer_error, candidate
 
 
 def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
@@ -206,7 +422,14 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
             )
 
         result_path = workspace / "scratch" / f"prepared-answer-{tool_call_id}.json"
-        executable_code = f"{_answer_helper_source(result_path)}\n{executable_code}"
+        code_context_paths = _extract_context_paths(code)
+        auto_capture_answer = isinstance(state.get("analysis_plan"), dict) and bool(
+            state.get("todos")
+        )
+        executable_code = (
+            f"{_answer_helper_source(result_path, auto_capture=auto_capture_answer)}\n"
+            f"{executable_code}"
+        )
         try:
             completed = subprocess.run(
                 [sys.executable, "-X", "utf8", "-I", "-B", "-"],
@@ -248,16 +471,50 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
             max_output_bytes=config.max_output_bytes,
         )
         if completed.returncode == 0:
-            prepared_answer, answer_error = _load_prepared_answer(
+            prepared_answer, answer_error, answer_candidate = _load_prepared_answer(
                 result_path,
                 state.get("analysis_plan"),
+                code_context_paths,
             )
             if answer_error is not None:
-                return ToolMessage(
-                    content=f"{content}\n\n{answer_error}",
-                    name="execute_python",
-                    tool_call_id=tool_call_id,
-                    status="error",
+                candidate_summary = {
+                    "status": "candidate_saved",
+                    "column_count": (
+                        answer_candidate.get("column_count")
+                        if answer_candidate is not None
+                        else None
+                    ),
+                    "row_count": (
+                        answer_candidate.get("row_count")
+                        if answer_candidate is not None
+                        else None
+                    ),
+                    "validation_error": answer_error,
+                    "recovery": (
+                        "Revise analysis_plan to the observed candidate shape or "
+                        "call finalize_answer_candidate to submit a projected "
+                        "candidate table."
+                    ),
+                }
+                return Command(
+                    update={
+                        **(
+                            {"answer_candidate": answer_candidate}
+                            if answer_candidate is not None
+                            else {}
+                        ),
+                        "messages": [
+                            ToolMessage(
+                                content=(
+                                    f"{content}\n\n{answer_error}\n\n"
+                                    f"{json.dumps(candidate_summary, ensure_ascii=False)}"
+                                ),
+                                name="execute_python",
+                                tool_call_id=tool_call_id,
+                                status="error",
+                            )
+                        ],
+                    }
                 )
             if prepared_answer is not None:
                 summary = json.dumps(
@@ -271,6 +528,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                 return Command(
                     update={
                         "prepared_answer": prepared_answer,
+                        "answer_candidate": None,
                         "messages": [
                             ToolMessage(
                                 content=f"{content}\n\n{summary}",

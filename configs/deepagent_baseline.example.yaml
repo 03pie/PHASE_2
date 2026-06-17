@@ -1,9 +1,9 @@
 dataset:
-  root_path: data/public/input
+  root_path: data/input
 
 agent:
   max_retries: 5
-  max_steps: 16
+  max_steps: 24
   temperature: 0.0
   execute_timeout_seconds: 30
   max_output_bytes: 100000

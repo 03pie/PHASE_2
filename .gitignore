@@ -36,3 +36,4 @@ configs/*
 # OS / notebook noise
 .DS_Store
 .ipynb_checkpoints/
+.tmp-pytest/

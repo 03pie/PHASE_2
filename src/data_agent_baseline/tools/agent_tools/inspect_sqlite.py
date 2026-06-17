@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
 
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.prompts.loader import load_tool_prompt
@@ -17,6 +18,10 @@ from data_agent_baseline.tools._helpers import (
     success,
     virtual_path,
 )
+from data_agent_baseline.tools.observed_sources import (
+    observed_sources_command,
+    sample_hash,
+)
 
 def create_inspect_sqlite_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create a SQLite schema/sample inspection tool."""
@@ -27,6 +32,7 @@ def create_inspect_sqlite_tool(workspace: Path, config: DeepAgentConfig) -> Base
     def inspect_sqlite(
         path: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict[str, Any], InjectedState],
         table: str = "",
         sample_rows: int = 5,
     ) -> Any:
@@ -71,6 +77,14 @@ def create_inspect_sqlite_tool(workspace: Path, config: DeepAgentConfig) -> Base
                     "table_count": len(tables),
                     "tables": {},
                 }
+                sources: list[dict[str, Any]] = [
+                    {
+                        "path": result["path"],
+                        "source_type": "sqlite",
+                        "tables": tables,
+                        "observed_by": "inspect_sqlite",
+                    }
+                ]
                 for table_name in target_tables:
                     if table_name not in tables:
                         continue
@@ -96,6 +110,24 @@ def create_inspect_sqlite_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         table_info["sample_rows"] = [
                             dict(row) for row in cursor.fetchall()
                         ]
+                        fields = [str(column["name"]) for column in columns]
+                        sources.append(
+                            {
+                                "path": f"{result['path']}::{table_name}",
+                                "source_type": "sqlite_table",
+                                "base_path": result["path"],
+                                "table": table_name,
+                                "row_count": row_count,
+                                "fields": fields,
+                                "sample_hash": sample_hash(
+                                    {
+                                        "columns": fields,
+                                        "rows": table_info["sample_rows"],
+                                    }
+                                ),
+                                "observed_by": "inspect_sqlite",
+                            }
+                        )
                     result["tables"][table_name] = table_info
                 if table and not result["tables"]:
                     result["warning"] = (
@@ -106,11 +138,16 @@ def create_inspect_sqlite_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         "Pass table=<name> to inspect sample_rows for one table; "
                         "use execute_sql for targeted queries."
                     )
-                return success(
+                message = success(
                     name="inspect_sqlite",
                     tool_call_id=tool_call_id,
                     payload=result,
                     max_output_bytes=config.max_output_bytes,
+                )
+                return observed_sources_command(
+                    state=state,
+                    message=message,
+                    sources=sources,
                 )
         except sqlite3.Error as exc:
             return error(

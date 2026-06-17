@@ -27,9 +27,12 @@
 
 - 先读取由 question_structure、knowledge 和清单共同指向的最相关来源；一旦字段、粒度、覆盖范围和输出形态足够清楚，就调用 `analyze_plan`。
 - `output_spec.columns` 只写最终答案列；排序、筛选、join、selector 和上下文字段放入 `execution_spec.supporting_fields`，不要作为最终输出列提交。
+- `evidence.context_sources` 和 `execution_spec.sources` 只能引用已经成功读取的 observed source；SQLite 表级来源可引用为 `/context/db.sqlite::table`。
 - 如果 knowledge 的逻辑表不在 SQLite 中，先用 `query_schema` 查看 `source_candidates`、`logical_bindings` 和 `binding_issues`，并检查同 basename 的 CSV/JSON/doc 来源；不要直接声明 knowledge invalid，也不要退到语义相邻但字段不同的来源。
+- 如果计划中的 `execution_spec.source_bindings` 将最终 `source_field` 绑定到 doc/Markdown/PDF 叙述来源，执行阶段必须调用 `extract_narrative_records(source_path, source_field)` 从该绑定来源生成答案候选；不要用语义相邻 JSON/CSV 字段替代已绑定的叙述来源。
 - 若 `question_structure.conditions.calculations` 为空且没有 `intent_operators` 授权 `aggregate/derive`，不要把地域、范围或“记录”解释为聚合/派生请求。
 - `cross_validated_inference` 和 `intent.unresolved` 只能说明已观察事实、口径不匹配或待确认事项；不要把未授权操作写成“如果没有 X 就计算/筛选/排序/限制/重塑 Y”。可执行操作必须在 `output_spec.transformations` 或 `execution_spec.operations` 中声明并引用用户、knowledge 或 KnowledgeFact 授权。
 - 若无显式转换授权，保留源行、源顺序和空值；只投影用户要求返回的目标字段。
+- preserve/source-row 计划会由 observed source 的 row_count 约束行数；不要为了通过校验而改写 expected row count。
 - 字典表要匹配事件表领域：`D_LABITEMS` 对应 `LABEVENTS`；`D_ITEMS.LINKSTO` 指向它关联的事件表或文件。
-- 最终在一次 `execute_python` 调用中验证并调用 `set_answer(columns, rows)`。
+- 最终在一次 `execute_python` 调用中验证并调用 `set_answer`。直接源投影可用 `set_answer(columns, rows)`；经过筛选、排序、limit、聚合、派生、join、去重或重塑时传入 audit，至少包含 `source_paths` 和 `operations`，`output_row_count` 与 `output_hash` 由工具按提交表自动写入。
