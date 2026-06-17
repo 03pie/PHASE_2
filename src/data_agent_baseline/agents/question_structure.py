@@ -249,6 +249,24 @@ def _detect_intent_operators(question: str) -> list[dict[str, str]]:
     return operators
 
 
+def _explicit_operator_keys(question: str) -> set[tuple[str, str]]:
+    return {
+        (item["quote"], item["operation"])
+        for item in _detect_intent_operators(question)
+    }
+
+
+def _target_requests_source_records(targets: list[Any], question: str) -> bool:
+    del question
+    if any(
+        isinstance(target, Mapping)
+        and str(target.get("target_type") or "") == "record_set"
+        for target in targets
+    ):
+        return True
+    return False
+
+
 def _ensure_exact_quotes(items: list[Any], question: str) -> list[Any]:
     normalized_items: list[Any] = []
     for item in items:
@@ -299,12 +317,18 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
             if isinstance(item, Mapping) or str(item or "").strip()
         ]
 
+    explicit_operator_keys = _explicit_operator_keys(question)
     existing_operators = [
         item
         for item in normalized["intent_operators"]
         if isinstance(item, Mapping)
         and _exact_substring(item.get("quote"), question)
         and str(item.get("operation") or "").strip()
+        and (
+            str(item.get("quote") or ""),
+            str(item.get("operation") or ""),
+        )
+        in explicit_operator_keys
     ]
     detected_operators = _detect_intent_operators(question)
     operator_keys = {
@@ -334,6 +358,15 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
         output["row_grain_hint"] == "aggregated_records"
         and not conditions["calculations"]
         and not conditions["groupings"]
+    ):
+        output["row_grain_hint"] = "source_records"
+        output["preserve_source_rows"] = "true"
+    if (
+        _target_requests_source_records(normalized["targets"], question)
+        and not conditions["calculations"]
+        and not conditions["groupings"]
+        and not conditions["orderings"]
+        and not conditions["limits"]
     ):
         output["row_grain_hint"] = "source_records"
         output["preserve_source_rows"] = "true"

@@ -1,6 +1,6 @@
 agent:
   max_retries: 5
-  max_steps: 24
+  max_steps: 16
   temperature: 0.0
   execute_timeout_seconds: 30
   max_output_bytes: 100000

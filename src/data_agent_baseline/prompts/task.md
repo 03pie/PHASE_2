@@ -26,6 +26,7 @@
 ## 本任务执行约束
 
 - 先读取由 question_structure、knowledge 和清单共同指向的最相关来源；一旦字段、粒度、覆盖范围和输出形态足够清楚，就调用 `analyze_plan`。
+- 每轮工具决策都先遵守系统注入的 `<evidence_boundary>`：已观察来源证明数据形状，用户/knowledge quote 或 fact_id 才能授权转换；口径歧义写入 evidence 或 unresolved，不要无证据推理成操作。
 - `output_spec.columns` 只写最终答案列；排序、筛选、join、selector 和上下文字段放入 `execution_spec.supporting_fields`，不要作为最终输出列提交。
 - `evidence.context_sources` 和 `execution_spec.sources` 只能引用已经成功读取的 observed source；SQLite 表级来源可引用为 `/context/db.sqlite::table`。
 - 如果 knowledge 的逻辑表不在 SQLite 中，先用 `query_schema` 查看 `source_candidates`、`logical_bindings` 和 `binding_issues`，并检查同 basename 的 CSV/JSON/doc 来源；不要直接声明 knowledge invalid，也不要退到语义相邻但字段不同的来源。

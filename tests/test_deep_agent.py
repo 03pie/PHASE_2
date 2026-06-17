@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,39 @@ def _message_text(message: BaseMessage) -> str:
                 parts.append(str(block.get("text") or ""))
         return "\n".join(part for part in parts if part)
     return str(content or "")
+
+
+def _extract_evidence_boundaries(system_texts: list[str]) -> list[dict[str, Any]]:
+    boundaries: list[dict[str, Any]] = []
+    start_tag = "<evidence_boundary>"
+    end_tag = "</evidence_boundary>"
+    for text in system_texts:
+        search_from = 0
+        while True:
+            start = text.find(start_tag, search_from)
+            if start < 0:
+                break
+            end = text.find(end_tag, start)
+            if end < 0:
+                break
+            boundary_text = text[start + len(start_tag) : end].strip()
+            try:
+                boundaries.append(json.loads(boundary_text))
+            except json.JSONDecodeError:
+                pass
+            search_from = end + len(end_tag)
+    return boundaries
+
+
+def _system_prompt_texts(result: Any) -> list[str]:
+    texts: list[str] = []
+    for step in result.steps:
+        if step.action != "system_prompt":
+            continue
+        message = (step.action_input or {}).get("message")
+        if isinstance(message, Mapping):
+            texts.append(str(message.get("content") or ""))
+    return texts
 
 
 def _plan_args(
@@ -3865,9 +3899,13 @@ def test_preserve_plan_derives_expected_row_count_from_json(
     output_spec = plan_call["result"]["update"]["analysis_plan"]["output_spec"]
     assert output_spec["expected_row_count"] == 3
     wrong_step, wrong_call = _tool_call(result, "wrong-derived-row-count")
-    assert wrong_step.ok is False
-    assert wrong_call["ok"] is False
-    assert "expected_row_count=3" in json.dumps(wrong_call["result"])
+    assert wrong_step.ok is True
+    assert wrong_call["ok"] is True
+    wrong_message = wrong_call["result"]["update"]["messages"][0]["content"]
+    assert "prepared_from_source_projection" in wrong_message
+    assert "expected_row_count=3" in wrong_message
+    assert result.answer is not None
+    assert result.answer.rows == [[1], [2], [3]]
 
 
 def test_preserve_plan_reuses_observed_row_count_on_revision(
@@ -4105,6 +4143,158 @@ def test_question_structure_does_not_rewrite_plan_requirements(
         "requirements"
     ]
     assert requirements == plan["intent"]["requirements"]
+
+
+def test_decision_evidence_boundary_is_visible_after_observation(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(
+                target_quote="China tertiary GDP these records",
+                target_constraints=[
+                    {
+                        "quote": "China",
+                        "constraint_type": "geography",
+                        "value": "China",
+                        "explicitness": "explicit",
+                    }
+                ],
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "boundary-source",
+            ),
+            _tool_response(
+                "analyze_plan",
+                _plan_args(
+                    requirement_quote="China tertiary GDP these records",
+                    context_paths=["/context/data.txt"],
+                ),
+                "boundary-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Prepare", "status": "in_progress"}]},
+                "boundary-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question="China tertiary GDP these records",
+        ),
+        assets=public_task.assets,
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(task)
+
+    assert result.succeeded
+    boundaries = _extract_evidence_boundaries(
+        [*model.system_texts, *_system_prompt_texts(result)]
+    )
+    assert boundaries
+    observed_boundary = next(
+        boundary
+        for boundary in boundaries
+        if boundary["observed_sources"]
+    )
+    assert observed_boundary["observed_sources"][0]["path"] == "/context/data.txt"
+    assert observed_boundary["scope_constraints_are_evidence_not_authorization"] == [
+        {
+            "quote": "China",
+            "constraint_type": "geography",
+            "explicitness": "explicit",
+        }
+    ]
+    assert observed_boundary["user_authorized_operations"] == []
+    assert "aggregate" in observed_boundary[
+        "forbidden_without_user_or_knowledge_authorization"
+    ]
+
+
+def test_scope_constraint_cannot_authorize_aggregate(
+    public_task: PublicTask,
+) -> None:
+    invalid_plan = _plan_args(
+        requirement_quote="China",
+        requirement_type="grouping",
+        transformations=[
+            {
+                "operation": "aggregate",
+                "description": "Aggregate rows to the requested scope.",
+                "authorization": {"source": "user", "quote": "China"},
+            }
+        ],
+    )
+    invalid_plan["output_spec"]["ordering"] = "specified"
+    invalid_plan["intent"]["requirements"] = [
+        {
+            "statement": "Treat the geography scope as an aggregate request.",
+            "requirement_type": "grouping",
+            "quote": "China",
+        }
+    ]
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _question_structure_response(
+                target_quote="China tertiary GDP these records",
+                target_constraints=[
+                    {
+                        "quote": "China",
+                        "constraint_type": "geography",
+                        "value": "China",
+                        "explicitness": "explicit",
+                    }
+                ],
+            ),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "scope-source",
+            ),
+            _tool_response(
+                "analyze_plan",
+                invalid_plan,
+                "scope-aggregate-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Prepare", "status": "in_progress"}]},
+                "scope-aggregate-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["done"]]),
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question="China tertiary GDP these records",
+        ),
+        assets=public_task.assets,
+    )
+
+    result = DeepAgent(
+        model=model,
+        config=DeepAgentConfig(question_structure_enabled=True),
+    ).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "scope-aggregate-plan")
+    output_spec = plan_call["result"]["update"]["analysis_plan"]["output_spec"]
+    assert output_spec["transformations"] == []
+    assert output_spec["row_policy"] == "preserve"
+    assert output_spec["ordering"] == "source"
 
 
 def test_unrequested_output_columns_are_rejected(public_task: PublicTask) -> None:
@@ -4893,7 +5083,7 @@ def test_preserve_plan_allows_source_context_columns(
 
 def test_task_2_preserves_source_rows_without_aggregation() -> None:
     repository_root = Path(__file__).resolve().parents[1]
-    task_dir = repository_root / "data" / "input" / "task_2"
+    task_dir = repository_root / "data" / "public" / "input" / "task_2"
     context_dir = task_dir / "context"
     task_record = json.loads(
         task_dir.joinpath("task.json").read_text(encoding="utf-8")
@@ -5018,10 +5208,10 @@ def test_task_2_preserves_source_rows_without_aggregation() -> None:
 
     assert result.succeeded
     assert result.answer is not None
-    assert result.answer.columns == ["EndDate", "Province", "ThirdIndustryGDP"]
-    assert result.answer.rows == source_rows
+    assert result.answer.columns == ["ThirdIndustryGDP"]
+    assert result.answer.rows == [[row[2]] for row in source_rows]
     assert len(result.answer.rows) == 354
-    assert sum(row[2] is None for row in result.answer.rows) == 41
+    assert sum(row[0] is None for row in result.answer.rows) == 41
 
 
 def test_successful_answer_stops_before_another_model_call(public_task: PublicTask) -> None:

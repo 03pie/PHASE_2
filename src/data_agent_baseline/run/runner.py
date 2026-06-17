@@ -4,6 +4,7 @@ import csv
 import json
 import multiprocessing
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -273,11 +274,23 @@ def _run_single_task_in_subprocess(
 def _stop_process(process: multiprocessing.Process) -> None:
     process.join(timeout=1.0)
     if process.is_alive():
-        process.terminate()
+        _terminate_process_tree(process)
         process.join(timeout=1.0)
     if process.is_alive():
         process.kill()
         process.join()
+
+
+def _terminate_process_tree(process: multiprocessing.Process) -> None:
+    if os.name == "nt" and process.pid is not None:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    process.terminate()
 
 
 def _run_single_task_with_timeout(

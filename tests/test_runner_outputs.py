@@ -321,6 +321,29 @@ def test_timeout_preserves_prepared_answer_from_trace(
     assert not multiprocessing.active_children()
 
 
+def test_timeout_cleanup_terminates_windows_process_tree(
+    monkeypatch: Any,
+) -> None:
+    calls: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def terminate(self) -> None:
+            raise AssertionError("Windows cleanup should use taskkill /T.")
+
+    monkeypatch.setattr(runner_module.os, "name", "nt")
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append(command),
+    )
+
+    runner_module._terminate_process_tree(FakeProcess())  # type: ignore[arg-type]
+
+    assert calls == [["taskkill", "/PID", "12345", "/T", "/F"]]
+
+
 class BrokenPipeConnection:
     closed: bool = False
 

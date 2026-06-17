@@ -76,6 +76,17 @@ _OPERATION_REQUIREMENT_TYPES: dict[str, frozenset[str]] = {
     "deduplicate": frozenset({"deduplication"}),
     "reshape": frozenset({"reshape"}),
 }
+_TRANSFORM_OPERATIONS = frozenset(
+    {
+        "aggregate",
+        "derive",
+        "deduplicate",
+        "filter",
+        "limit",
+        "reshape",
+        "sort",
+    }
+)
 _AGGREGATE_SELECTOR_PATTERN = re.compile(
     r"(?i)\b(count|how many|number of|sum|total|average|avg|mean|"
     r"maximum|max|minimum|min|highest|lowest|largest|smallest|top|bottom)\b|"
@@ -881,6 +892,8 @@ def _canonicalize_unrequested_key_output_columns(
     updated_output_spec["columns"] = kept_columns
     execution_spec = arguments.get("execution_spec")
     updated_execution_spec = dict(execution_spec) if isinstance(execution_spec, Mapping) else {}
+    updated_execution_spec.setdefault("sources", [])
+    updated_execution_spec.setdefault("operations", [])
     supporting_fields = [
         dict(item)
         for item in updated_execution_spec.get("supporting_fields") or []
@@ -1470,6 +1483,13 @@ def _quote_type_pairs_from_question_structure(
         target_type = str(target.get("target_type") or "").strip()
         if quote and target_type:
             pairs.append((quote, _target_requirement_type(target_type)))
+    for constraint in question_structure.get("target_constraints") or []:
+        if not isinstance(constraint, Mapping):
+            continue
+        quote = str(constraint.get("quote") or "").strip()
+        if not quote:
+            continue
+        pairs.append((quote, "scope"))
     conditions = question_structure.get("conditions")
     if isinstance(conditions, Mapping):
         for container_name, items in conditions.items():
@@ -1485,6 +1505,24 @@ def _quote_type_pairs_from_question_structure(
     return pairs
 
 
+def _question_structure_exact_types_for_quote(
+    question_structure: Any,
+    quote: str,
+) -> set[str]:
+    if not isinstance(question_structure, Mapping):
+        return set()
+    normalized_quote = _normalized_quote_text(quote)
+    exact_types = {
+        requirement_type
+        for item_quote, requirement_type in _quote_type_pairs_from_question_structure(
+            question_structure
+        )
+        if item_quote == quote
+        or _normalized_quote_text(item_quote) == normalized_quote
+    }
+    return {item for item in exact_types if item}
+
+
 def _requirement_types_for_quote(
     *,
     quote: str,
@@ -1494,6 +1532,14 @@ def _requirement_types_for_quote(
     stripped = quote.strip()
     if not stripped:
         return set()
+    question_structure = state.get("question_structure")
+    if state.get("question_structure_enforced"):
+        exact_types = _question_structure_exact_types_for_quote(
+            question_structure,
+            stripped,
+        )
+        if exact_types:
+            return exact_types
     pairs: list[tuple[str, str]] = []
     intent = arguments.get("intent")
     if isinstance(intent, Mapping):
@@ -1504,7 +1550,7 @@ def _requirement_types_for_quote(
             requirement_type = str(item.get("requirement_type") or "").strip()
             if item_quote and requirement_type:
                 pairs.append((item_quote, requirement_type))
-    pairs.extend(_quote_type_pairs_from_question_structure(state.get("question_structure")))
+    pairs.extend(_quote_type_pairs_from_question_structure(question_structure))
     types: set[str] = set()
     normalized_quote = _normalized_quote_text(stripped)
     for item_quote, requirement_type in pairs:
@@ -1519,6 +1565,265 @@ def _requirement_types_for_quote(
         ):
             types.add(requirement_type)
     return types
+
+
+def _effective_requirement_types_by_quote(
+    raw_requirement_types_by_quote: Mapping[str, set[str]],
+    state: Mapping[str, Any],
+) -> dict[str, set[str]]:
+    if not state.get("question_structure_enforced"):
+        return {quote: set(types) for quote, types in raw_requirement_types_by_quote.items()}
+    question_structure = state.get("question_structure")
+    effective: dict[str, set[str]] = {}
+    for quote, types in raw_requirement_types_by_quote.items():
+        exact_types = _question_structure_exact_types_for_quote(
+            question_structure,
+            quote,
+        )
+        effective[quote] = exact_types or set(types)
+    return effective
+
+
+def _condition_quote_is_explicit(item: Mapping[str, Any], original_request: str) -> bool:
+    quote = str(item.get("quote") or "").strip()
+    if not quote or quote not in original_request:
+        return False
+    explicitness = str(item.get("explicitness") or "").strip()
+    return explicitness not in {"ambiguous", "unquoted_hint"}
+
+
+def _question_structure_user_authorized_operations(
+    question_structure: Any,
+    original_request: str,
+) -> set[str]:
+    if not isinstance(question_structure, Mapping):
+        return set()
+
+    authorized: set[str] = set()
+    for item in question_structure.get("intent_operators") or []:
+        if not isinstance(item, Mapping):
+            continue
+        quote = str(item.get("quote") or "").strip()
+        operation = str(item.get("operation") or "").strip()
+        if quote and quote in original_request and operation in _TRANSFORM_OPERATIONS:
+            authorized.add(operation)
+
+    conditions = question_structure.get("conditions")
+    if not isinstance(conditions, Mapping):
+        return authorized
+
+    condition_operations = {
+        "filters": {"filter"},
+        "time_ranges": {"filter"},
+        "groupings": {"aggregate"},
+        "orderings": {"sort"},
+        "limits": {"limit"},
+        "calculations": {"aggregate", "derive"},
+    }
+    for container_name, operations in condition_operations.items():
+        for item in conditions.get(container_name) or []:
+            if not isinstance(item, Mapping):
+                continue
+            if _condition_quote_is_explicit(item, original_request):
+                authorized.update(operations)
+    return authorized
+
+
+def _question_structure_scope_constraints(question_structure: Any) -> list[dict[str, str]]:
+    if not isinstance(question_structure, Mapping):
+        return []
+    constraints: list[dict[str, str]] = []
+    for item in question_structure.get("target_constraints") or []:
+        if not isinstance(item, Mapping):
+            continue
+        quote = str(item.get("quote") or "").strip()
+        if not quote:
+            continue
+        constraints.append(
+            {
+                "quote": quote,
+                "constraint_type": str(item.get("constraint_type") or "").strip(),
+                "explicitness": str(item.get("explicitness") or "").strip(),
+            }
+        )
+    return constraints[:12]
+
+
+def _question_structure_preserve_hint(question_structure: Any) -> bool:
+    if not isinstance(question_structure, Mapping):
+        return False
+    output = question_structure.get("output")
+    if not isinstance(output, Mapping):
+        return False
+    return (
+        str(output.get("row_grain_hint") or "") == "source_records"
+        and str(output.get("preserve_source_rows") or "") == "true"
+    )
+
+
+def _evidence_boundary_source_summary(source: Mapping[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "path": str(source.get("path") or "").replace("\\", "/"),
+        "source_type": str(source.get("source_type") or "").strip(),
+    }
+    for key in ("row_count", "line_count", "table", "selected_path"):
+        value = source.get(key)
+        if value is not None and value != "":
+            summary[key] = value
+    fields = source.get("fields")
+    if isinstance(fields, list):
+        summary["fields"] = [str(field) for field in fields[:16]]
+        if len(fields) > 16:
+            summary["field_count"] = len(fields)
+    return {
+        key: value
+        for key, value in summary.items()
+        if value != "" and value != []
+    }
+
+
+def _active_plan_boundary_summary(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    analysis_plan = state.get("analysis_plan")
+    if not isinstance(analysis_plan, Mapping):
+        return None
+    output_spec = analysis_plan.get("output_spec")
+    execution_spec = analysis_plan.get("execution_spec")
+    summary: dict[str, Any] = {}
+    if isinstance(output_spec, Mapping):
+        summary["row_policy"] = str(output_spec.get("row_policy") or "")
+        summary["row_grain"] = str(output_spec.get("row_grain") or "")
+        summary["columns"] = [
+            {
+                "name": str(column.get("name") or ""),
+                "source_fields": [
+                    str(field)
+                    for field in column.get("source_fields") or []
+                    if str(field).strip()
+                ],
+            }
+            for column in output_spec.get("columns") or []
+            if isinstance(column, Mapping)
+        ][:12]
+        transformations = [
+            str(item.get("operation") or "")
+            for item in output_spec.get("transformations") or []
+            if isinstance(item, Mapping) and str(item.get("operation") or "").strip()
+        ]
+        summary["transformations"] = transformations
+    if isinstance(execution_spec, Mapping):
+        summary["execution_sources"] = sorted(_source_paths_from_execution_spec(execution_spec))
+        summary["execution_operations"] = [
+            str(item.get("operation") or "")
+            for item in execution_spec.get("operations") or []
+            if isinstance(item, Mapping) and str(item.get("operation") or "").strip()
+        ]
+    return {
+        key: value
+        for key, value in summary.items()
+        if value != "" and value != []
+    }
+
+
+def _decision_evidence_boundary_payload(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> dict[str, Any]:
+    original_request = str(state.get("original_request") or "")
+    question_structure = state.get("question_structure")
+    user_authorized_operations = _question_structure_user_authorized_operations(
+        question_structure,
+        original_request,
+    )
+    forbidden_operations = sorted(_TRANSFORM_OPERATIONS - user_authorized_operations)
+    source_summaries = [
+        _evidence_boundary_source_summary(source)
+        for source in _state_observed_sources(state)
+    ]
+    source_summaries = [
+        source for source in source_summaries if source.get("path")
+    ][:8]
+    preserve_hint = _question_structure_preserve_hint(question_structure)
+
+    return {
+        "schema_version": "1.0",
+        "purpose": (
+            "Runtime authorization and evidence boundary. Use it for every "
+            "decision, including discovery, analyze_plan, revisions, and execution."
+        ),
+        "discovery_ready": discovery.context_ready,
+        "observed_sources": source_summaries,
+        "active_plan": _active_plan_boundary_summary(state),
+        "user_authorized_operations": sorted(user_authorized_operations),
+        "forbidden_without_user_or_knowledge_authorization": forbidden_operations,
+        "scope_constraints_are_evidence_not_authorization": (
+            _question_structure_scope_constraints(question_structure)
+        ),
+        "preserve_source_rows_hint": preserve_hint,
+        "rules": [
+            (
+                "Context/source observations can support evidence.context_sources "
+                "but cannot authorize filter, aggregate, derive, sort, limit, "
+                "deduplicate, or reshape."
+            ),
+            (
+                "A transformation needs an exact user quote detected as an "
+                "operation, or an observed knowledge quote/KnowledgeFact.fact_id."
+            ),
+            (
+                "When source grain or scope is ambiguous, record the conflict in "
+                "evidence or unresolved items; do not invent a transformation."
+            ),
+        ],
+        "knowledge_available": discovery.knowledge_available,
+    }
+
+
+def _decision_evidence_boundary_text(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> str:
+    if not (
+        state.get("original_request")
+        or state.get("question_structure")
+        or _state_observed_sources(state)
+    ):
+        return ""
+    payload = _decision_evidence_boundary_payload(state, discovery)
+    return (
+        "## Decision Evidence Boundary\n"
+        "<evidence_boundary>\n"
+        f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n"
+        "</evidence_boundary>\n"
+        "Run the next decision under this authorization/evidence boundary. "
+        "Do not infer or execute transformations outside it."
+    )
+
+
+def _inject_decision_evidence_boundary(
+    request: ModelRequest[None],
+    discovery: _DiscoveryState,
+) -> ModelRequest[None]:
+    boundary_text = _decision_evidence_boundary_text(request.state, discovery)
+    if not boundary_text:
+        return request
+    current_system = request.system_message
+    current_text = _message_text(current_system) if current_system is not None else ""
+    messages = list(request.messages)
+    messages_have_boundary = any(
+        isinstance(message, SystemMessage)
+        and "</evidence_boundary>" in _message_text(message)
+        for message in messages
+    )
+    if not messages_have_boundary:
+        messages = [SystemMessage(content=boundary_text), *messages]
+    if "</evidence_boundary>" in current_text:
+        return request.override(messages=messages)
+    return request.override(
+        messages=messages,
+        system_message=SystemMessage(
+            content=f"{current_text.rstrip()}\n\n{boundary_text}".strip()
+        )
+    )
 
 
 def _is_generic_scope_quote(quote: str) -> bool:
@@ -2268,6 +2573,10 @@ def _validate_plan_contract(
             request,
             "every intent requirement quote must occur verbatim in original_request.",
         )
+    effective_requirement_types_by_quote = _effective_requirement_types_by_quote(
+        requirement_types_by_quote,
+        request.state,
+    )
     evidence = arguments.get("evidence") or {}
     if not isinstance(evidence, Mapping):
         return _plan_error(request, "evidence must be a JSON object.")
@@ -2415,7 +2724,7 @@ def _validate_plan_contract(
         )
     required_types = {
         requirement_type
-        for types in requirement_types_by_quote.values()
+        for types in effective_requirement_types_by_quote.values()
         for requirement_type in types
     }
     missing_operation_requirements: list[str] = []
@@ -2903,8 +3212,18 @@ class CustomSystemPromptMiddleware(AgentMiddleware[Any, None, Any]):
     ) -> ModelResponse[Any]:
         if not self.prompt:
             return handler(request)
+        prompt = self.prompt
+        try:
+            boundary_text = _decision_evidence_boundary_text(
+                request.state,
+                _discovery_state(request.messages, request.state),
+            )
+        except Exception:
+            boundary_text = ""
+        if boundary_text and "</evidence_boundary>" not in prompt:
+            prompt = f"{prompt}\n\n{boundary_text}"
         return handler(
-            request.override(system_message=SystemMessage(content=self.prompt))
+            request.override(system_message=SystemMessage(content=prompt.strip()))
         )
 
 
@@ -2944,6 +3263,7 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                 item for item in request.tools if tool_name(item) == "write_todos"
             ]
             request = request.override(tools=todo_tools, tool_choice="write_todos")
+        request = _inject_decision_evidence_boundary(request, discovery)
         response = handler(request)
         return _retry_invalid_tool_call(request, handler, response)
 
