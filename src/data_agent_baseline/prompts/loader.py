@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from importlib.resources import files
 from pathlib import Path
 
+from data_agent_baseline.agents.semantic_layer import build_semantic_context
 from data_agent_baseline.benchmark.schema import PublicTask
 
 _PROMPT_PACKAGE = "data_agent_baseline.prompts"
@@ -86,15 +88,93 @@ def _context_inventory(context_dir: Path) -> str:
     return "\n".join(entries) if entries else "- <no context files>"
 
 
-def _knowledge_context(context_dir: Path) -> str:
+def read_knowledge_content(context_dir: Path) -> str:
     knowledge_path = context_dir / "knowledge.md"
     if not knowledge_path.is_file():
-        return "<missing>"
+        return ""
     try:
-        content = knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
+        return knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError as exc:
         return f"<unreadable: {exc}>"
-    return content or "<empty>"
+
+
+def _knowledge_schema_context(context_dir: Path) -> str:
+    raw_content = read_knowledge_content(context_dir)
+    if not raw_content:
+        return json.dumps(
+            {
+                "availability": "missing",
+                "knowledge_status_for_plan": "unavailable",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    if raw_content.startswith("<unreadable:"):
+        return json.dumps(
+            {
+                "availability": "unreadable",
+                "knowledge_status_for_plan": "unavailable",
+                "error": raw_content,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    semantic = build_semantic_context(context_dir)
+    bindings_by_logical: dict[str, list[dict[str, object]]] = {}
+    for binding in semantic.bindings:
+        bindings_by_logical.setdefault(binding.logical_name, []).append(
+            {
+                "source_path": binding.source_path,
+                "source_type": binding.source_type,
+                "table_or_path": binding.table_or_path,
+                "confidence": binding.confidence,
+                "fields": list(binding.fields[:80]),
+                **({"field_count": len(binding.fields)} if len(binding.fields) > 80 else {}),
+            }
+        )
+
+    tables: dict[str, dict[str, object]] = {}
+    global_facts: list[dict[str, object]] = []
+    for fact in semantic.facts:
+        payload = {
+            "fact_id": fact.fact_id,
+            "kind": fact.kind,
+            "logical_field": fact.logical_field,
+            "operation": fact.operation,
+            "binding_status": fact.status,
+            "quote": fact.quote,
+        }
+        if fact.logical_table:
+            table_payload = tables.setdefault(
+                fact.logical_table,
+                {
+                    "logical_table": fact.logical_table,
+                    "bindings": bindings_by_logical.get(fact.logical_table, []),
+                    "facts": [],
+                },
+            )
+            facts = table_payload.setdefault("facts", [])
+            if isinstance(facts, list):
+                facts.append(payload)
+        else:
+            global_facts.append(payload)
+
+    schema = {
+        "availability": "available",
+        "knowledge_status_for_plan": "authoritative",
+        "source_path": "/context/knowledge.md",
+        "usage_contract": [
+            "For analyze_plan.evidence.knowledge_status, use knowledge_status_for_plan exactly.",
+            "Use fact_id plus quote when a knowledge fact authorizes an output field, calculation, filter, ordering, or unit.",
+            "Treat binding_status values such as binding_unresolved/schema_conflict/narrative_only as local source-binding states, not as proof that all knowledge is invalid.",
+            "When a target fact has binding_status narrative_only, bind execution_spec.source_bindings to the observed doc source and use the narrative extraction tool.",
+        ],
+        "tables": list(tables.values()),
+        "global_facts": global_facts,
+        "issues": list(semantic.issues),
+    }
+    return json.dumps(schema, ensure_ascii=False, indent=2)
 
 
 def build_task_prompt(
@@ -102,12 +182,12 @@ def build_task_prompt(
     *,
     question_structure: str = "<not_run>",
 ) -> str:
-    """向任务模板注入用户问题、固定 knowledge 上下文和完整文件清单。"""
+    """向任务模板注入用户问题、结构化 knowledge schema 和完整文件清单。"""
 
     template = load_prompt("task.md")
     return template.format(
         question=task.question,
         question_structure=question_structure,
         context_inventory=_context_inventory(task.context_dir),
-        knowledge_context=_knowledge_context(task.context_dir),
+        knowledge_schema=_knowledge_schema_context(task.context_dir),
     )

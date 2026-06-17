@@ -1,6 +1,3 @@
-dataset:
-  root_path: data/input
-
 agent:
   max_retries: 5
   max_steps: 24
@@ -11,7 +8,5 @@ agent:
   question_structure_enabled: true
 
 run:
-  output_dir: artifacts/run
-  run_id: 
   max_workers: 1
   task_timeout_seconds: 600

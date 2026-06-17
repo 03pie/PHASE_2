@@ -31,7 +31,7 @@ def _source_type_for_path(path: str) -> str:
         return "csv"
     if suffix == ".json":
         return "json"
-    if suffix in {".log", ".md", ".txt"}:
+    if suffix in {".log", ".md", ".pdf", ".txt"}:
         return "doc"
     return "text"
 
@@ -75,6 +75,61 @@ def _grep_observed_sources(
         for file_path, matched_lines in by_file.items()
         if matched_lines
     ]
+
+
+def _read_doc_slices_for_matches(
+    matches: list[dict[str, Any]],
+    *,
+    context_lines: int,
+    max_slices: int = 10,
+) -> list[dict[str, Any]]:
+    slices: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    lead_lines = max(12, context_lines)
+    window_lines = max(40, min(200, lead_lines * 2 + 40))
+    for match in matches:
+        if match.get("is_separator"):
+            continue
+        file_path = str(match.get("file") or "").replace("\\", "/")
+        line_number = match.get("line_number")
+        if not file_path or not isinstance(line_number, int):
+            continue
+        start_line = max(0, line_number - 1 - lead_lines)
+        key = (file_path, start_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        slices.append(
+            {
+                "path": file_path,
+                "anchor_line": line_number,
+                "start_line": start_line,
+                "max_lines": window_lines,
+            }
+        )
+        if len(slices) >= max_slices:
+            break
+    return slices
+
+
+def _paging_payload(
+    *,
+    total_items: int,
+    returned_items: int,
+    offset: int,
+    paging_unit: str,
+) -> dict[str, Any]:
+    next_offset = offset + returned_items
+    if next_offset >= total_items:
+        next_offset = None
+    return {
+        "paging_unit": paging_unit,
+        "total_result_items": total_items,
+        "offset": offset,
+        "next_offset": next_offset,
+        "has_more": next_offset is not None,
+    }
+
 
 def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """Create an EVE-style grep_file search tool."""
@@ -165,9 +220,19 @@ def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                 "numFiles": len(limited),
                 "files_searched": len(files),
                 "search_mode": search_mode,
+                "total_matches": sum(file_counts.values()),
+                **_paging_payload(
+                    total_items=len(filenames),
+                    returned_items=len(limited),
+                    offset=offset,
+                    paging_unit="files",
+                ),
             }
         else:
             limited, applied_limit = apply_head_limit(raw_matches, max_matches, offset)
+            total_matches = sum(
+                1 for match in raw_matches if not match.get("is_separator")
+            )
             payload = {
                 "mode": "content",
                 "content": "\n".join(
@@ -180,7 +245,20 @@ def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                 ),
                 "files_searched": len(files),
                 "search_mode": search_mode,
+                "total_matches": total_matches,
+                **_paging_payload(
+                    total_items=len(raw_matches),
+                    returned_items=len(limited),
+                    offset=offset,
+                    paging_unit="matched_lines",
+                ),
             }
+        read_doc_slices = _read_doc_slices_for_matches(
+            raw_matches,
+            context_lines=context_lines,
+        )
+        if read_doc_slices:
+            payload["read_doc_slices"] = read_doc_slices
         if applied_limit is not None:
             payload["appliedLimit"] = applied_limit
         if offset:

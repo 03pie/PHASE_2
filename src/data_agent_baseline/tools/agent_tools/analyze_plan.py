@@ -89,6 +89,7 @@ class TransformationSpec(TypedDict):
     operation: TransformationOperation
     description: str
     authorization: TransformationAuthorization
+    authorization_fact_ids: NotRequired[list[str]]
 
 
 class SortKey(TypedDict):
@@ -100,7 +101,7 @@ class OutputSpec(TypedDict):
     columns: list[OutputColumn]
     row_grain: str
     row_policy: Literal["preserve", "transform"]
-    transformations: list[TransformationSpec]
+    transformations: NotRequired[list[TransformationSpec]]
     ordering: Literal["source", "specified", "unspecified"]
     sort_keys: list[SortKey]
     null_policy: Literal["preserve", "drop", "fill"]
@@ -189,6 +190,13 @@ def _clean_texts(items: list[str]) -> list[str]:
     return [text for item in items if (text := _clean_text(item))]
 
 
+def _normalize_rule_type(value: object) -> str:
+    rule_type = _clean_text(value)
+    if rule_type == "field":
+        return "semantic"
+    return rule_type
+
+
 @tool("analyze_plan", description=load_tool_prompt("analyze_plan"))
 def analyze_plan_tool(
     intent: IntentSpec,
@@ -259,7 +267,7 @@ def analyze_plan_tool(
         )
 
     transformations = []
-    for item in output_spec["transformations"]:
+    for item in output_spec.get("transformations", []) or []:
         if not isinstance(item, Mapping):
             return _error(
                 "Each transformation must be an object.",
@@ -271,6 +279,8 @@ def analyze_plan_tool(
                 "Each transformation authorization must be an object.",
                 tool_call_id,
             )
+        raw_fact_ids = item.get("authorization_fact_ids", [])
+        fact_ids = _clean_texts(raw_fact_ids if isinstance(raw_fact_ids, list) else [])
         transformations.append(
             {
                 "operation": item.get("operation"),
@@ -279,14 +289,26 @@ def analyze_plan_tool(
                     "source": authorization.get("source"),
                     "quote": _clean_text(authorization.get("quote")),
                 },
+                **(
+                    {"authorization_fact_ids": fact_ids}
+                    if fact_ids
+                    else {}
+                ),
             }
         )
     if any(
-        not item["description"] or not item["authorization"]["quote"]
+        not item["description"]
+        or not (
+            item["authorization"]["quote"]
+            or item.get("authorization_fact_ids")
+        )
         for item in transformations
     ):
         return _error(
-            "Each transformation requires a description and authorization quote.",
+            (
+                "Each transformation requires a description and an "
+                "authorization quote or KnowledgeFact.fact_id."
+            ),
             tool_call_id,
         )
 
@@ -307,7 +329,7 @@ def analyze_plan_tool(
 
     knowledge_rules = [
         {
-            "rule_type": item["rule_type"],
+            "rule_type": _normalize_rule_type(item["rule_type"]),
             "quote": _clean_text(item["quote"]),
             "source_path": _clean_text(item["source_path"]).replace("\\", "/"),
             **(

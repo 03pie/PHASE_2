@@ -16,6 +16,23 @@ from data_agent_baseline.tools.observed_sources import (
 )
 
 
+def _state_scope_terms(state: dict[str, Any]) -> list[str]:
+    question_structure = state.get("question_structure")
+    if not isinstance(question_structure, dict):
+        return []
+    terms: list[str] = []
+    for item in question_structure.get("target_constraints") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("constraint_type") or "") not in {"scope", "entity"}:
+            continue
+        for key in ("value", "quote"):
+            value = str(item.get(key) or "").strip()
+            if value and value not in terms:
+                terms.append(value)
+    return terms
+
+
 def _semantic_observed_sources(
     semantic_matches: dict[str, Any],
     *,
@@ -69,6 +86,7 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
         field: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         state: Annotated[dict[str, Any], InjectedState],
+        scope: str | None = None,
         max_matches: int = 25,
     ) -> Any:
         """Run the query_schema tool."""
@@ -94,16 +112,21 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
             field_text,
             max_matches=max_matches,
         )
+        scope_terms = [scope.strip()] if isinstance(scope, str) and scope.strip() else []
+        if not scope_terms:
+            scope_terms = _state_scope_terms(state)
         semantic_matches = query_semantic_context(
             context_root,
             field_text,
             max_matches=max_matches,
+            scope=scope_terms,
         )
         message = success(
             name="query_schema",
             tool_call_id=tool_call_id,
             payload={
                 "field": field_text,
+                "scope": scope_terms,
                 "matches": matches,
                 "match_count": len(matches),
                 "source_candidates": semantic_matches["source_candidates"],

@@ -28,6 +28,71 @@ _NARRATIVE_QUERY_HINT_PATTERN = re.compile(
     r"年|月|日|周|回报|收益|return|rate|rr",
     re.IGNORECASE,
 )
+_MAX_DOC_LINES_PER_READ = 240
+
+
+def _read_strategy_payload(
+    *,
+    path: str,
+    total_lines: int,
+    returned_lines: int,
+    start_line: int,
+    effective_max_lines: int,
+    next_start_line: int | None,
+    previous_start_line: int | None,
+) -> dict[str, Any]:
+    large_file = total_lines > effective_max_lines
+    actions: list[dict[str, Any]] = []
+    if large_file:
+        actions.append(
+            {
+                "tool": "grep_file",
+                "reason": "locate relevant lines before reading more document slices",
+                "args": {
+                    "path": path,
+                    "output_mode": "content",
+                    "context_lines": 20,
+                },
+            }
+        )
+    if next_start_line is not None:
+        actions.append(
+            {
+                "tool": "read_doc",
+                "reason": "read the next adjacent slice",
+                "args": {
+                    "path": path,
+                    "start_line": next_start_line,
+                    "max_lines": effective_max_lines,
+                },
+            }
+        )
+    if previous_start_line is not None:
+        actions.append(
+            {
+                "tool": "read_doc",
+                "reason": "read the previous adjacent slice",
+                "args": {
+                    "path": path,
+                    "start_line": previous_start_line,
+                    "max_lines": effective_max_lines,
+                },
+            }
+        )
+    return {
+        "large_file": large_file,
+        "read_strategy": (
+            "grep_file_to_line_anchors_then_read_doc_slices"
+            if large_file
+            else "single_slice_or_adjacent_paging"
+        ),
+        "recommended_next_actions": actions,
+        "slice_window": {
+            "start_line": start_line,
+            "returned_lines": returned_lines,
+            "max_lines": effective_max_lines,
+        },
+    }
 
 
 def _collect_semantic_terms(value: Any, terms: list[str]) -> None:
@@ -145,12 +210,13 @@ def create_read_doc_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
 
         try:
             assert resolved is not None
+            effective_max_lines = min(max_lines, _MAX_DOC_LINES_PER_READ)
             if resolved.suffix.lower() == ".pdf":
                 text = extract_pdf_text(resolved)
             else:
                 text = resolved.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
-            slice_lines = lines[start_line : start_line + max_lines]
+            slice_lines = lines[start_line : start_line + effective_max_lines]
             numbered = [
                 f"{line_number:>6}->{line}"
                 for line_number, line in enumerate(slice_lines, start=start_line + 1)
@@ -160,16 +226,44 @@ def create_read_doc_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                 for index, line in enumerate(lines)
                 if line.startswith("#")
             ][:30]
+            next_start_line = (
+                start_line + len(slice_lines)
+                if start_line + len(slice_lines) < len(lines)
+                else None
+            )
+            previous_start_line = (
+                max(0, start_line - effective_max_lines)
+                if start_line > 0
+                else None
+            )
             payload = {
                 "path": virtual_path(resolved, context_root),
                 "content": "\n".join(numbered),
                 "total_lines": len(lines),
                 "returned_lines": len(slice_lines),
                 "start_line": start_line + 1,
+                "start_line_arg": start_line,
+                "requested_max_lines": max_lines,
+                "max_lines": effective_max_lines,
+                "end_line": start_line + len(slice_lines),
+                "next_start_line": next_start_line,
+                "previous_start_line": previous_start_line,
                 "has_more": start_line + len(slice_lines) < len(lines),
                 "truncated": start_line > 0
                 or start_line + len(slice_lines) < len(lines),
                 "headings": headings,
+                "line_numbering": (
+                    "content prefixes are 1-based; start_line arguments are 0-based"
+                ),
+                **_read_strategy_payload(
+                    path=virtual_path(resolved, context_root),
+                    total_lines=len(lines),
+                    returned_lines=len(slice_lines),
+                    start_line=start_line,
+                    effective_max_lines=effective_max_lines,
+                    next_start_line=next_start_line,
+                    previous_start_line=previous_start_line,
+                ),
             }
             semantic_windows = _semantic_windows_for_doc(
                 context_root=context_root,

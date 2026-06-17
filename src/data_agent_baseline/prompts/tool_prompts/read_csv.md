@@ -1,1 +1,1 @@
-Read a CSV preview with columns, dtypes, paging, and null-safe rows.
+Read a CSV preview with columns, dtypes, paging, and null-safe rows. A single read is capped to a preview page. For large files, inspect a page, then use next_start_row/previous_start_row for adjacent pages; use execute_python for full-table computation after the relevant source is identified.

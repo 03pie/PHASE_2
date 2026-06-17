@@ -46,6 +46,7 @@ from data_agent_baseline.prompts.loader import (
     build_task_prompt,
     load_main_agent_prompt,
     load_subagent_prompt,
+    read_knowledge_content,
 )
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
 from data_agent_baseline.tools.agent_tools.execute_sql import create_execute_sql_tool
@@ -373,6 +374,7 @@ class DeepAgent:
                         "original_request": task.question,
                         "question_structure": question_structure,
                         "question_structure_enforced": question_structure_enforced,
+                        "knowledge_content": read_knowledge_content(task.context_dir),
                         "messages": [
                             HumanMessage(
                                 content=build_task_prompt(

@@ -92,6 +92,11 @@ def _semantic_tokens(value: str | None) -> set[str]:
         for token in re.findall(r"[0-9a-z_]{2,}", text)
         if token
     }
+    for token in list(tokens):
+        if len(token) > 3 and token.endswith("ies"):
+            tokens.add(f"{token[:-3]}y")
+        elif len(token) > 3 and token.endswith("s"):
+            tokens.add(token[:-1])
     for sequence in re.findall(r"[\u3400-\u9fff]+", text):
         if len(sequence) < 2:
             continue
@@ -104,6 +109,41 @@ def _semantic_tokens(value: str | None) -> set[str]:
                 for index in range(0, len(sequence) - size + 1)
             )
     return tokens
+
+
+def _semantic_concepts(value: str | None) -> set[str]:
+    concepts: set[str] = set()
+    for token in _semantic_tokens(value):
+        if re.search(r"[\u3400-\u9fff]", token):
+            continue
+        normalized = token.casefold()
+        if len(normalized) > 3 and normalized.endswith("ies"):
+            normalized = f"{normalized[:-3]}y"
+        elif len(normalized) > 3 and normalized.endswith("s"):
+            normalized = normalized[:-1]
+        if normalized and normalized not in {"and", "data", "record", "records", "value", "values", "other"}:
+            concepts.add(normalized)
+    return concepts
+
+
+def _fact_related_to_query(
+    fact: KnowledgeFact,
+    *,
+    query_norm: str,
+    query_concepts: set[str],
+) -> bool:
+    if not query_norm:
+        return True
+    values = [
+        fact.logical_table or "",
+        fact.logical_field or "",
+        fact.quote,
+    ]
+    if any(query_norm in _normalize_name(value) for value in values):
+        return True
+    fact_terms = set().union(*(_semantic_concepts(value) for value in values))
+    overlap = fact_terms & query_concepts
+    return len(overlap) >= 2
 
 
 def _split_markdown_row(line: str) -> list[str] | None:
@@ -639,9 +679,17 @@ def query_semantic_context(
     query: str,
     *,
     max_matches: int = 25,
+    scope: str | Iterable[str] | None = None,
 ) -> dict[str, Any]:
     semantic = build_semantic_context(context_root)
     query_norm = _normalize_name(query)
+    query_concepts = _semantic_concepts(query)
+    scope_values = (
+        [scope]
+        if isinstance(scope, str)
+        else [str(item or "") for item in scope or []]
+    )
+    scope_norms = [_normalize_name(item) for item in scope_values if _normalize_name(item)]
     candidate_terms: dict[tuple[str, str], list[str]] = {}
 
     def add_candidate_terms(binding: PhysicalBinding, terms: Iterable[str]) -> None:
@@ -661,17 +709,36 @@ def query_semantic_context(
         (binding.source_path, binding.table_or_path)
         for binding in candidates
     }
-    for fact in semantic.facts:
-        fact_field = _normalize_name(fact.logical_field)
+
+    def fact_in_scope(fact: KnowledgeFact) -> bool:
+        if not scope_norms:
+            return False
+        fact_values = [
+            fact.logical_table or "",
+            fact.logical_field or "",
+            fact.quote,
+        ]
+        return any(
+            scope_norm in _normalize_name(value)
+            or (_normalize_name(value) and _normalize_name(value) in scope_norm)
+            for scope_norm in scope_norms
+            for value in fact_values
+        )
+
+    related_facts = [
+        fact
+        for fact in semantic.facts
+        if fact_in_scope(fact)
+        or _fact_related_to_query(
+            fact,
+            query_norm=query_norm,
+            query_concepts=query_concepts,
+        )
+    ]
+
+    for fact in related_facts:
         fact_table = _normalize_name(fact.logical_table)
-        fact_quote = _normalize_name(fact.quote)
         if not query_norm:
-            continue
-        if not (
-            (fact_field and (query_norm in fact_field or fact_field in query_norm))
-            or (fact_table and (query_norm in fact_table or fact_table in query_norm))
-            or (fact_quote and query_norm in fact_quote)
-        ):
             continue
         if not fact_table:
             continue
@@ -687,21 +754,36 @@ def query_semantic_context(
     candidates = candidates[:max_matches]
 
     logical_bindings: dict[str, list[dict[str, Any]]] = {}
-    for fact in semantic.facts:
+    logical_binding_keys: dict[str, set[tuple[str, str]]] = {}
+    for fact in related_facts:
         logical = fact.logical_table or fact.logical_field
         if not logical:
             continue
         logical_norm = _normalize_name(logical)
-        matches = [
-            binding
-            for binding in semantic.bindings
-            if _normalize_name(binding.logical_name) == logical_norm
-            or any(_normalize_name(field) == _normalize_name(fact.logical_field) for field in binding.fields)
-        ][:5]
+        if fact.logical_table:
+            matches = [
+                binding
+                for binding in semantic.bindings
+                if _normalize_name(binding.logical_name) == logical_norm
+            ]
+        else:
+            field_norm = _normalize_name(fact.logical_field)
+            matches = [
+                binding
+                for binding in semantic.bindings
+                if field_norm
+                and any(_normalize_name(field) == field_norm for field in binding.fields)
+            ]
+        matches = matches[:5]
         if not matches:
             continue
         logical_bindings.setdefault(logical, [])
+        seen = logical_binding_keys.setdefault(logical, set())
         for binding in matches:
+            key = (binding.source_path, binding.table_or_path)
+            if key in seen:
+                continue
+            seen.add(key)
             logical_bindings[logical].append(
                 _binding_payload(
                     binding,
@@ -710,24 +792,12 @@ def query_semantic_context(
                 )
             )
 
-    def fact_related(fact: KnowledgeFact) -> bool:
-        if not query_norm:
-            return True
-        values = [
-            fact.logical_table or "",
-            fact.logical_field or "",
-            fact.quote,
-        ]
-        return any(query_norm in _normalize_name(value) for value in values)
-
     binding_issues = [
         issue
         for issue in semantic.issues
         if query_norm and query_norm in _normalize_name(issue)
     ]
-    for fact in semantic.facts:
-        if not fact_related(fact):
-            continue
+    for fact in related_facts:
         if fact.status in {"binding_unresolved", "schema_conflict", "narrative_only"}:
             binding_issues.append(
                 (
@@ -747,5 +817,8 @@ def query_semantic_context(
         ],
         "logical_bindings": logical_bindings,
         "binding_issues": list(dict.fromkeys(binding_issues))[:max_matches],
-        "knowledge_facts": [asdict(fact) for fact in semantic.facts[:max_matches]],
+        "knowledge_facts": [
+            asdict(fact)
+            for fact in (related_facts or list(semantic.facts))[:max_matches]
+        ],
     }

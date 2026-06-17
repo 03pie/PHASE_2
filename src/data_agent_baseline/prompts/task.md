@@ -15,13 +15,13 @@
 
 清单是完整递归视图。除非清单本身存在具体歧义，不要列目录或重新发现文件。
 
-## 注入的 knowledge
+## 注入的 knowledge schema
 
-<context_knowledge>
-{knowledge_context}
-</context_knowledge>
+<knowledge_schema>
+{knowledge_schema}
+</knowledge_schema>
 
-如果 knowledge 中某条事实有效且覆盖当前概念，将该 rule/fact 作为术语、单位、计算、筛选和输出规则依据；如果只有物理源绑定缺失，不要把整篇 knowledge 判 invalid。不可用、不足或冲突的部分用 `knowledge_issue` 与 `cross_validated_inference` 说明证据。
+`knowledge_schema` 是 `/context/knowledge.md` 的结构化视图。`analyze_plan.evidence.knowledge_status` 必须使用 `knowledge_status_for_plan` 的取值；不要把 `availability` 或 fact 的 `binding_status` 填到 `knowledge_status`。优先使用其中的 `fact_id`、`logical_table`、`logical_field`、`binding_status`、`bindings` 和原始 `quote` 建立执行契约；不要从未结构化全文自由扩展语义。如果只有物理源绑定缺失，不要把整篇 knowledge 判 invalid。不可用、不足或冲突的部分用 `knowledge_issue` 与 `cross_validated_inference` 说明证据。
 
 ## 本任务执行约束
 
@@ -29,7 +29,7 @@
 - `output_spec.columns` 只写最终答案列；排序、筛选、join、selector 和上下文字段放入 `execution_spec.supporting_fields`，不要作为最终输出列提交。
 - `evidence.context_sources` 和 `execution_spec.sources` 只能引用已经成功读取的 observed source；SQLite 表级来源可引用为 `/context/db.sqlite::table`。
 - 如果 knowledge 的逻辑表不在 SQLite 中，先用 `query_schema` 查看 `source_candidates`、`logical_bindings` 和 `binding_issues`，并检查同 basename 的 CSV/JSON/doc 来源；不要直接声明 knowledge invalid，也不要退到语义相邻但字段不同的来源。
-- 如果计划中的 `execution_spec.source_bindings` 将最终 `source_field` 绑定到 doc/Markdown/PDF 叙述来源，执行阶段必须调用 `extract_narrative_records(source_path, source_field)` 从该绑定来源生成答案候选；不要用语义相邻 JSON/CSV 字段替代已绑定的叙述来源。
+- 如果计划中的 `execution_spec.source_bindings` 将最终 `source_field` 绑定到 doc/Markdown/PDF 叙述来源，先用 `grep_file` 定位候选行，再用 `read_doc(start_line, max_lines)` 分批读取小切片；执行阶段必须调用 `extract_narrative_records(source_path, source_field, start_line, end_line)` 从确认后的绑定切片生成答案候选；不要用语义相邻 JSON/CSV 字段替代已绑定的叙述来源。
 - 若 `question_structure.conditions.calculations` 为空且没有 `intent_operators` 授权 `aggregate/derive`，不要把地域、范围或“记录”解释为聚合/派生请求。
 - `cross_validated_inference` 和 `intent.unresolved` 只能说明已观察事实、口径不匹配或待确认事项；不要把未授权操作写成“如果没有 X 就计算/筛选/排序/限制/重塑 Y”。可执行操作必须在 `output_spec.transformations` 或 `execution_spec.operations` 中声明并引用用户、knowledge 或 KnowledgeFact 授权。
 - 若无显式转换授权，保留源行、源顺序和空值；只投影用户要求返回的目标字段。

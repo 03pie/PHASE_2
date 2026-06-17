@@ -38,6 +38,7 @@ _EN_TIME_RE = re.compile(
     re.IGNORECASE,
 )
 _NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+_VALUE_NUMBER_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 _RECORD_RE = re.compile(
     r"(?:\u6863\u6848|\u6218\u7565\u5355\u5143|archive)\s*\d+",
     re.IGNORECASE,
@@ -73,6 +74,20 @@ _RETURN_TERMS = (
     "return rate",
     "return",
     "rate",
+)
+_FINAL_VALUE_RE = re.compile(
+    (
+        r"(?:final|audited|official|confirmed|reconciled)"
+        r"[^0-9+-]{0,100}"
+        r"(?P<value>[-+]?\d[\d,]*(?:\.\d+)?)"
+    ),
+    re.IGNORECASE,
+)
+_PROVISIONAL_VALUE_RE = re.compile(
+    r"(?:initial|initially|preliminary|estimated|estimate|logged|"
+    r"tentative|provisional|early|earlier|\u521d\u6b65|\u6682\u4f30|"
+    r"\u539f\u5148|\u65e9\u671f)",
+    re.IGNORECASE,
 )
 
 
@@ -226,6 +241,104 @@ def _extract_value(line: str, time_terms: list[str]) -> str:
     return numbers[-1] if numbers else ""
 
 
+def _coerce_number(value: str) -> float | str:
+    cleaned = value.replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return cleaned
+
+
+def _nearby_field_value(line: str, match: re.Match[str]) -> Any:
+    field_end = match.end()
+    start = max(0, match.start() - 180)
+    end = min(len(line), field_end + 220)
+    window = line[start:end]
+    relative_start = match.start() - start
+    relative_end = field_end - start
+
+    before_numbers = list(_VALUE_NUMBER_RE.finditer(window[:relative_start]))
+    if before_numbers:
+        last = before_numbers[-1]
+        bridge = window[last.end() : relative_start]
+        if relative_start - last.end() <= 90 and not re.search(r"[.;。；]", bridge):
+            return _coerce_number(last.group())
+
+    after_text = window[relative_end:]
+    final_match = _FINAL_VALUE_RE.search(after_text)
+    after_numbers = list(_VALUE_NUMBER_RE.finditer(after_text))
+    if after_numbers and after_numbers[0].start() <= 120:
+        if final_match is not None:
+            before_final = after_text[: final_match.start()]
+            if _PROVISIONAL_VALUE_RE.search(before_final):
+                return _coerce_number(final_match.group("value"))
+        return _coerce_number(after_numbers[0].group())
+
+    if final_match is not None:
+        return _coerce_number(final_match.group("value"))
+
+    return ""
+
+
+def _extract_field_rows(
+    lines: list[str],
+    *,
+    source_field: str,
+    start_line: int | None,
+    end_line: int | None,
+    max_records: int,
+) -> tuple[list[list[Any]], list[dict[str, Any]]]:
+    field = source_field.strip()
+    if not field:
+        return [], []
+    field_pattern = re.compile(re.escape(field), re.IGNORECASE)
+    start_index = max(0, start_line - 1) if start_line is not None else 0
+    end_index = min(len(lines), end_line) if end_line is not None else len(lines)
+    rows: list[list[Any]] = []
+    evidence: list[dict[str, Any]] = []
+    for index in range(start_index, end_index):
+        line = lines[index]
+        matches = list(field_pattern.finditer(line))
+        if not matches:
+            continue
+        context_line = " ".join(lines[index : min(len(lines), index + 3)])
+        line_values: list[Any] = []
+        for match in matches:
+            value = _nearby_field_value(line, match)
+            if value == "":
+                value = _nearby_field_value(context_line, match)
+            if value == "":
+                continue
+            rows.append([value])
+            line_values.append(value)
+            if len(rows) >= max_records:
+                break
+        if line_values:
+            evidence.append(
+                {
+                    "line_number": index + 1,
+                    "record_count": len(line_values),
+                    "value": line_values[-1],
+                    "content": context_line,
+                }
+            )
+        if len(rows) >= max_records:
+            break
+    return rows, evidence
+
+
+def _observed_field_name(lines: list[str], source_field: str) -> str:
+    field = source_field.strip()
+    if not field:
+        return source_field
+    pattern = re.compile(re.escape(field), re.IGNORECASE)
+    for line in lines:
+        match = pattern.search(line)
+        if match is not None:
+            return match.group(0)
+    return source_field
+
+
 def _extract_rows(
     lines: list[str],
     *,
@@ -234,7 +347,17 @@ def _extract_rows(
     start_line: int | None,
     end_line: int | None,
     max_records: int,
-) -> tuple[list[list[str]], list[dict[str, Any]]]:
+) -> tuple[list[list[Any]], list[dict[str, Any]]]:
+    field_rows, field_evidence = _extract_field_rows(
+        lines,
+        source_field=source_field,
+        start_line=start_line,
+        end_line=end_line,
+        max_records=max_records,
+    )
+    if field_rows:
+        return field_rows, field_evidence
+
     time_terms = _time_terms(source_field, knowledge_quote)
     if not time_terms:
         time_terms = _time_terms(knowledge_quote)
@@ -244,7 +367,7 @@ def _extract_rows(
         start_line=start_line,
         end_line=end_line,
     )
-    rows: list[list[str]] = []
+    rows: list[list[Any]] = []
     evidence: list[dict[str, Any]] = []
     for index in range(start_index, end_index):
         line = lines[index]
@@ -366,7 +489,8 @@ def create_extract_narrative_records_tool(
                 max_output_bytes=config.max_output_bytes,
             )
 
-        columns = [str(column or source_field)]
+        observed_field_name = _observed_field_name(lines, source_field)
+        columns = [str(column or observed_field_name or source_field)]
         audit = {
             "source_paths": [virtual_source],
             "operations": [

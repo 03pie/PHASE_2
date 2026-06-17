@@ -37,6 +37,7 @@ from data_agent_baseline.tools.agent_tools.inspect_sqlite import (
 )
 from data_agent_baseline.tools.agent_tools.grep_file import create_grep_file_tool
 from data_agent_baseline.tools.agent_tools.query_schema import create_query_schema_tool
+from data_agent_baseline.tools.agent_tools.read_csv import create_read_csv_tool
 from data_agent_baseline.tools.agent_tools.read_doc import create_read_doc_tool
 from data_agent_baseline.tools.agent_tools.read_json import create_read_json_tool
 from data_agent_baseline.tools.answer import validate_prepared_answer
@@ -44,7 +45,6 @@ from data_agent_baseline.tools.answer import validate_prepared_answer
 DISCOVERY_TOOLS = {
     "execute_sql",
     "execute_python",
-    "extract_narrative_records",
     "grep_file",
     "inspect_sqlite",
     "query_schema",
@@ -816,6 +816,59 @@ def test_grep_file_observes_matched_sources(tmp_path: Path) -> None:
     assert observed[0]["match_count"] == 1
     assert observed[0]["observed_by"] == "grep_file"
     assert "166.097944" in observed[0]["matched_lines"][0]["content"]
+
+
+def test_grep_file_searches_pdf_and_suggests_read_doc_slice(tmp_path: Path) -> None:
+    fitz = pytest.importorskip("fitz")
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context" / "doc"
+    context_dir.mkdir(parents=True)
+    pdf_path = context_dir / "report.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "\n".join(
+            [
+                "intro line",
+                "target metric appears here",
+                "following line",
+            ]
+        ),
+    )
+    document.save(pdf_path)
+    document.close()
+    tool = create_grep_file_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "grep_file",
+            "id": "grep-pdf",
+            "args": {
+                "pattern": "target metric",
+                "path": "/context/doc/report.pdf",
+                "output_mode": "content",
+                "state": {},
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    payload = json.loads(message.content)
+    assert message.status == "success"
+    assert payload["filenames"] == ["/context/doc/report.pdf"]
+    assert payload["read_doc_slices"][0]["path"] == "/context/doc/report.pdf"
+    assert payload["read_doc_slices"][0]["start_line"] == 0
+    assert payload["paging_unit"] == "matched_lines"
+    assert payload["total_matches"] == 1
+    assert payload["has_more"] is False
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["source_type"] == "doc"
+    assert "target metric" in observed[0]["matched_lines"][0]["content"]
 
 
 def test_query_schema_narrative_observation_can_drive_plan(tmp_path: Path) -> None:
@@ -1797,6 +1850,67 @@ def test_question_structure_does_not_block_quoted_user_calculation(
     assert plan_call["ok"] is True
 
 
+def test_filter_requirement_must_declare_filter_operation(
+    public_task: PublicTask,
+) -> None:
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question="Return records above 100.",
+        ),
+        assets=public_task.assets,
+    )
+    invalid_plan = _plan_args(
+        requirement_quote="above 100",
+        requirement_type="filter",
+        columns=[("value", ["value"])],
+    )
+    valid_plan = _plan_args(
+        requirement_quote="above 100",
+        requirement_type="filter",
+        columns=[("value", ["value"])],
+        transformations=[
+            {
+                "operation": "filter",
+                "description": "Keep rows above the requested threshold.",
+                "authorization": {"source": "user", "quote": "above 100"},
+            }
+        ],
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "filter-source",
+            ),
+            _tool_response("analyze_plan", invalid_plan, "missing-filter-plan"),
+            _tool_response("analyze_plan", valid_plan, "declared-filter-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "filter-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["done"]],
+                tool_call_id="filter-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "missing-filter-plan")
+    _, valid_call = _tool_call(result, "declared-filter-plan")
+    assert invalid_call["status"] == "error"
+    assert "does not declare them" in invalid_call["result"]["content"]
+    assert valid_call["ok"] is True
+
+
 def test_discovery_does_not_keyword_block_tool_arguments(
     public_task: PublicTask,
 ) -> None:
@@ -2233,6 +2347,128 @@ def test_knowledge_authorization_quote_is_canonicalized(
     assert transformation["authorization"]["quote"] == (
         "| `value` | Use the observed source value exactly. |"
     )
+
+
+def test_transformation_knowledge_fact_id_canonicalizes_authorization(
+    public_task: PublicTask,
+) -> None:
+    public_task.context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "### Example Table (`example_table`)",
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                "| `value` | Use the observed source value exactly. |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plan = _plan_args(
+        transformations=[
+            {
+                "operation": "filter",
+                "description": "Apply the knowledge fact.",
+                "authorization": {
+                    "source": "knowledge",
+                    "quote": "WHERE value > 100",
+                },
+                "authorization_fact_ids": ["kf_1"],
+            }
+        ],
+        knowledge_quote="| `value` | Use the observed source value exactly. |",
+        expected_row_count=1,
+    )
+    plan["evidence"]["knowledge_rules"][0]["fact_id"] = "kf_1"
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "fact-auth-source",
+            ),
+            _tool_response("analyze_plan", plan, "fact-auth-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "fact-auth-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["done"]],
+                tool_call_id="fact-auth-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "fact-auth-plan")
+    transformation = plan_call["result"]["update"]["analysis_plan"]["output_spec"][
+        "transformations"
+    ][0]
+    assert transformation["authorization"]["quote"] == (
+        "| `value` | Use the observed source value exactly. |"
+    )
+    assert transformation["authorization_fact_ids"] == ["kf_1"]
+
+
+def test_knowledge_field_rule_type_uses_fact_id_quote(
+    public_task: PublicTask,
+) -> None:
+    public_task.context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "### Example Table (`example_table`)",
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                "| `value` | Use the observed source value exactly. |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plan = _plan_args(
+        knowledge_quote="value: approximate wording",
+        expected_row_count=1,
+    )
+    plan["evidence"]["knowledge_rules"][0] = {
+        "fact_id": "kf_1",
+        "quote": "value: approximate wording",
+        "rule_type": "field",
+        "source_path": "/context/knowledge.md",
+    }
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "field-rule-source",
+            ),
+            _tool_response("analyze_plan", plan, "field-rule-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "field-rule-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["done"]],
+                tool_call_id="field-rule-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "field-rule-plan")
+    rule = plan_call["result"]["update"]["analysis_plan"]["evidence"][
+        "knowledge_rules"
+    ][0]
+    assert rule["rule_type"] == "semantic"
+    assert rule["quote"] == "| `value` | Use the observed source value exactly. |"
 
 
 def test_user_authorization_quote_is_canonicalized_from_expression(
@@ -5089,6 +5325,12 @@ def test_read_json_returns_paged_functional_view(tmp_path: Path) -> None:
     assert payload["selected_path"] == "records"
     assert payload["total_items"] == 3
     assert payload["returned_items"] == 2
+    assert payload["next_start_item"] == 2
+    assert payload["previous_start_item"] is None
+    assert payload["read_strategy"] == (
+        "preview_pages_then_execute_python_for_full_collection"
+    )
+    assert payload["recommended_next_actions"][0]["tool"] == "read_json"
     assert payload["has_more"] is True
     assert payload["items"] == [{"id": 1, "value": 10}, {"id": 2, "value": None}]
     assert payload["metadata"] == {"table": "demo"}
@@ -5129,8 +5371,15 @@ def test_read_doc_defaults_to_paged_window(tmp_path: Path) -> None:
     payload = json.loads(result.content)
     assert payload["returned_lines"] == 120
     assert payload["total_lines"] == 200
+    assert payload["start_line_arg"] == 0
+    assert payload["end_line"] == 120
+    assert payload["next_start_line"] == 120
+    assert payload["previous_start_line"] is None
     assert payload["has_more"] is True
     assert payload["truncated"] is True
+    assert payload["read_strategy"] == "grep_file_to_line_anchors_then_read_doc_slices"
+    assert payload["recommended_next_actions"][0]["tool"] == "grep_file"
+    assert payload["recommended_next_actions"][1]["args"]["start_line"] == 120
     assert "   120->line 120" in payload["content"]
     assert "   121->line 121" not in payload["content"]
     observed = getattr(command, "update", {})["observed_sources"]
@@ -5277,6 +5526,39 @@ def test_python_tool_schema_keeps_answer_rows_out_of_model_input(
 
     assert schema["required"] == ["code"]
     assert set(schema["properties"]) == {"code"}
+
+
+def test_read_csv_returns_paging_hints(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    context_dir.mkdir(parents=True)
+    context_dir.joinpath("records.csv").write_text(
+        "id,value\n1,a\n2,b\n3,c\n",
+        encoding="utf-8",
+    )
+    tool = create_read_csv_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "read_csv",
+            "id": "paged-csv",
+            "args": {"path": "/context/records.csv", "max_rows": 2, "state": {}},
+        }
+    )
+
+    message = _command_tool_message(command)
+    payload = json.loads(message.content)
+    assert message.status == "success"
+    assert payload["returned_rows"] == 2
+    assert payload["total_rows"] == 3
+    assert payload["next_start_row"] == 2
+    assert payload["previous_start_row"] is None
+    assert payload["read_strategy"] == "preview_pages_then_execute_python_for_full_table"
+    assert payload["recommended_next_actions"][0]["tool"] == "read_csv"
 
 
 def test_set_answer_accepts_object_rows(public_task: PublicTask) -> None:
@@ -5597,6 +5879,38 @@ def test_python_output_is_utf8(public_task: PublicTask) -> None:
     output = json.dumps(output_call["result"], ensure_ascii=False)
     assert "北京 上海 全国" in output
     assert "�" not in output
+
+
+def test_execute_python_reads_pdf_text_with_helper(public_task: PublicTask) -> None:
+    fitz = pytest.importorskip("fitz")
+    pdf_path = public_task.context_dir / "sample.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Portable context text")
+    document.save(pdf_path)
+    document.close()
+    model = ScriptedChatModel(
+        responses=[
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "text = read_context_text('/context/sample.pdf')\n"
+                        "print(text[:80])\n"
+                    )
+                },
+                "pdf-helper-output",
+            ),
+            _answer_response(columns=["value"], rows=[["ok"]]),
+        ]
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, output_call = _tool_call(result, "pdf-helper-output")
+    output = json.dumps(output_call["result"], ensure_ascii=False)
+    assert "Portable context text" in output
 
 
 def test_binary_context_read_is_returned_as_text_error(

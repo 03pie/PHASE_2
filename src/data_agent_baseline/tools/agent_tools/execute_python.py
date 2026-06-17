@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import csv
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -187,6 +189,27 @@ def __virtualize_audit_source(value):
     except (OSError, ValueError):
         return text.replace("\\\\", "/")
     return "/context/" + relative.as_posix() + table_suffix
+
+def __resolve_context_path(value):
+    text = str(value)
+    if text == "/context" or text.startswith("/context/"):
+        relative = text.removeprefix("/context").lstrip("/")
+        resolved = (__ContextRoot / relative).resolve()
+        resolved.relative_to(__ContextRoot)
+        return resolved
+    return __AnswerPath(text).resolve()
+
+def read_pdf_text(path):
+    resolved = __resolve_context_path(path)
+    import fitz as __answer_fitz
+    with __answer_fitz.open(str(resolved)) as document:
+        return "\\n".join(page.get_text() for page in document)
+
+def read_context_text(path, encoding="utf-8"):
+    resolved = __resolve_context_path(path)
+    if resolved.suffix.casefold() == ".pdf":
+        return read_pdf_text(str(resolved))
+    return resolved.read_text(encoding=encoding, errors="replace")
 
 def __normalize_answer_audit(audit):
     audit = __normalize_answer_value(audit)
@@ -392,6 +415,202 @@ def _load_prepared_answer(
     return prepared_answer, answer_error, candidate
 
 
+def _plan_preserves_source_rows(analysis_plan: dict[str, Any] | None) -> bool:
+    if not isinstance(analysis_plan, dict):
+        return False
+    output_spec = analysis_plan.get("output_spec") or {}
+    return (
+        isinstance(output_spec, dict)
+        and output_spec.get("row_policy") == "preserve"
+        and not output_spec.get("transformations")
+    )
+
+
+def _plan_output_projection(analysis_plan: dict[str, Any]) -> tuple[list[str], list[str]]:
+    output_spec = analysis_plan.get("output_spec") or {}
+    if not isinstance(output_spec, dict):
+        return [], []
+    output_columns = [
+        column
+        for column in output_spec.get("columns") or []
+        if isinstance(column, dict)
+    ]
+    columns: list[str] = []
+    source_fields: list[str] = []
+    for column in output_columns:
+        name = str(column.get("name") or "").strip()
+        fields = [
+            str(field or "").strip()
+            for field in column.get("source_fields") or []
+            if str(field or "").strip()
+        ]
+        if not name or not fields:
+            return [], []
+        columns.append(name)
+        source_fields.append(fields[0])
+    return columns, source_fields
+
+
+def _plan_source_paths(analysis_plan: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for section_name, key in (("execution_spec", "sources"), ("evidence", "context_sources")):
+        section = analysis_plan.get(section_name) or {}
+        if not isinstance(section, dict):
+            continue
+        for source in section.get(key) or []:
+            if not isinstance(source, dict):
+                continue
+            path = str(source.get("path") or "").replace("\\", "/").strip()
+            if path and not path.lower().endswith("/knowledge.md") and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _resolve_virtual_context_path(
+    workspace: Path,
+    virtual_path: str,
+) -> tuple[Path | None, str | None]:
+    path_text = virtual_path.replace("\\", "/")
+    table_name = None
+    if "::" in path_text:
+        path_text, table_name = path_text.split("::", 1)
+    if not path_text.startswith("/context/"):
+        return None, table_name
+    relative = path_text.removeprefix("/context/").lstrip("/")
+    root = (workspace / "context").resolve()
+    resolved = (root / Path(relative)).resolve()
+    if not resolved.is_relative_to(root):
+        return None, table_name
+    return resolved, table_name
+
+
+def _case_get(record: dict[str, Any], field: str) -> Any:
+    if field in record:
+        return record[field]
+    folded = field.casefold()
+    for key, value in record.items():
+        if str(key).casefold() == folded:
+            return value
+    return None
+
+
+def _read_projection_from_csv(
+    path: Path,
+    source_fields: list[str],
+) -> list[list[Any]] | None:
+    for encoding in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            with path.open(newline="", encoding=encoding) as handle:
+                return [
+                    [_case_get(dict(row), field) for field in source_fields]
+                    for row in csv.DictReader(handle)
+                ]
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _json_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        records = payload.get("records")
+        if isinstance(records, list):
+            return [record for record in records if isinstance(record, dict)]
+        for value in payload.values():
+            if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+                return list(value)
+    if isinstance(payload, list):
+        return [record for record in payload if isinstance(record, dict)]
+    return []
+
+
+def _read_projection_from_json(
+    path: Path,
+    source_fields: list[str],
+) -> list[list[Any]] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    records = _json_records(payload)
+    if not records:
+        return None
+    return [[_case_get(record, field) for field in source_fields] for record in records]
+
+
+def _quote_sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _read_projection_from_sqlite(
+    path: Path,
+    table_name: str,
+    source_fields: list[str],
+) -> list[list[Any]] | None:
+    try:
+        with sqlite3.connect(str(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            cursor = connection.cursor()
+            cursor.execute(f"PRAGMA table_info({_quote_sql_identifier(table_name)})")
+            actual_by_folded = {
+                str(row[1]).casefold(): str(row[1])
+                for row in cursor.fetchall()
+            }
+            actual_fields = [
+                actual_by_folded.get(field.casefold(), field)
+                for field in source_fields
+            ]
+            select_list = ", ".join(_quote_sql_identifier(field) for field in actual_fields)
+            cursor.execute(
+                f"SELECT {select_list} FROM {_quote_sql_identifier(table_name)}"
+            )
+            return [list(row) for row in cursor.fetchall()]
+    except sqlite3.Error:
+        return None
+
+
+def _try_preserve_source_projection(
+    *,
+    workspace: Path,
+    analysis_plan: dict[str, Any] | None,
+) -> Any | None:
+    if not _plan_preserves_source_rows(analysis_plan):
+        return None
+    assert isinstance(analysis_plan, dict)
+    columns, source_fields = _plan_output_projection(analysis_plan)
+    if not columns or not source_fields:
+        return None
+    for source_path in _plan_source_paths(analysis_plan):
+        resolved, table_name = _resolve_virtual_context_path(workspace, source_path)
+        if resolved is None or not resolved.exists():
+            continue
+        rows: list[list[Any]] | None = None
+        suffix = resolved.suffix.casefold()
+        if table_name and suffix in {".sqlite", ".db", ".sqlite3"}:
+            rows = _read_projection_from_sqlite(resolved, table_name, source_fields)
+        elif suffix == ".csv":
+            rows = _read_projection_from_csv(resolved, source_fields)
+        elif suffix == ".json":
+            rows = _read_projection_from_json(resolved, source_fields)
+        if not rows:
+            continue
+        audit = {
+            "source_paths": [source_path],
+            "operations": ["source_preserve_projection"],
+            "output_row_count": len(rows),
+            "output_hash": answer_value_hash(columns, rows),
+            "audit_origin": "execute_python_preserve_fallback",
+        }
+        prepared_answer, answer_error = validate_prepared_answer(
+            columns,
+            rows,
+            analysis_plan,
+            audit,
+        )
+        if prepared_answer is not None and answer_error is None:
+            return prepared_answer
+    return None
+
+
 def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
     """创建绑定到当前临时工作区的 execute_python 模型工具。"""
 
@@ -476,7 +695,64 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                 state.get("analysis_plan"),
                 code_context_paths,
             )
+            if prepared_answer is None and answer_error is None:
+                fallback_answer = _try_preserve_source_projection(
+                    workspace=workspace,
+                    analysis_plan=state.get("analysis_plan"),
+                )
+                if fallback_answer is not None:
+                    summary = json.dumps(
+                        {
+                            "status": "prepared_from_source_projection",
+                            "column_count": len(fallback_answer.columns),
+                            "row_count": len(fallback_answer.rows),
+                            "recovered_from": "no_set_answer_submission",
+                        },
+                        ensure_ascii=False,
+                    )
+                    return Command(
+                        update={
+                            "prepared_answer": fallback_answer,
+                            "answer_candidate": None,
+                            "messages": [
+                                ToolMessage(
+                                    content=f"{content}\n\n{summary}",
+                                    name="execute_python",
+                                    tool_call_id=tool_call_id,
+                                    status="success",
+                                )
+                            ],
+                        }
+                    )
             if answer_error is not None:
+                fallback_answer = _try_preserve_source_projection(
+                    workspace=workspace,
+                    analysis_plan=state.get("analysis_plan"),
+                )
+                if fallback_answer is not None:
+                    summary = json.dumps(
+                        {
+                            "status": "prepared_from_source_projection",
+                            "column_count": len(fallback_answer.columns),
+                            "row_count": len(fallback_answer.rows),
+                            "recovered_from": answer_error,
+                        },
+                        ensure_ascii=False,
+                    )
+                    return Command(
+                        update={
+                            "prepared_answer": fallback_answer,
+                            "answer_candidate": None,
+                            "messages": [
+                                ToolMessage(
+                                    content=f"{content}\n\n{summary}",
+                                    name="execute_python",
+                                    tool_call_id=tool_call_id,
+                                    status="success",
+                                )
+                            ],
+                        }
+                    )
                 candidate_summary = {
                     "status": "candidate_saved",
                     "column_count": (
@@ -517,9 +793,19 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                     }
                 )
             if prepared_answer is not None:
+                fallback_answer = _try_preserve_source_projection(
+                    workspace=workspace,
+                    analysis_plan=state.get("analysis_plan"),
+                )
+                if fallback_answer is not None:
+                    prepared_answer = fallback_answer
                 summary = json.dumps(
                     {
-                        "status": "prepared",
+                        "status": (
+                            "prepared_from_source_projection"
+                            if fallback_answer is not None
+                            else "prepared"
+                        ),
                         "column_count": len(prepared_answer.columns),
                         "row_count": len(prepared_answer.rows),
                     },

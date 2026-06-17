@@ -7,6 +7,9 @@ source record order, returns one value column, and submits through the same
 answer validator as set_answer. Missing or unavailable metric values are kept
 as empty strings.
 
-Pass the exact bound source_path and source_field from the plan. Use start_line
-and end_line only when the relevant narrative section has already been read and
-the section boundary is known.
+Pass the exact bound source_path and source_field from the plan. Prefer bounded
+extraction: first use grep_file to locate candidate lines, then read_doc with a
+small start_line/max_lines slice. If a record or section continues beyond the
+slice, read the next adjacent slice before extracting. Pass start_line/end_line
+for the confirmed bounded section. Use whole-document extraction only when the
+whole source is already known to contain only the target record sequence.

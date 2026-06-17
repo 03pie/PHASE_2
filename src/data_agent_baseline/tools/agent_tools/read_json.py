@@ -25,6 +25,57 @@ from data_agent_baseline.tools.observed_sources import (
 _DEFAULT_COLLECTION_KEYS = ("records", "items", "rows", "data", "values")
 _SCHEMA_SAMPLE_LIMIT = 200
 _EXAMPLE_VALUE_LIMIT = 3
+_MAX_JSON_ITEMS_PER_READ = 200
+
+
+def _read_strategy_payload(
+    *,
+    path: str,
+    json_path: str,
+    total_items: int,
+    returned_items: int,
+    start_item: int,
+    effective_max_items: int,
+    next_start_item: int | None,
+    previous_start_item: int | None,
+) -> dict[str, Any]:
+    base_args: dict[str, Any] = {"path": path, "max_items": effective_max_items}
+    if json_path:
+        base_args["json_path"] = json_path
+    actions: list[dict[str, Any]] = []
+    if next_start_item is not None:
+        actions.append(
+            {
+                "tool": "read_json",
+                "reason": "read the next preview page",
+                "args": {**base_args, "start_item": next_start_item},
+            }
+        )
+    if previous_start_item is not None:
+        actions.append(
+            {
+                "tool": "read_json",
+                "reason": "read the previous preview page",
+                "args": {**base_args, "start_item": previous_start_item},
+            }
+        )
+    actions.append(
+        {
+            "tool": "execute_python",
+            "reason": "run full-collection computation after schema and relevant fields are confirmed",
+            "args": {"path": path, **({"json_path": json_path} if json_path else {})},
+        }
+    )
+    return {
+        "large_file": total_items > effective_max_items,
+        "read_strategy": "preview_pages_then_execute_python_for_full_collection",
+        "recommended_next_actions": actions,
+        "page_window": {
+            "start_item": start_item,
+            "returned_items": returned_items,
+            "max_items": effective_max_items,
+        },
+    }
 
 
 def _type_name(value: Any) -> str:
@@ -187,6 +238,7 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
 
         try:
             assert resolved is not None
+            effective_max_items = min(max_items, _MAX_JSON_ITEMS_PER_READ)
             data = json.loads(resolved.read_text(encoding="utf-8"))
             selected = navigate_json_path(data, json_path) if json_path else data
             collection_path, collection_items = _find_default_collection(selected)
@@ -206,7 +258,7 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                 page_items, has_more = _window_items(
                     collection_items,
                     start_item,
-                    max_items,
+                    effective_max_items,
                 )
                 selected_path = _join_json_path(json_path, collection_path)
                 schema = _field_schema(collection_items)
@@ -215,6 +267,16 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                     source_fields = [str(field) for field in fields.keys()]
                 row_count = len(collection_items)
                 sample_value = page_items
+                next_start_item = (
+                    start_item + len(page_items)
+                    if start_item + len(page_items) < len(collection_items)
+                    else None
+                )
+                previous_start_item = (
+                    max(0, start_item - effective_max_items)
+                    if start_item > 0
+                    else None
+                )
                 payload.update(
                     {
                         "selected_path": selected_path,
@@ -222,10 +284,24 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                         "total_items": len(collection_items),
                         "returned_items": len(page_items),
                         "start_item": start_item,
+                        "requested_max_items": max_items,
+                        "max_items": effective_max_items,
+                        "next_start_item": next_start_item,
+                        "previous_start_item": previous_start_item,
                         "has_more": has_more,
                         "truncated": start_item > 0 or has_more,
                         "schema": schema,
                         "metadata": _parent_metadata(selected, collection_path),
+                        **_read_strategy_payload(
+                            path=payload["path"],
+                            json_path=json_path,
+                            total_items=len(collection_items),
+                            returned_items=len(page_items),
+                            start_item=start_item,
+                            effective_max_items=effective_max_items,
+                            next_start_item=next_start_item,
+                            previous_start_item=previous_start_item,
+                        ),
                     }
                 )
             else:

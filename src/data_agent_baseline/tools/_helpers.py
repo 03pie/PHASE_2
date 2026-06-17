@@ -27,7 +27,7 @@ TEXT_SUFFIXES = {
 }
 DOC_SUFFIXES = {".log", ".md", ".pdf", ".txt"}
 VIDEO_SUFFIXES = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
-SEARCHABLE_SUFFIXES = TEXT_SUFFIXES
+SEARCHABLE_SUFFIXES = TEXT_SUFFIXES | {".pdf"}
 
 
 def tool_message(
@@ -378,8 +378,8 @@ def regex_search(
     raw_cap = 50_000
     for path, rendered_path in files:
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+            lines = _searchable_text_lines(path)
+        except (OSError, RuntimeError):
             continue
         emitted: set[int] = set()
         for index, line in enumerate(lines):
@@ -429,8 +429,8 @@ def fuzzy_search(
     matches: list[dict[str, Any]] = []
     for path, rendered_path in files:
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+            lines = _searchable_text_lines(path)
+        except (OSError, RuntimeError):
             continue
         for index, line in enumerate(lines):
             line_lower = line.lower()
@@ -450,6 +450,12 @@ def fuzzy_search(
                 )
     matches.sort(key=lambda item: float(item.get("score", 0)), reverse=True)
     return matches[:50_000]
+
+
+def _searchable_text_lines(path: Path) -> list[str]:
+    if path.suffix.lower() == ".pdf":
+        return extract_pdf_text(path).splitlines()
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
 def apply_head_limit(items: list[Any], limit: int, offset: int) -> tuple[list[Any], int | None]:

@@ -5,3 +5,8 @@ when a logical table from knowledge is missing from SQLite or may exist as
 same-basename CSV/JSON/doc evidence. `knowledge_facts[].fact_id` can be cited in
 `execution_spec.operations[].authorization_fact_ids` when it authorizes the
 operation.
+
+When the user question names a table, source, report, dataset, or business
+scope, pass that wording or the corresponding knowledge logical table in
+`scope`. Scope is used to narrow bindings before choosing semantically similar
+fields.
