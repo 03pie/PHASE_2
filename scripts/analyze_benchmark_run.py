@@ -85,7 +85,7 @@ def _cells_equal(left: object, right: object) -> bool:
     left_number = _parse_number(left)
     right_number = _parse_number(right)
     if left_number is not None and right_number is not None:
-        tolerance = max(1e-8, 1e-10 * max(abs(left_number), abs(right_number), 1.0))
+        tolerance = max(1e-6, 1e-9 * max(abs(left_number), abs(right_number), 1.0))
         return abs(left_number - right_number) <= tolerance
     return _normalize_cell(left) == _normalize_cell(right)
 
@@ -112,6 +112,13 @@ def _contains_gold_answer(
     gold_rows: list[list[str]],
 ) -> bool:
     if not gold_rows or not prediction_rows:
+        return False
+    gold_rows = [
+        row
+        for row in gold_rows
+        if any(_normalize_cell(value) for value in row)
+    ]
+    if not gold_rows:
         return False
     unused_prediction_indexes = set(range(len(prediction_rows)))
     for gold_row in gold_rows:

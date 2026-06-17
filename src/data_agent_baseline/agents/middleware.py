@@ -26,6 +26,10 @@ from langgraph.types import Command
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
 from data_agent_baseline.agents.semantic_layer import parse_knowledge_content
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
+from data_agent_baseline.tools.answer import (
+    normalize_answer_columns,
+    validate_prepared_answer,
+)
 
 _SOURCE_DISCOVERY_TOOLS = frozenset(
     {
@@ -401,6 +405,68 @@ def _observed_source_row_counts_from_state(
         if base_path and isinstance(row_count, int) and row_count >= 0:
             counts.setdefault(base_path, row_count)
     return counts
+
+
+def _candidate_prepared_answer(
+    *,
+    candidate: Any,
+    analysis_plan: Any,
+) -> Any | None:
+    if not isinstance(candidate, Mapping) or not isinstance(analysis_plan, dict):
+        return None
+    candidate_columns = candidate.get("columns")
+    candidate_rows = candidate.get("rows")
+    if not isinstance(candidate_columns, list) or not isinstance(candidate_rows, list):
+        return None
+    if not all(isinstance(row, list) for row in candidate_rows):
+        return None
+    columns = normalize_answer_columns(candidate_columns)
+    output_spec = analysis_plan.get("output_spec") or {}
+    expected_columns = []
+    if isinstance(output_spec, Mapping):
+        expected_columns = [
+            column
+            for column in output_spec.get("columns") or []
+            if isinstance(column, Mapping)
+        ]
+    if expected_columns and len(columns) != len(expected_columns):
+        return None
+    rows = [list(row) for row in candidate_rows]
+    audit = candidate.get("audit") if isinstance(candidate.get("audit"), dict) else None
+    prepared_answer, answer_error = validate_prepared_answer(
+        columns,
+        rows,
+        analysis_plan,
+        audit,
+    )
+    if answer_error is not None:
+        return None
+    return prepared_answer
+
+
+def _promote_answer_candidate_after_plan(
+    request: ToolCallRequest,
+    result: ToolMessage | Command[Any],
+) -> ToolMessage | Command[Any]:
+    if not isinstance(result, Command):
+        return result
+    update = getattr(result, "update", None)
+    if not isinstance(update, dict):
+        return result
+    analysis_plan = update.get("analysis_plan")
+    prepared_answer = _candidate_prepared_answer(
+        candidate=request.state.get("answer_candidate"),
+        analysis_plan=analysis_plan,
+    )
+    if prepared_answer is None:
+        return result
+    return Command(
+        update={
+            **update,
+            "prepared_answer": prepared_answer,
+            "answer_candidate": None,
+        }
+    )
 
 
 def _observed_narrative_sources_by_logical(
@@ -810,18 +876,46 @@ def _canonicalize_semantic_source_bindings(
         if str(binding.get("source_field") or "").strip()
     ]
     updated_columns: list[Any] = []
-    for index, column in enumerate(output_columns):
-        if not isinstance(column, Mapping) or not canonical_fields:
-            updated_columns.append(column)
-            continue
-        updated_column = dict(column)
-        updated_column["source_fields"] = [
-            canonical_fields[min(index, len(canonical_fields) - 1)]
-        ]
-        updated_columns.append(updated_column)
-    if len(canonical_fields) > len(updated_columns):
-        for field in canonical_fields[len(updated_columns) :]:
+    used_column_indexes: set[int] = set()
+    for field in canonical_fields:
+        normalized_field = _normalized_quote_text(field)
+        selected_index: int | None = None
+        for index, column in enumerate(output_columns):
+            if index in used_column_indexes or not isinstance(column, Mapping):
+                continue
+            source_fields = {
+                _normalized_quote_text(str(item or ""))
+                for item in column.get("source_fields") or []
+                if str(item or "").strip()
+            }
+            if normalized_field in source_fields:
+                selected_index = index
+                break
+        if selected_index is None:
+            for index, column in enumerate(output_columns):
+                if index in used_column_indexes or not isinstance(column, Mapping):
+                    continue
+                if str(column.get("role") or "") in {
+                    "measure",
+                    "calculation",
+                    "output_column",
+                }:
+                    selected_index = index
+                    break
+        if selected_index is None:
+            for index, column in enumerate(output_columns):
+                if index not in used_column_indexes and isinstance(column, Mapping):
+                    selected_index = index
+                    break
+        if selected_index is None:
             updated_columns.append({"name": field, "source_fields": [field]})
+            continue
+        used_column_indexes.add(selected_index)
+        selected_column = dict(output_columns[selected_index])
+        selected_column["source_fields"] = [field]
+        if not str(selected_column.get("name") or "").strip():
+            selected_column["name"] = field
+        updated_columns.append(selected_column)
     updated_output_spec["columns"] = updated_columns
     if "expected_row_count" in updated_output_spec:
         updated_output_spec["expected_row_count"] = None
@@ -2197,7 +2291,10 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                 request,
                 "Call write_todos successfully before using any other tool.",
             )
-        return handler(request)
+        result = handler(request)
+        if current_tool_name == "analyze_plan":
+            return _promote_answer_candidate_after_plan(request, result)
+        return result
 
 
 class DisabledToolGuardMiddleware(AgentMiddleware[Any, None, Any]):
