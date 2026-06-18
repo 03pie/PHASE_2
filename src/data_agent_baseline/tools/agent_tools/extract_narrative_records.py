@@ -470,7 +470,7 @@ def create_extract_narrative_records_tool(
                     for fact in parse_knowledge_content(
                         knowledge_path.read_text(encoding="utf-8", errors="replace")
                     ):
-                        if str(fact.logical_field or "").casefold() == source_field.casefold():
+                        if str(fact.field_key or "").casefold() == source_field.casefold():
                             knowledge_quote = fact.quote
                             break
             rows, line_evidence = _extract_rows(
@@ -529,7 +529,7 @@ def create_extract_narrative_records_tool(
                 {
                     "path": virtual_source,
                     "source_type": "doc",
-                    "logical_name": resolved.stem,
+                    "source_name_hint": resolved.stem,
                     "line_count": len(lines),
                     "matched_lines": line_evidence[:20],
                     "sample_hash": sample_hash(rows[:50]),

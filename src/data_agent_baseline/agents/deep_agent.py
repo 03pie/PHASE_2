@@ -43,10 +43,10 @@ from data_agent_baseline.agents.tracing import (
 )
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.prompts.loader import (
+    build_knowledge_bundle,
     build_task_prompt,
     load_main_agent_prompt,
     load_subagent_prompt,
-    read_knowledge_content,
 )
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
 from data_agent_baseline.tools.agent_tools.execute_sql import create_execute_sql_tool
@@ -360,6 +360,7 @@ class DeepAgent:
             task,
             collector,
         )
+        knowledge_bundle = build_knowledge_bundle(task.context_dir)
 
         # 每个任务复制到独立临时目录，保证上下文只读且任务之间互不污染。
         workspace = Path(tempfile.mkdtemp(prefix=f"dabench-{task.task_id}-"))
@@ -374,7 +375,8 @@ class DeepAgent:
                         "original_request": task.question,
                         "question_structure": question_structure,
                         "question_structure_enforced": question_structure_enforced,
-                        "knowledge_content": read_knowledge_content(task.context_dir),
+                        "knowledge_content": knowledge_bundle.raw_content,
+                        "knowledge_content_hash": knowledge_bundle.content_hash,
                         "messages": [
                             HumanMessage(
                                 content=build_task_prompt(
@@ -382,6 +384,7 @@ class DeepAgent:
                                     question_structure=format_question_structure(
                                         question_structure
                                     ),
+                                    knowledge_bundle=knowledge_bundle,
                                 )
                             )
                         ],

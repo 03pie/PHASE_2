@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import hashlib
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 
@@ -12,6 +14,15 @@ from data_agent_baseline.benchmark.schema import PublicTask
 
 _PROMPT_PACKAGE = "data_agent_baseline.prompts"
 _FileInfoHook = Callable[[Path], str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeBundle:
+    """Single-source knowledge payload used by prompt and runtime state."""
+
+    raw_content: str
+    schema_json: str
+    content_hash: str
 
 
 def _sqlite_table_info(path: Path) -> str | None:
@@ -98,32 +109,45 @@ def read_knowledge_content(context_dir: Path) -> str:
         return f"<unreadable: {exc}>"
 
 
-def _knowledge_schema_context(context_dir: Path) -> str:
-    raw_content = read_knowledge_content(context_dir)
-    if not raw_content:
+def _knowledge_content_hash(raw_content: str) -> str:
+    if not raw_content or raw_content.startswith("<unreadable:"):
+        return ""
+    return hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
+
+
+def _knowledge_schema_context(
+    context_dir: Path,
+    *,
+    raw_content: str | None = None,
+) -> str:
+    content = read_knowledge_content(context_dir) if raw_content is None else raw_content
+    content_hash = _knowledge_content_hash(content)
+    if not content:
         return json.dumps(
             {
                 "availability": "missing",
                 "knowledge_status_for_plan": "unavailable",
+                "content_hash": content_hash,
             },
             ensure_ascii=False,
             indent=2,
         )
-    if raw_content.startswith("<unreadable:"):
+    if content.startswith("<unreadable:"):
         return json.dumps(
             {
                 "availability": "unreadable",
                 "knowledge_status_for_plan": "unavailable",
-                "error": raw_content,
+                "content_hash": content_hash,
+                "error": content,
             },
             ensure_ascii=False,
             indent=2,
         )
 
-    semantic = build_semantic_context(context_dir)
-    bindings_by_logical: dict[str, list[dict[str, object]]] = {}
+    semantic = build_semantic_context(context_dir, knowledge_content=content)
+    bindings_by_source_hint: dict[str, list[dict[str, object]]] = {}
     for binding in semantic.bindings:
-        bindings_by_logical.setdefault(binding.logical_name, []).append(
+        bindings_by_source_hint.setdefault(binding.source_name_hint, []).append(
             {
                 "source_path": binding.source_path,
                 "source_type": binding.source_type,
@@ -134,27 +158,28 @@ def _knowledge_schema_context(context_dir: Path) -> str:
             }
         )
 
-    tables: dict[str, dict[str, object]] = {}
+    sections: dict[str, dict[str, object]] = {}
     global_facts: list[dict[str, object]] = []
     for fact in semantic.facts:
         payload = {
             "fact_id": fact.fact_id,
             "kind": fact.kind,
-            "logical_field": fact.logical_field,
+            "field_key": fact.field_key,
             "operation": fact.operation,
             "binding_status": fact.status,
             "quote": fact.quote,
         }
-        if fact.logical_table:
-            table_payload = tables.setdefault(
-                fact.logical_table,
+        if fact.section_key:
+            section_payload = sections.setdefault(
+                fact.section_key,
                 {
-                    "logical_table": fact.logical_table,
-                    "bindings": bindings_by_logical.get(fact.logical_table, []),
+                    "section_key": fact.section_key,
+                    "source_name_hint": fact.section_key,
+                    "source_candidates": bindings_by_source_hint.get(fact.section_key, []),
                     "facts": [],
                 },
             )
-            facts = table_payload.setdefault("facts", [])
+            facts = section_payload.setdefault("facts", [])
             if isinstance(facts, list):
                 facts.append(payload)
         else:
@@ -164,30 +189,46 @@ def _knowledge_schema_context(context_dir: Path) -> str:
         "availability": "available",
         "knowledge_status_for_plan": "authoritative",
         "source_path": "/context/knowledge.md",
+        "content_hash": content_hash,
         "usage_contract": [
             "For analyze_plan.evidence.knowledge_status, use knowledge_status_for_plan exactly.",
-            "Use fact_id plus quote when a knowledge fact authorizes an output field, calculation, filter, ordering, or unit.",
+            "Use fact_id plus quote when a knowledge fact authorizes a plan decision or output field.",
+            "section_key/source_name_hint is a knowledge-document grouping and source-name hint, not proof of a physical data table or row grain.",
             "Treat binding_status values such as binding_unresolved/schema_conflict/narrative_only as local source-binding states, not as proof that all knowledge is invalid.",
             "When a target fact has binding_status narrative_only, bind execution_spec.source_bindings to the observed doc source and use the narrative extraction tool.",
         ],
-        "tables": list(tables.values()),
+        "knowledge_sections": list(sections.values()),
         "global_facts": global_facts,
         "issues": list(semantic.issues),
     }
     return json.dumps(schema, ensure_ascii=False, indent=2)
 
 
+def build_knowledge_bundle(context_dir: Path) -> KnowledgeBundle:
+    raw_content = read_knowledge_content(context_dir)
+    return KnowledgeBundle(
+        raw_content=raw_content,
+        schema_json=_knowledge_schema_context(
+            context_dir,
+            raw_content=raw_content,
+        ),
+        content_hash=_knowledge_content_hash(raw_content),
+    )
+
+
 def build_task_prompt(
     task: PublicTask,
     *,
     question_structure: str = "<not_run>",
+    knowledge_bundle: KnowledgeBundle | None = None,
 ) -> str:
     """向任务模板注入用户问题、结构化 knowledge schema 和完整文件清单。"""
 
+    bundle = knowledge_bundle or build_knowledge_bundle(task.context_dir)
     template = load_prompt("task.md")
     return template.format(
         question=task.question,
         question_structure=question_structure,
         context_inventory=_context_inventory(task.context_dir),
-        knowledge_schema=_knowledge_schema_context(task.context_dir),
+        knowledge_schema=bundle.schema_json,
     )

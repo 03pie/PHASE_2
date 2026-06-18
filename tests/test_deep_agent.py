@@ -154,7 +154,6 @@ def _plan_args(
             "knowledge_rules": (
                 [
                     {
-                        "rule_type": "semantic",
                         "quote": knowledge_quote,
                         "source_path": "/context/knowledge.md",
                     }
@@ -717,7 +716,7 @@ def test_semantic_layer_extracts_facts_and_same_basename_sources(tmp_path: Path)
     facts = parse_knowledge_content(
         context_dir.joinpath("knowledge.md").read_text(encoding="utf-8")
     )
-    assert {"field", "unit", "join", "calculation", "example_query"} <= {
+    assert {"field", "join", "calculation", "example_query"} <= {
         fact.kind for fact in facts
     }
     assert any(fact.operation == "filter,aggregate" for fact in facts)
@@ -1275,7 +1274,7 @@ def test_knowledge_field_fact_canonicalizes_semantic_neighbor_source_field(
     assert plan["execution_spec"]["source_bindings"] == [
         {
             "fact_id": "kf_1",
-            "logical_table": "mf_netvalueperformancehis",
+            "section_key": "mf_netvalueperformancehis",
             "source_field": "rrintenyear",
             "source_paths": ["/context/doc/mf_netvalueperformancehis.md"],
         }
@@ -1284,6 +1283,379 @@ def test_knowledge_field_fact_canonicalizes_semantic_neighbor_source_field(
         rule.get("fact_id") == "kf_1"
         for rule in plan["evidence"]["knowledge_rules"]
     )
+
+
+def test_authoritative_target_fact_rejects_extra_measure_outputs(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_extra_measure_outputs"
+    context_dir = task_dir / "context"
+    json_dir = context_dir / "json"
+    json_dir.mkdir(parents=True)
+    knowledge_quote = "| `metrics` | `targetmetric` | target metric value |"
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                f"| `metrics` | `targetmetric` | target metric value |",
+                "| `metrics` | `othermetric` | unrelated metric value |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    json_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"TargetMetric": 1, "OtherMetric": 2},
+                    {"TargetMetric": 3, "OtherMetric": 4},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    question = "Show target metric records."
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote=knowledge_quote,
+        context_paths=["/context/json/metrics.json"],
+        columns=[
+            ("TargetMetric", ["TargetMetric"]),
+            ("OtherMetric", ["OtherMetric"]),
+        ],
+        expected_row_count=2,
+    )
+    for column in invalid_plan["output_spec"]["columns"]:
+        column["role"] = "measure"
+    valid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote=knowledge_quote,
+        context_paths=["/context/json/metrics.json"],
+        columns=[("TargetMetric", ["TargetMetric"])],
+        expected_row_count=2,
+    )
+    valid_plan["output_spec"]["columns"][0]["role"] = "measure"
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_json",
+                {"path": "/context/json/metrics.json"},
+                "extra-measure-json",
+            ),
+            _tool_response(
+                "analyze_plan",
+                invalid_plan,
+                "extra-measure-plan",
+            ),
+            _tool_response(
+                "analyze_plan",
+                valid_plan,
+                "target-measure-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {
+                    "todos": [
+                        {"content": "Project target metric", "status": "in_progress"},
+                        {"content": "Submit the result", "status": "pending"},
+                    ]
+                },
+                "extra-measure-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "set_answer(['TargetMetric'], [[1], [3]])\n"
+                    )
+                },
+                "extra-measure-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_extra_measure_outputs",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, invalid_call = _tool_call(result, "extra-measure-plan")
+    assert invalid_call["status"] == "error"
+    assert "final measure output columns must be authorized" in invalid_call["result"]["content"]
+    _, valid_call = _tool_call(result, "target-measure-plan")
+    assert valid_call["ok"] is True
+
+
+def test_context_key_fact_does_not_force_final_output_column(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_context_key_fact"
+    context_dir = task_dir / "context"
+    json_dir = context_dir / "json"
+    json_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `metrics` | `targetmetric` | target metric value |",
+                "| `metrics` | `enddate` | reporting period end date |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    json_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"TargetMetric": 1, "EndDate": "2020-12-31"},
+                    {"TargetMetric": 3, "EndDate": "2021-12-31"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    question = "Show target metric records over the years."
+    plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `metrics` | `targetmetric` | target metric value |",
+        context_paths=["/context/json/metrics.json"],
+        columns=[("TargetMetric", ["TargetMetric"])],
+        expected_row_count=2,
+    )
+    plan["output_spec"]["columns"][0]["role"] = "measure"
+    plan["evidence"]["knowledge_rules"].append(
+        {
+            "quote": "| `metrics` | `enddate` | reporting period end date |",
+            "source_path": "/context/knowledge.md",
+        }
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_json",
+                {"path": "/context/json/metrics.json"},
+                "context-key-json",
+            ),
+            _tool_response("analyze_plan", plan, "context-key-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit target metric", "status": "in_progress"}]},
+                "context-key-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "set_answer(['TargetMetric'], [[1], [3]])\n"},
+                "context-key-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_context_key_fact",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "context-key-plan")
+    assert plan_call["ok"] is True
+    plan_update = plan_call["result"]["update"]["analysis_plan"]
+    assert plan_update["output_spec"]["columns"] == [
+        {"name": "TargetMetric", "source_fields": ["TargetMetric"], "role": "measure"}
+    ]
+
+
+def test_unrequested_context_columns_are_demoted_to_supporting_fields(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_context_column_demotion"
+    context_dir = task_dir / "context"
+    json_dir = context_dir / "json"
+    json_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Table | Column | Semantic Definition |",
+                "|---|---|---|",
+                "| `metrics` | `targetmetric` | target metric value |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    json_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"TargetMetric": 1, "EndDate": "2020-12-31", "Province": "A"},
+                    {"TargetMetric": 3, "EndDate": "2021-12-31", "Province": "B"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    question = "Show target metric records over the years."
+    plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote="| `metrics` | `targetmetric` | target metric value |",
+        context_paths=["/context/json/metrics.json"],
+        columns=[
+            ("EndDate", ["EndDate"]),
+            ("Province", ["Province"]),
+            ("TargetMetric", ["TargetMetric"]),
+        ],
+        expected_row_count=2,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_json",
+                {"path": "/context/json/metrics.json"},
+                "context-column-json",
+            ),
+            _tool_response("analyze_plan", plan, "context-column-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit target metric", "status": "in_progress"}]},
+                "context-column-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "set_answer(['TargetMetric'], [[1], [3]])\n"},
+                "context-column-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_context_column_demotion",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "context-column-plan")
+    plan_update = plan_call["result"]["update"]["analysis_plan"]
+    assert plan_update["output_spec"]["columns"] == [
+        {"name": "TargetMetric", "source_fields": ["TargetMetric"]}
+    ]
+    assert {
+        (field["name"], tuple(field["source_fields"]), field["purpose"])
+        for field in plan_update["execution_spec"]["supporting_fields"]
+    } >= {
+        ("EndDate", ("EndDate",), "context"),
+        ("Province", ("Province",), "context"),
+    }
+
+
+def test_analyze_plan_recovers_tagged_argument_sections(public_task: PublicTask) -> None:
+    base_plan = _plan_args(columns=[("value", ["value"])])
+    base_plan["execution_spec"] = {
+        "sources": [{"path": "/context/data.txt", "source_type": "doc"}],
+        "supporting_fields": [],
+        "operations": [],
+    }
+    tagged_sections = "\n".join(
+        [
+            "<operations>",
+            json.dumps(base_plan["execution_spec"]["operations"]),
+            "</operations>",
+            "<sources>",
+            json.dumps(base_plan["execution_spec"]["sources"]),
+            "</sources>",
+            "<supporting_fields>",
+            json.dumps(base_plan["execution_spec"]["supporting_fields"]),
+            "</supporting_fields>",
+            "<output_spec>",
+            "<columns>",
+            json.dumps(base_plan["output_spec"]["columns"]),
+            "</columns>",
+            "<expected_row_count>",
+            "null",
+            "</expected_row_count>",
+            "<null_policy>",
+            base_plan["output_spec"]["null_policy"],
+            "</null_policy>",
+            "<ordering>",
+            base_plan["output_spec"]["ordering"],
+            "</ordering>",
+            "<row_grain>",
+            base_plan["output_spec"]["row_grain"],
+            "</row_grain>",
+            "<row_policy>",
+            base_plan["output_spec"]["row_policy"],
+            "</row_policy>",
+            "<sort_keys>",
+            json.dumps(base_plan["output_spec"]["sort_keys"]),
+            "</sort_keys>",
+            "</output_spec>",
+            "<intent>",
+            "<requirements>",
+            json.dumps(base_plan["intent"]["requirements"]),
+            "</requirements>",
+            "<unresolved>",
+            json.dumps(base_plan["intent"]["unresolved"]),
+            "</unresolved>",
+            "</intent>",
+            "<revision>",
+            "<version>1</version>",
+            "<reason>Initial evidence-based plan.</reason>",
+            "</revision>",
+            "<schema_version>1.0</schema_version>",
+            "<steps>",
+            json.dumps(base_plan["steps"]),
+            "</steps>",
+        ]
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response("read_doc", {"path": "/context/data.txt"}, "tagged-source"),
+            _tool_response(
+                "analyze_plan",
+                {
+                    "evidence": base_plan["evidence"],
+                    "execution_spec": tagged_sections,
+                },
+                "tagged-plan",
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit value", "status": "in_progress"}]},
+                "tagged-todos",
+            ),
+            _answer_response(columns=["value"], rows=[["hello from context"]]),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "tagged-plan")
+    assert plan_call["ok"] is True
+    plan = plan_call["result"]["update"]["analysis_plan"]
+    assert plan["output_spec"]["columns"] == [{"name": "value", "source_fields": ["value"]}]
 
 
 def test_observed_target_field_fact_must_bind_narrative_source(
@@ -1399,7 +1771,7 @@ def test_observed_target_field_fact_must_bind_narrative_source(
     assert plan["execution_spec"]["source_bindings"] == [
         {
             "fact_id": "kf_1",
-            "logical_table": "mf_netvalueperformancehis",
+            "section_key": "mf_netvalueperformancehis",
             "source_field": "rrintenyear",
             "source_paths": ["/context/doc/mf_netvalueperformancehis.md"],
         }
@@ -1592,7 +1964,7 @@ def test_extract_narrative_records_preserves_source_bound_rows(
         "source_bindings": [
             {
                 "fact_id": "kf_1",
-                "logical_table": "fund_perf",
+                "section_key": "fund_perf",
                 "source_field": "rrintenyear",
                 "source_paths": ["/context/doc/fund_perf.md"],
             }
@@ -2063,7 +2435,6 @@ def test_analyze_plan_is_unavailable_before_discovery(
     assert plan_call["args"]["evidence"]["knowledge_status"] == "authoritative"
     assert plan_call["args"]["evidence"]["knowledge_rules"] == [
         {
-            "rule_type": "semantic",
             "quote": "Use the observed source value exactly.",
             "source_path": "/context/knowledge.md",
         }
@@ -2448,7 +2819,7 @@ def test_transformation_knowledge_fact_id_canonicalizes_authorization(
     assert transformation["authorization_fact_ids"] == ["kf_1"]
 
 
-def test_knowledge_field_rule_type_uses_fact_id_quote(
+def test_knowledge_fact_reference_uses_fact_id_quote_without_type_assumption(
     public_task: PublicTask,
 ) -> None:
     public_task.context_dir.joinpath("knowledge.md").write_text(
@@ -2469,7 +2840,7 @@ def test_knowledge_field_rule_type_uses_fact_id_quote(
     plan["evidence"]["knowledge_rules"][0] = {
         "fact_id": "kf_1",
         "quote": "value: approximate wording",
-        "rule_type": "field",
+        "rule_type": "source_column",
         "source_path": "/context/knowledge.md",
     }
     model = ScriptedChatModel(
@@ -2501,7 +2872,7 @@ def test_knowledge_field_rule_type_uses_fact_id_quote(
     rule = plan_call["result"]["update"]["analysis_plan"]["evidence"][
         "knowledge_rules"
     ][0]
-    assert rule["rule_type"] == "semantic"
+    assert rule["rule_type"] == "source_column"
     assert rule["quote"] == "| `value` | Use the observed source value exactly. |"
 
 
@@ -3109,7 +3480,6 @@ def test_non_authoritative_knowledge_rules_are_cleared(
     )
     plan["evidence"]["knowledge_rules"] = [
         {
-            "rule_type": "semantic",
             "quote": "This paraphrased rule is not present in knowledge.",
             "source_path": "/context/knowledge.md",
         }
@@ -4187,7 +4557,7 @@ def test_decision_evidence_boundary_is_visible_after_observation(
         record=TaskRecord(
             task_id=public_task.task_id,
             difficulty=public_task.difficulty,
-            question="China tertiary GDP these records",
+            question="China tertiary GDP records by date and province",
         ),
         assets=public_task.assets,
     )
@@ -5634,7 +6004,7 @@ def test_read_doc_surfaces_semantic_windows_from_question(
     assert "semantic_windows" in payload
     assert "十年回报率" in payload["semantic_windows"][0]["content"]
     observed = getattr(command, "update", {})["observed_sources"]
-    assert observed[0]["logical_name"] == "mf_netvalueperformancehis"
+    assert observed[0]["source_name_hint"] == "mf_netvalueperformancehis"
     assert "十年回报率" in observed[0]["matched_lines"][0]["content"]
 
 

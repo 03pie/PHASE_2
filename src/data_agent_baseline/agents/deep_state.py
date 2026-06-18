@@ -66,6 +66,7 @@ class BenchmarkDeepAgentState(DeepAgentState):
     question_structure: NotRequired[dict[str, Any]]
     question_structure_enforced: NotRequired[bool]
     knowledge_content: NotRequired[str]
+    knowledge_content_hash: NotRequired[str]
     answer: NotRequired[AnswerTable | None]
     prepared_answer: NotRequired[AnswerTable | None]
     answer_candidate: NotRequired[dict[str, Any]]

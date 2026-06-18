@@ -65,7 +65,7 @@ def _semantic_observed_sources(
             {
                 "path": path,
                 "source_type": "doc",
-                "logical_name": candidate.get("logical_name"),
+                "source_name_hint": candidate.get("source_name_hint"),
                 "semantic_query": field_text,
                 "semantic_confidence": candidate.get("confidence"),
                 "matched_lines": matched_lines,
@@ -130,7 +130,7 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
                 "matches": matches,
                 "match_count": len(matches),
                 "source_candidates": semantic_matches["source_candidates"],
-                "logical_bindings": semantic_matches["logical_bindings"],
+                "section_bindings": semantic_matches["section_bindings"],
                 "binding_issues": semantic_matches["binding_issues"],
                 "knowledge_facts": semantic_matches["knowledge_facts"],
                 "hint": "Inspect the reported source before relying on a field.",

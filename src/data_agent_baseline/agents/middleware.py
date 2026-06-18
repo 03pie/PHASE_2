@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -246,13 +246,141 @@ def _decode_json_like_argument(value: Any) -> Any:
     return value
 
 
+def _tagged_block(text: str, tag: str) -> str | None:
+    match = re.search(rf"<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}>", text, re.S)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _decode_tagged_value(value: str) -> Any:
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    decoded = _decode_json_like_argument(stripped)
+    if decoded is not stripped:
+        return decoded
+    if stripped.casefold() == "null":
+        return None
+    if re.fullmatch(r"-?\d+", stripped):
+        try:
+            return int(stripped)
+        except ValueError:
+            return stripped
+    return stripped
+
+
+def _decode_tagged_object(text: str, fields: Mapping[str, Any]) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {}
+    for key, default in fields.items():
+        block = _tagged_block(text, key)
+        if block is None:
+            if default is not None:
+                payload[key] = default
+            continue
+        payload[key] = _decode_tagged_value(block)
+    return payload or None
+
+
+def _recover_analyze_plan_tagged_arguments(
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    recovered = dict(arguments)
+    text_blobs = [
+        value
+        for value in recovered.values()
+        if isinstance(value, str) and "<" in value and ">" in value
+    ]
+    if not text_blobs:
+        return recovered
+    for text in text_blobs:
+        if "intent" not in recovered:
+            intent_text = _tagged_block(text, "intent")
+            if intent_text is not None:
+                decoded_intent = _decode_tagged_value(intent_text)
+                if isinstance(decoded_intent, Mapping):
+                    recovered["intent"] = dict(decoded_intent)
+                else:
+                    intent_payload = _decode_tagged_object(
+                        intent_text,
+                        {"requirements": [], "unresolved": []},
+                    )
+                    if intent_payload is not None:
+                        recovered["intent"] = intent_payload
+        if "output_spec" not in recovered:
+            output_text = _tagged_block(text, "output_spec")
+            if output_text is not None:
+                decoded_output = _decode_tagged_value(output_text)
+                if isinstance(decoded_output, Mapping):
+                    recovered["output_spec"] = dict(decoded_output)
+                else:
+                    output_payload = _decode_tagged_object(
+                        output_text,
+                        {
+                            "columns": [],
+                            "row_grain": "",
+                            "row_policy": "",
+                            "transformations": [],
+                            "ordering": "",
+                            "sort_keys": [],
+                            "null_policy": "",
+                            "expected_row_count": None,
+                        },
+                    )
+                    if output_payload is not None:
+                        recovered["output_spec"] = output_payload
+        if "revision" not in recovered:
+            revision_text = _tagged_block(text, "revision")
+            if revision_text is not None:
+                decoded_revision = _decode_tagged_value(revision_text)
+                if isinstance(decoded_revision, Mapping):
+                    recovered["revision"] = dict(decoded_revision)
+                else:
+                    revision_payload = _decode_tagged_object(
+                        revision_text,
+                        {
+                            "version": 1,
+                            "reason": "",
+                            "evidence_changes": [],
+                            "changed_fields": [],
+                        },
+                    )
+                    if revision_payload is not None:
+                        recovered["revision"] = revision_payload
+        if "steps" not in recovered:
+            steps_text = _tagged_block(text, "steps")
+            if steps_text is not None:
+                recovered["steps"] = _decode_tagged_value(steps_text)
+        if "schema_version" not in recovered:
+            schema_text = _tagged_block(text, "schema_version")
+            if schema_text is not None:
+                recovered["schema_version"] = str(_decode_tagged_value(schema_text))
+
+        execution_spec = recovered.get("execution_spec")
+        if not isinstance(execution_spec, Mapping):
+            execution_payload = _decode_tagged_object(
+                text,
+                {
+                    "sources": [],
+                    "supporting_fields": [],
+                    "operations": [],
+                    "source_bindings": [],
+                },
+            )
+            if execution_payload is not None:
+                recovered["execution_spec"] = execution_payload
+    return recovered
+
+
 def _normalize_tool_call_arguments(request: ToolCallRequest) -> ToolCallRequest:
     arguments = request.tool_call.get("args")
     normalized_arguments = _decode_json_like_argument(arguments)
     if not isinstance(normalized_arguments, Mapping):
         return request
     if str(request.tool_call.get("name") or "") == "analyze_plan":
-        normalized_arguments = dict(normalized_arguments)
+        normalized_arguments = _recover_analyze_plan_tagged_arguments(
+            normalized_arguments,
+        )
         execution_spec = normalized_arguments.get("execution_spec")
         if execution_spec is not None and not isinstance(execution_spec, Mapping):
             normalized_arguments.pop("execution_spec", None)
@@ -530,13 +658,13 @@ def _promote_answer_candidate_after_plan(
     )
 
 
-def _observed_narrative_sources_by_logical(
+def _observed_narrative_sources_by_source_hint(
     state: Mapping[str, Any],
 ) -> dict[str, list[str]]:
     sources: dict[str, list[str]] = {}
 
-    def add_source(logical_name: str, path: str) -> None:
-        normalized_name = _normalized_quote_text(logical_name)
+    def add_source(source_name_hint: str, path: str) -> None:
+        normalized_name = _normalized_quote_text(source_name_hint)
         normalized_path = path.replace("\\", "/")
         if not normalized_name or not normalized_path:
             return
@@ -548,10 +676,10 @@ def _observed_narrative_sources_by_logical(
         if str(source.get("source_type") or "") != "doc":
             continue
         path = str(source.get("path") or "").replace("\\", "/")
-        logical_name = str(source.get("logical_name") or "")
-        if not logical_name or not path:
+        source_name_hint = str(source.get("source_name_hint") or "")
+        if not source_name_hint or not path:
             continue
-        add_source(logical_name, path)
+        add_source(source_name_hint, path)
 
     messages = state.get("messages")
     if isinstance(messages, list):
@@ -564,12 +692,12 @@ def _observed_narrative_sources_by_logical(
             if not lower_path.endswith((".md", ".markdown", ".txt", ".pdf")):
                 continue
             filename = path.rsplit("/", 1)[-1]
-            logical_name = filename.rsplit(".", 1)[0]
-            add_source(logical_name, path)
+            source_name_hint = filename.rsplit(".", 1)[0]
+            add_source(source_name_hint, path)
     return sources
 
 
-def _observed_sources_by_logical(
+def _observed_sources_by_source_hint(
     state: Mapping[str, Any],
 ) -> dict[str, list[str]]:
     sources: dict[str, list[str]] = {}
@@ -577,16 +705,16 @@ def _observed_sources_by_logical(
         path = str(source.get("path") or "").replace("\\", "/")
         if not path:
             continue
-        logical_names = {
-            _normalized_quote_text(str(source.get("logical_name") or "")),
+        source_name_hints = {
+            _normalized_quote_text(str(source.get("source_name_hint") or "")),
             _normalized_quote_text(str(source.get("table") or "")),
         }
         path_tail = path.rsplit("::", 1)[-1].rsplit("/", 1)[-1]
-        logical_names.add(_normalized_quote_text(path_tail.rsplit(".", 1)[0]))
-        for logical_name in {name for name in logical_names if name}:
-            sources.setdefault(logical_name, [])
-            if path not in sources[logical_name]:
-                sources[logical_name].append(path)
+        source_name_hints.add(_normalized_quote_text(path_tail.rsplit(".", 1)[0]))
+        for source_name_hint in {name for name in source_name_hints if name}:
+            sources.setdefault(source_name_hint, [])
+            if path not in sources[source_name_hint]:
+                sources[source_name_hint].append(path)
     return sources
 
 
@@ -795,6 +923,18 @@ def _column_texts(column: Mapping[str, Any]) -> set[str]:
     return {text for text in texts if text}
 
 
+def _normalized_field_alias(value: Any) -> str:
+    return _normalized_quote_text(str(value or "")).replace(" ", "")
+
+
+def _column_field_aliases(column: Mapping[str, Any]) -> set[str]:
+    return {
+        _normalized_field_alias(text)
+        for text in _column_texts(column)
+        if _normalized_field_alias(text)
+    }
+
+
 def _column_matches_requested_output(
     column: Mapping[str, Any],
     requested_texts: set[str],
@@ -828,15 +968,11 @@ def _should_keep_key_output_column(
     column_blob = " ".join(_column_texts(column))
     looks_time_context = bool(_TIME_CONTEXT_FIELD_PATTERN.search(column_blob))
     looks_identity_context = bool(_IDENTITY_CONTEXT_FIELD_PATTERN.search(column_blob))
-    if role == "time_key" or (
-        role == "output_column" and looks_time_context
-    ):
+    if role == "time_key" or looks_time_context:
         return bool(_TIME_OUTPUT_PATTERN.search(original_request)) or (
             _column_matches_requested_output(column, requested_texts)
         )
-    if role in {"entity_key", "record_key"} or (
-        role == "output_column" and looks_identity_context
-    ):
+    if role in {"entity_key", "record_key"} or looks_identity_context:
         return bool(_IDENTITY_OUTPUT_PATTERN.search(original_request)) or (
             _column_matches_requested_output(column, requested_texts)
         )
@@ -948,6 +1084,10 @@ def _source_paths_from_execution_spec(execution_spec: Any) -> set[str]:
     }
 
 
+def _source_binding_section_key(binding: Mapping[str, Any]) -> str:
+    return str(binding.get("section_key") or "")
+
+
 def _canonicalize_semantic_source_bindings(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
@@ -970,7 +1110,7 @@ def _canonicalize_semantic_source_bindings(
     if not isinstance(output_columns, list):
         return request
     original_output_source_fields = {
-        _normalized_quote_text(str(field or ""))
+        _normalized_field_alias(field)
         for column in output_columns
         if isinstance(column, Mapping)
         for field in column.get("source_fields") or []
@@ -990,19 +1130,19 @@ def _canonicalize_semantic_source_bindings(
     if not plan_sources:
         return request
 
-    narrative_sources = _observed_narrative_sources_by_logical(request.state)
-    observed_sources_by_logical = _observed_sources_by_logical(request.state)
-    if not narrative_sources and not observed_sources_by_logical:
+    narrative_sources = _observed_narrative_sources_by_source_hint(request.state)
+    observed_sources_by_source_hint = _observed_sources_by_source_hint(request.state)
+    if not narrative_sources and not observed_sources_by_source_hint:
         return request
 
-    def narrative_paths_for_table(logical_table: str) -> list[str]:
-        logical_name = _normalized_quote_text(logical_table)
-        paths = narrative_sources.get(logical_name, [])
+    def narrative_paths_for_section(section_key: str) -> list[str]:
+        source_name_hint = _normalized_quote_text(section_key)
+        paths = narrative_sources.get(source_name_hint, [])
         if paths:
             return paths
         return [
             path
-            for path in observed_sources_by_logical.get(logical_name, [])
+            for path in observed_sources_by_source_hint.get(source_name_hint, [])
             if path.lower().endswith((".md", ".markdown", ".txt", ".pdf"))
         ]
 
@@ -1010,7 +1150,7 @@ def _canonicalize_semantic_source_bindings(
     knowledge_facts = parse_knowledge_content(discovery.knowledge_content)
     knowledge_facts_by_id = {str(fact.fact_id): fact for fact in knowledge_facts}
     output_field_aliases = {
-        _normalized_quote_text(str(column.get("name") or ""))
+        _normalized_field_alias(column.get("name"))
         for column in output_columns
         if isinstance(column, Mapping)
         and str(column.get("name") or "").strip()
@@ -1018,7 +1158,7 @@ def _canonicalize_semantic_source_bindings(
     output_field_aliases.update(original_output_source_fields)
     execution_spec_mapping = execution_spec if isinstance(execution_spec, Mapping) else {}
     binding_field_aliases = {
-        _normalized_quote_text(str(binding.get("source_field") or ""))
+        _normalized_field_alias(binding.get("source_field"))
         for binding in execution_spec_mapping.get("source_bindings") or []
         if isinstance(binding, Mapping)
         and str(binding.get("source_field") or "").strip()
@@ -1030,26 +1170,22 @@ def _canonicalize_semantic_source_bindings(
         fact = knowledge_facts_by_id.get(str(rule.get("fact_id") or ""))
         if (
             fact is not None
-            and fact.kind == "field"
-            and fact.logical_table
-            and fact.logical_field
+            and _knowledge_fact_defines_field(fact)
         ):
             cited_field_facts.append(fact)
     cited_target_facts = [
         fact
         for fact in cited_field_facts
         if len(cited_field_facts) == 1
-        or _normalized_quote_text(fact.logical_field or "") in output_field_aliases
-        or _normalized_quote_text(fact.logical_field or "") in binding_field_aliases
+        or _normalized_field_alias(fact.field_key) in output_field_aliases
+        or _normalized_field_alias(fact.field_key) in binding_field_aliases
     ]
 
     target_facts: list[Any] = []
     seen_fact_ids: set[str] = set()
     for fact in [*cited_target_facts, *knowledge_facts]:
         if not (
-            fact.kind == "field"
-            and fact.logical_table
-            and fact.logical_field
+            _knowledge_fact_defines_field(fact)
             and (
                 str(fact.fact_id) in {
                     str(item.fact_id) for item in cited_target_facts
@@ -1062,7 +1198,7 @@ def _canonicalize_semantic_source_bindings(
             )
         ):
             continue
-        observed_paths = narrative_paths_for_table(fact.logical_table)
+        observed_paths = narrative_paths_for_section(fact.section_key)
         if not observed_paths:
             continue
         if str(fact.fact_id) in seen_fact_ids:
@@ -1072,7 +1208,7 @@ def _canonicalize_semantic_source_bindings(
 
     bindings: list[dict[str, Any]] = []
     for fact in target_facts:
-        observed_paths = narrative_paths_for_table(fact.logical_table)
+        observed_paths = narrative_paths_for_section(fact.section_key)
         selected_paths = [
             path
             for path in observed_paths
@@ -1083,8 +1219,8 @@ def _canonicalize_semantic_source_bindings(
         bindings.append(
             {
                 "fact_id": fact.fact_id,
-                "logical_table": fact.logical_table,
-                "source_field": fact.logical_field,
+                "section_key": fact.section_key,
+                "source_field": fact.field_key,
                 "source_paths": selected_paths,
             }
         )
@@ -1104,7 +1240,7 @@ def _canonicalize_semantic_source_bindings(
         if str(source.get("path") or "").strip()
     }
     for binding in bindings:
-        logical_table = str(binding.get("logical_table") or "")
+        section_key = _source_binding_section_key(binding)
         source_field = str(binding.get("source_field") or "")
         for path in binding.get("source_paths") or []:
             source_path = str(path or "").replace("\\", "/")
@@ -1116,7 +1252,7 @@ def _canonicalize_semantic_source_bindings(
                     "observations": [
                         (
                             "Observed narrative source for "
-                            f"{logical_table}.{source_field}."
+                            f"{section_key}.{source_field}."
                         )
                     ],
                 }
@@ -1139,7 +1275,6 @@ def _canonicalize_semantic_source_bindings(
             continue
         updated_knowledge_rules.append(
             {
-                "rule_type": "semantic",
                 "source_path": fact.source_path,
                 "quote": fact.quote,
                 "fact_id": fact.fact_id,
@@ -1157,13 +1292,13 @@ def _canonicalize_semantic_source_bindings(
     updated_columns: list[Any] = []
     used_column_indexes: set[int] = set()
     for field in canonical_fields:
-        normalized_field = _normalized_quote_text(field)
+        normalized_field = _normalized_field_alias(field)
         selected_index: int | None = None
         for index, column in enumerate(output_columns):
             if index in used_column_indexes or not isinstance(column, Mapping):
                 continue
             source_fields = {
-                _normalized_quote_text(str(item or ""))
+                _normalized_field_alias(item)
                 for item in column.get("source_fields") or []
                 if str(item or "").strip()
             }
@@ -1245,7 +1380,7 @@ def _canonicalize_semantic_source_bindings(
     existing_keys = {
         (
             str(item.get("fact_id") or ""),
-            str(item.get("logical_table") or ""),
+            _source_binding_section_key(item),
             str(item.get("source_field") or ""),
         )
         for item in existing_bindings
@@ -1253,7 +1388,7 @@ def _canonicalize_semantic_source_bindings(
     for binding in bindings:
         key = (
             str(binding.get("fact_id") or ""),
-            str(binding.get("logical_table") or ""),
+            _source_binding_section_key(binding),
             str(binding.get("source_field") or ""),
         )
         if key not in existing_keys:
@@ -1425,7 +1560,7 @@ def _fact_matches_target_requirement(
         | _split_identifier_tokens(target_requirement_blob)
     )
     field_tokens = _canonical_semantic_concepts(
-        _split_identifier_tokens(str(fact.logical_field or ""))
+        _split_identifier_tokens(str(fact.field_key or ""))
     )
     quote_tokens = _canonical_semantic_concepts(
         _semantic_overlap_tokens(str(fact.quote or ""))
@@ -1433,7 +1568,7 @@ def _fact_matches_target_requirement(
     field_overlap = field_tokens & target_tokens
     quote_overlap = quote_tokens & target_tokens
     normalized_target = _normalized_quote_text(target_requirement_blob).replace(" ", "")
-    normalized_field = _normalized_quote_text(str(fact.logical_field or "")).replace(" ", "")
+    normalized_field = _normalized_quote_text(str(fact.field_key or "")).replace(" ", "")
     field_substring_overlap = {
         token
         for token in target_tokens
@@ -2001,7 +2136,7 @@ def _fact_targets_request(
     if target_requirement_blob.strip():
         field_blob = " ".join(
             str(item or "")
-            for item in (fact.logical_field, fact.quote)
+            for item in (fact.field_key, fact.quote)
         )
         request_time_terms = _time_overlap_terms(target_requirement_blob)
         fact_time_terms = _time_overlap_terms(field_blob)
@@ -2031,7 +2166,7 @@ def _fact_targets_request(
     )
     fact_blob = " ".join(
         str(item or "")
-        for item in (fact.logical_field, fact.logical_table, fact.quote)
+        for item in (fact.field_key, fact.section_key, fact.quote)
     )
     request_time_terms = _time_overlap_terms(request_blob)
     fact_time_terms = _time_overlap_terms(fact_blob)
@@ -2050,8 +2185,8 @@ def _fact_targets_request(
         _semantic_overlap_tokens(request_blob) | _split_identifier_tokens(request_blob)
     )
     table_concepts = _canonical_semantic_concepts(
-        _semantic_overlap_tokens(str(fact.logical_table or ""))
-        | _split_identifier_tokens(str(fact.logical_table or ""))
+        _semantic_overlap_tokens(str(fact.section_key or ""))
+        | _split_identifier_tokens(str(fact.section_key or ""))
     )
     return True
 
@@ -2059,9 +2194,25 @@ def _fact_targets_request(
 def _fact_has_time_terms(fact: Any) -> bool:
     fact_blob = " ".join(
         str(item or "")
-        for item in (fact.logical_field, fact.logical_table, fact.quote)
+        for item in (fact.field_key, fact.section_key, fact.quote)
     )
     return bool(_time_overlap_terms(fact_blob))
+
+
+def _fact_looks_like_context_key(fact: Any) -> bool:
+    fact_blob = " ".join(str(item or "") for item in (fact.field_key, fact.quote))
+    return bool(
+        _TIME_CONTEXT_FIELD_PATTERN.search(fact_blob)
+        or _IDENTITY_CONTEXT_FIELD_PATTERN.search(fact_blob)
+    )
+
+
+def _knowledge_fact_defines_field(fact: Any) -> bool:
+    return bool(
+        str(getattr(fact, "section_key", "") or "").strip()
+        and str(getattr(fact, "field_key", "") or "").strip()
+        and not str(getattr(fact, "operation", "") or "").strip()
+    )
 
 
 def _field_facts_for_knowledge_quote(
@@ -2300,12 +2451,6 @@ def _canonicalize_plan_quotes(
             if normalized_rule.get("source_path") != fact.source_path:
                 normalized_rule["source_path"] = fact.source_path
                 changed = True
-            if fact.kind == "field" and normalized_rule.get("rule_type") != "semantic":
-                normalized_rule["rule_type"] = "semantic"
-                changed = True
-        elif str(normalized_rule.get("rule_type") or "") == "field":
-            normalized_rule["rule_type"] = "semantic"
-            changed = True
         quote = str(rule.get("quote") or "").strip()
         canonical_quote = _canonical_knowledge_quote(
             str(normalized_rule.get("quote") or quote),
@@ -2608,23 +2753,23 @@ def _validate_plan_contract(
 
     knowledge_facts = parse_knowledge_content(discovery.knowledge_content)
     knowledge_facts_by_id = {fact.fact_id: fact for fact in knowledge_facts}
-    semantic_field_facts = [
+    field_definition_facts = [
         fact
         for fact in knowledge_facts
-        if fact.kind == "field" and fact.logical_field
+        if _knowledge_fact_defines_field(fact)
     ]
-    semantic_field_facts_by_quote: dict[str, list[Any]] = {}
-    for fact in semantic_field_facts:
-        semantic_field_facts_by_quote.setdefault(fact.quote, []).append(fact)
-    narrative_sources = _observed_narrative_sources_by_logical(request.state)
-    observed_sources_by_logical = _observed_sources_by_logical(request.state)
+    field_definition_facts_by_quote: dict[str, list[Any]] = {}
+    for fact in field_definition_facts:
+        field_definition_facts_by_quote.setdefault(fact.quote, []).append(fact)
+    narrative_sources = _observed_narrative_sources_by_source_hint(request.state)
+    observed_sources_by_source_hint = _observed_sources_by_source_hint(request.state)
     if knowledge_status in {"unavailable", "invalid"}:
         observed_fact_sources = sorted(
             {
                 path
                 for fact in knowledge_facts
                 for path in narrative_sources.get(
-                    _normalized_quote_text(fact.logical_table or ""),
+                    _normalized_quote_text(fact.section_key or ""),
                     [],
                 )
             }
@@ -2640,14 +2785,13 @@ def _validate_plan_contract(
                 ),
             )
     knowledge_rules = evidence.get("knowledge_rules") or []
-    rule_quotes_by_type: dict[str, set[str]] = {}
-    cited_semantic_field_facts: list[Any] = []
+    knowledge_rule_quotes: set[str] = set()
+    cited_field_definition_facts: list[Any] = []
     for rule in knowledge_rules:
         if not isinstance(rule, dict):
             continue
         source_path = str(rule.get("source_path") or "").replace("\\", "/")
         quote = str(rule.get("quote") or "").strip()
-        rule_type = str(rule.get("rule_type") or "")
         fact_id = str(rule.get("fact_id") or "").strip()
         if fact_id:
             fact = knowledge_facts_by_id.get(fact_id)
@@ -2672,18 +2816,14 @@ def _validate_plan_contract(
                     )
                 quote = quote or fact.quote
                 source_path = fact.source_path
-                if (
-                    rule_type == "semantic"
-                    and fact.kind == "field"
-                    and fact.logical_field
-                ):
-                    cited_semantic_field_facts.append(fact)
-        elif rule_type == "semantic":
-            cited_semantic_field_facts.extend(
-                semantic_field_facts_by_quote.get(quote)
+                if _knowledge_fact_defines_field(fact):
+                    cited_field_definition_facts.append(fact)
+        elif quote:
+            cited_field_definition_facts.extend(
+                field_definition_facts_by_quote.get(quote)
                 or _field_facts_for_knowledge_quote(
                     quote=quote,
-                    field_facts=semantic_field_facts,
+                    field_facts=field_definition_facts,
                 )
             )
         if (
@@ -2698,7 +2838,7 @@ def _validate_plan_contract(
                     "/context/knowledge.md."
                 ),
             )
-        rule_quotes_by_type.setdefault(rule_type, set()).add(quote)
+        knowledge_rule_quotes.add(quote)
 
     output_spec = arguments.get("output_spec") or {}
     if not isinstance(output_spec, Mapping):
@@ -2753,34 +2893,35 @@ def _validate_plan_contract(
     execution_sources = _source_paths_from_execution_spec(execution_spec)
     if knowledge_status == "authoritative":
         output_source_fields = {
-            _normalized_quote_text(str(field or ""))
+            _normalized_field_alias(field)
             for column in output_columns
             if isinstance(column, Mapping)
             for field in column.get("source_fields") or []
             if str(field or "").strip()
         }
         binding_source_fields = {
-            _normalized_quote_text(str(binding.get("source_field") or ""))
+            _normalized_field_alias(binding.get("source_field"))
             for binding in execution_spec.get("source_bindings") or []
             if isinstance(binding, Mapping)
             and str(binding.get("source_field") or "").strip()
         }
-        cited_fact_ids = {str(fact.fact_id) for fact in cited_semantic_field_facts}
+        cited_fact_ids = {str(fact.fact_id) for fact in cited_field_definition_facts}
         explicit_cited_target_facts = [
             fact
-            for fact in cited_semantic_field_facts
-            if len(cited_semantic_field_facts) == 1
-            or _normalized_quote_text(fact.logical_field or "") in output_source_fields
-            or _normalized_quote_text(fact.logical_field or "") in binding_source_fields
+            for fact in cited_field_definition_facts
+            if len(cited_field_definition_facts) == 1
+            or _normalized_field_alias(fact.field_key) in output_source_fields
+            or _normalized_field_alias(fact.field_key) in binding_source_fields
         ]
         automatic_target_field_facts = [
             fact
-            for fact in semantic_field_facts
+            for fact in field_definition_facts
             if _fact_targets_request(
                 fact=fact,
                 original_request=original_request,
                 requirements=requirements,
             )
+            and not _fact_looks_like_context_key(fact)
         ]
         request_target_field_facts: list[Any] = []
         seen_request_target_fact_ids: set[str] = set()
@@ -2791,12 +2932,12 @@ def _validate_plan_contract(
             seen_request_target_fact_ids.add(str(fact.fact_id))
         undiscovered_target_fields = sorted(
             {
-                f"{fact.logical_table}.{fact.logical_field}"
+                f"{fact.section_key}.{fact.field_key}"
                 for fact in request_target_field_facts
-                if fact.logical_table
+                if fact.section_key
                 and _fact_has_time_terms(fact)
-                if not observed_sources_by_logical.get(
-                    _normalized_quote_text(fact.logical_table or ""),
+                if not observed_sources_by_source_hint.get(
+                    _normalized_quote_text(fact.section_key or ""),
                     [],
                 )
             }
@@ -2807,21 +2948,21 @@ def _validate_plan_contract(
                 (
                     "request-target knowledge field facts require physical "
                     "binding discovery before planning; run query_schema or "
-                    "inspect the logical source first: "
+                    "inspect the source hint first: "
                     f"{undiscovered_target_fields}."
                 ),
             )
         observed_target_field_facts = [
             fact
             for fact in request_target_field_facts
-            if observed_sources_by_logical.get(
-                _normalized_quote_text(fact.logical_table or ""),
+            if observed_sources_by_source_hint.get(
+                _normalized_quote_text(fact.section_key or ""),
                 [],
             )
         ]
         uncited_target_fields = sorted(
             {
-                f"{fact.logical_table}.{fact.logical_field}"
+                f"{fact.section_key}.{fact.field_key}"
                 for fact in observed_target_field_facts
                 if str(fact.fact_id) not in cited_fact_ids
             }
@@ -2840,36 +2981,36 @@ def _validate_plan_contract(
             for fact in observed_target_field_facts
             if str(fact.fact_id) in cited_fact_ids
         ]
-        missing_logical_fields = sorted(
+        missing_field_keys = sorted(
             {
-                str(fact.logical_field)
+                str(fact.field_key)
                 for fact in target_field_facts
-                if _normalized_quote_text(fact.logical_field or "")
+                if _normalized_field_alias(fact.field_key)
                 not in output_source_fields
             }
         )
-        if missing_logical_fields:
+        if missing_field_keys:
             return _plan_error(
                 request,
                 (
                     "output columns authorized by knowledge field facts must "
-                    "cite those logical fields in source_fields; do not replace "
-                    f"them with semantic-neighbor fields: {missing_logical_fields}."
+                    "cite those field keys in source_fields; do not replace "
+                    f"them with semantic-neighbor fields: {missing_field_keys}."
                 ),
             )
         plan_sources = requested_sources | execution_sources
         missing_source_bindings = sorted(
             {
-                f"{fact.logical_table}.{fact.logical_field}"
+                f"{fact.section_key}.{fact.field_key}"
                 for fact in target_field_facts
                 if narrative_sources.get(
-                    _normalized_quote_text(fact.logical_table or ""),
+                    _normalized_quote_text(fact.section_key or ""),
                     [],
                 )
                 if not (
                     set(
                         narrative_sources.get(
-                            _normalized_quote_text(fact.logical_table or ""),
+                            _normalized_quote_text(fact.section_key or ""),
                             [],
                         )
                     )
@@ -2886,6 +3027,39 @@ def _validate_plan_contract(
                     f"execution_spec.sources: {missing_source_bindings}."
                 ),
             )
+        authorized_output_field_keys = {
+            _normalized_field_alias(fact.field_key)
+            for fact in target_field_facts
+            if str(fact.field_key or "").strip()
+        }
+        if authorized_output_field_keys:
+            requested_output_texts = _question_requested_output_texts(request.state)
+            unauthorized_measure_outputs = []
+            for column in output_columns:
+                if not isinstance(column, Mapping):
+                    continue
+                role = str(column.get("role") or "").casefold()
+                if role not in {"measure", "metric", "output_column"}:
+                    continue
+                column_aliases = _column_field_aliases(column)
+                if column_aliases & authorized_output_field_keys:
+                    continue
+                if _column_matches_requested_output(column, requested_output_texts):
+                    continue
+                unauthorized_measure_outputs.append(
+                    str(column.get("name") or sorted(column_aliases) or column)
+                )
+            if unauthorized_measure_outputs:
+                return _plan_error(
+                    request,
+                    (
+                        "final measure output columns must be authorized by "
+                        "the user target or a request-target knowledge field "
+                        "fact; move unrequested same-source fields to "
+                        "execution_spec.supporting_fields: "
+                        f"{unauthorized_measure_outputs}."
+                    ),
+                )
     if row_policy == "preserve" and not transformations:
         missing_source_fields = [
             str(column.get("name") or "")
@@ -2989,12 +3163,7 @@ def _validate_plan_contract(
 
     def knowledge_authorization_error(operation: str, quote: str) -> str | None:
         del operation
-        authorized_quotes = {
-            quote
-            for quotes in rule_quotes_by_type.values()
-            for quote in quotes
-        }
-        if not quote or quote not in authorized_quotes:
+        if not quote or quote not in knowledge_rule_quotes:
             return (
                 "knowledge authorization must cite an observed knowledge quote."
             )

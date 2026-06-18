@@ -7,7 +7,11 @@ from data_agent_baseline.agents.middleware import _fact_targets_request
 from data_agent_baseline.agents.middleware import _discovery_state
 from data_agent_baseline.agents.semantic_layer import query_semantic_context
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
-from data_agent_baseline.prompts.loader import build_task_prompt, read_knowledge_content
+from data_agent_baseline.prompts.loader import (
+    build_knowledge_bundle,
+    build_task_prompt,
+    read_knowledge_content,
+)
 from data_agent_baseline.tools.agent_tools.extract_narrative_records import _extract_rows
 from data_agent_baseline.tools.agent_tools.execute_python import (
     _try_preserve_source_projection,
@@ -35,7 +39,7 @@ def test_fact_target_matching_uses_field_level_evidence() -> None:
 
     assert _fact_targets_request(
         fact=SimpleNamespace(
-            logical_field="otherforeignassets",
+            field_key="otherforeignassets",
             quote="Foreign assets not classified as forex or gold",
         ),
         original_request=original_request,
@@ -43,7 +47,7 @@ def test_fact_target_matching_uses_field_level_evidence() -> None:
     )
     assert _fact_targets_request(
         fact=SimpleNamespace(
-            logical_field="abroadliability",
+            field_key="abroadliability",
             quote="Total liabilities owed to foreign entities",
         ),
         original_request=original_request,
@@ -51,7 +55,7 @@ def test_fact_target_matching_uses_field_level_evidence() -> None:
     )
     assert not _fact_targets_request(
         fact=SimpleNamespace(
-            logical_field="totalassets",
+            field_key="totalassets",
             quote="Total assets held by the monetary authority",
         ),
         original_request=original_request,
@@ -59,7 +63,7 @@ def test_fact_target_matching_uses_field_level_evidence() -> None:
     )
     assert not _fact_targets_request(
         fact=SimpleNamespace(
-            logical_field="forex",
+            field_key="forex",
             quote="Foreign exchange reserves held as assets",
         ),
         original_request=original_request,
@@ -79,8 +83,8 @@ def test_fact_target_matching_does_not_translate_cross_language_filters() -> Non
 
     assert not _fact_targets_request(
         fact=SimpleNamespace(
-            logical_table="ed_otherdepositorycorpbs",
-            logical_field="depositswithcentralbank",
+            section_key="ed_otherdepositorycorpbs",
+            field_key="depositswithcentralbank",
             quote="Reserves and deposits placed by ODCs at the central bank (PBoC)",
         ),
         original_request=original_request,
@@ -88,8 +92,8 @@ def test_fact_target_matching_does_not_translate_cross_language_filters() -> Non
     )
     assert not _fact_targets_request(
         fact=SimpleNamespace(
-            logical_table="ed_chinafibalancesheetrmb",
-            logical_field="corporatesavings",
+            section_key="ed_chinafibalancesheetrmb",
+            field_key="corporatesavings",
             quote="Name could imply investment savings | corporate deposit balances (存款), not investment",
         ),
         original_request=original_request,
@@ -97,8 +101,8 @@ def test_fact_target_matching_does_not_translate_cross_language_filters() -> Non
     )
     assert not _fact_targets_request(
         fact=SimpleNamespace(
-            logical_table="ed_moneyauthoritybs",
-            logical_field="reservedeposits",
+            section_key="ed_moneyauthoritybs",
+            field_key="reservedeposits",
             quote="Deposits held by banks at the monetary authority",
         ),
         original_request=original_request,
@@ -106,7 +110,7 @@ def test_fact_target_matching_does_not_translate_cross_language_filters() -> Non
     )
 
 
-def test_semantic_bindings_keep_logical_table_scope(tmp_path) -> None:
+def test_semantic_bindings_keep_section_scope(tmp_path) -> None:
     context = tmp_path / "context"
     doc_dir = context / "doc"
     csv_dir = context / "csv"
@@ -149,7 +153,7 @@ def test_semantic_bindings_keep_logical_table_scope(tmp_path) -> None:
     )
 
     assert [
-        fact["logical_field"]
+        fact["field_key"]
         for fact in semantic["knowledge_facts"]
     ] == ["depositswithcentralbank"]
     assert [
@@ -158,7 +162,7 @@ def test_semantic_bindings_keep_logical_table_scope(tmp_path) -> None:
     ] == ["/context/doc/ed_otherdepositorycorpbs.md"]
     assert [
         item["source_path"]
-        for item in semantic["logical_bindings"]["ed_otherdepositorycorpbs"]
+        for item in semantic["section_bindings"]["ed_otherdepositorycorpbs"]
     ] == ["/context/doc/ed_otherdepositorycorpbs.md"]
 
 
@@ -238,15 +242,22 @@ def test_task_prompt_injects_structured_knowledge_schema(tmp_path) -> None:
         TaskAssets(task_dir, context),
     )
 
-    prompt = build_task_prompt(task, question_structure="<structure>")
+    bundle = build_knowledge_bundle(context)
+    prompt = build_task_prompt(
+        task,
+        question_structure="<structure>",
+        knowledge_bundle=bundle,
+    )
 
     assert "<knowledge_schema>" in prompt
     assert "<context_knowledge>" not in prompt
     assert '"knowledge_status_for_plan": "authoritative"' in prompt
+    assert f'"content_hash": "{bundle.content_hash}"' in prompt
     assert '"binding_status": "narrative_only"' in prompt
     assert '"fact_id": "kf_1"' in prompt
-    assert '"logical_table": "example_table"' in prompt
+    assert '"section_key": "example_table"' in prompt
     assert '"source_path": "/context/doc/example_table.md"' in prompt
+    assert bundle.raw_content == read_knowledge_content(context)
     assert "| `MetricValue` | Target metric value |" in read_knowledge_content(context)
 
 

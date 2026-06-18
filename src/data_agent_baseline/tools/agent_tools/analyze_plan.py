@@ -33,7 +33,6 @@ RequirementType = Literal[
     "deduplication",
     "reshape",
 ]
-KnowledgeRuleType = Literal["semantic", "filter", "calculation", "output"]
 OutputColumnRole = Literal[
     "measure",
     "calculation",
@@ -134,7 +133,7 @@ class ExecutionOperation(TypedDict):
 
 class SourceBinding(TypedDict):
     fact_id: str
-    logical_table: str
+    section_key: str
     source_field: str
     source_paths: list[str]
 
@@ -147,9 +146,9 @@ class ExecutionSpec(TypedDict):
 
 
 class KnowledgeRule(TypedDict):
-    rule_type: KnowledgeRuleType
     quote: str
     source_path: str
+    rule_type: NotRequired[str]
     fact_id: NotRequired[str]
 
 
@@ -188,13 +187,6 @@ def _clean_text(value: object) -> str:
 
 def _clean_texts(items: list[str]) -> list[str]:
     return [text for item in items if (text := _clean_text(item))]
-
-
-def _normalize_rule_type(value: object) -> str:
-    rule_type = _clean_text(value)
-    if rule_type == "field":
-        return "semantic"
-    return rule_type
 
 
 @tool("analyze_plan", description=load_tool_prompt("analyze_plan"))
@@ -329,9 +321,13 @@ def analyze_plan_tool(
 
     knowledge_rules = [
         {
-            "rule_type": _normalize_rule_type(item["rule_type"]),
             "quote": _clean_text(item["quote"]),
             "source_path": _clean_text(item["source_path"]).replace("\\", "/"),
+            **(
+                {"rule_type": _clean_text(item.get("rule_type"))}
+                if "rule_type" in item and _clean_text(item.get("rule_type"))
+                else {}
+            ),
             **(
                 {"fact_id": _clean_text(item["fact_id"])}
                 if "fact_id" in item and _clean_text(item["fact_id"])
@@ -382,7 +378,7 @@ def analyze_plan_tool(
         source_bindings = [
             {
                 "fact_id": _clean_text(item.get("fact_id")),
-                "logical_table": _clean_text(item.get("logical_table")),
+                "section_key": _clean_text(item.get("section_key")),
                 "source_field": _clean_text(item.get("source_field")),
                 "source_paths": [
                     path.replace("\\", "/")

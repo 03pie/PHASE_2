@@ -285,7 +285,7 @@ def create_read_doc_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                     {
                         "path": payload["path"],
                         "source_type": "doc",
-                        "logical_name": resolved.stem,
+                        "source_name_hint": resolved.stem,
                         "line_count": len(lines),
                         "observed_line_start": payload["start_line"],
                         "observed_line_count": payload["returned_lines"],

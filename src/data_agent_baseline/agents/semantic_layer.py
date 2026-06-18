@@ -9,18 +9,6 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
-
-KnowledgeFactKind = Literal[
-    "logical_table",
-    "field",
-    "unit",
-    "join",
-    "calculation",
-    "filter_rule",
-    "ordering_rule",
-    "output_rule",
-    "example_query",
-]
 KnowledgeFactStatus = Literal[
     "usable",
     "binding_unresolved",
@@ -45,9 +33,9 @@ _TIME_EXPRESSION_PATTERN = re.compile(
 @dataclass(frozen=True)
 class KnowledgeFact:
     fact_id: str
-    kind: KnowledgeFactKind
-    logical_table: str | None
-    logical_field: str | None
+    kind: str
+    section_key: str | None
+    field_key: str | None
     operation: str | None
     quote: str
     source_path: str
@@ -56,7 +44,7 @@ class KnowledgeFact:
 
 @dataclass(frozen=True)
 class PhysicalBinding:
-    logical_name: str
+    source_name_hint: str
     source_path: str
     source_type: SourceType
     table_or_path: str
@@ -135,8 +123,8 @@ def _fact_related_to_query(
     if not query_norm:
         return True
     values = [
-        fact.logical_table or "",
-        fact.logical_field or "",
+        fact.section_key or "",
+        fact.field_key or "",
         fact.quote,
     ]
     if any(query_norm in _normalize_name(value) for value in values):
@@ -214,8 +202,8 @@ def _time_terms_from_text(text: str) -> list[str]:
 def _knowledge_fact_terms(fact: KnowledgeFact) -> list[str]:
     terms: list[str] = []
     for value in (
-        fact.logical_table,
-        fact.logical_field,
+        fact.section_key,
+        fact.field_key,
         fact.operation,
         fact.quote,
     ):
@@ -238,28 +226,28 @@ def _status_for_fact(
     fact: KnowledgeFact,
     bindings: Iterable[PhysicalBinding],
 ) -> KnowledgeFactStatus:
-    table = _normalize_name(fact.logical_table)
-    field = _normalize_name(fact.logical_field)
-    if not table and not field:
+    section = _normalize_name(fact.section_key)
+    field = _normalize_name(fact.field_key)
+    if not section and not field:
         return fact.status
-    table_bindings = [
+    section_bindings = [
         binding
         for binding in bindings
-        if table and _normalize_name(binding.logical_name) == table
+        if section and _normalize_name(binding.source_name_hint) == section
     ]
-    if table and not table_bindings:
+    if section and not section_bindings:
         return "binding_unresolved"
-    if field and table_bindings:
-        for binding in table_bindings:
+    if field and section_bindings:
+        for binding in section_bindings:
             fields = {_normalize_name(item) for item in binding.fields}
             if field in fields:
                 return fact.status
-            if any(item.casefold() == str(fact.logical_field or "").casefold() for item in binding.fields):
+            if any(item.casefold() == str(fact.field_key or "").casefold() for item in binding.fields):
                 return "usable"
-        if any(binding.source_type == "doc" for binding in table_bindings):
+        if any(binding.source_type == "doc" for binding in section_bindings):
             return "narrative_only"
         return "schema_conflict"
-    if table_bindings and any(binding.source_type == "doc" for binding in table_bindings):
+    if section_bindings and any(binding.source_type == "doc" for binding in section_bindings):
         return "narrative_only"
     return fact.status
 
@@ -270,17 +258,17 @@ def parse_knowledge_content(
     source_path: str = "/context/knowledge.md",
 ) -> tuple[KnowledgeFact, ...]:
     facts: list[KnowledgeFact] = []
-    current_table: str | None = None
+    current_section: str | None = None
     markdown_header: list[str] | None = None
     in_code = False
     code_lines: list[str] = []
 
     def append_fact(
-        kind: KnowledgeFactKind,
+        kind: str,
         quote: str,
         *,
-        logical_table: str | None = None,
-        logical_field: str | None = None,
+        section_key: str | None = None,
+        field_key: str | None = None,
         operation: str | None = None,
         status: KnowledgeFactStatus = "usable",
     ) -> None:
@@ -291,8 +279,8 @@ def parse_knowledge_content(
             KnowledgeFact(
                 fact_id=f"kf_{len(facts) + 1}",
                 kind=kind,
-                logical_table=logical_table or current_table,
-                logical_field=logical_field,
+                section_key=section_key or current_section,
+                field_key=field_key,
                 operation=operation,
                 quote=text,
                 source_path=source_path,
@@ -310,7 +298,7 @@ def parse_knowledge_content(
                 append_fact(
                     "example_query",
                     sql,
-                    logical_table=_table_from_sql(sql) or current_table,
+                    section_key=_table_from_sql(sql) or current_section,
                     operation=operation,
                 )
                 code_lines = []
@@ -320,7 +308,7 @@ def parse_knowledge_content(
             code_lines.append(line)
             continue
         if stripped.startswith("#"):
-            current_table = _infer_heading_table(stripped)
+            current_section = _infer_heading_table(stripped)
             continue
 
         row = _split_markdown_row(stripped)
@@ -333,9 +321,8 @@ def parse_knowledge_content(
                 markdown_header = row
                 continue
 
-            logical_table = current_table
-            logical_field = row[0].strip()
-            unit_value = ""
+            section_key = current_section
+            field_key = row[0].strip()
             if markdown_header:
                 header_cells = [cell.casefold() for cell in markdown_header]
 
@@ -347,31 +334,16 @@ def parse_knowledge_content(
 
                 table_index = find_header("表名", "table")
                 field_index = find_header("字段", "column", "field")
-                unit_index = find_header("单位", "unit")
                 if table_index is not None and table_index < len(row):
-                    logical_table = row[table_index].strip() or logical_table
+                    section_key = row[table_index].strip() or section_key
                 if field_index is not None and field_index < len(row):
-                    logical_field = row[field_index].strip()
-                if unit_index is not None and unit_index < len(row):
-                    unit_value = row[unit_index].strip()
-            if logical_field:
+                    field_key = row[field_index].strip()
+            if field_key:
                 append_fact(
                     "field",
                     stripped,
-                    logical_table=logical_table,
-                    logical_field=logical_field,
-                )
-            unit_cells = [
-                cell
-                for cell in ([unit_value] if unit_value else row[2:])
-                if cell and re.search(r"(unit|亿元|元|%|percent|date|time|股|年)", cell, re.IGNORECASE)
-            ]
-            if logical_field and unit_cells:
-                append_fact(
-                    "unit",
-                    stripped,
-                    logical_table=logical_table,
-                    logical_field=logical_field,
+                    section_key=section_key,
+                    field_key=field_key,
                 )
             continue
 
@@ -384,7 +356,7 @@ def parse_knowledge_content(
             append_fact(
                 "calculation",
                 stripped,
-                logical_field=fields[0] if fields else None,
+                field_key=fields[0] if fields else None,
                 operation="derive",
             )
             continue
@@ -393,7 +365,7 @@ def parse_knowledge_content(
             append_fact(
                 "filter_rule",
                 stripped,
-                logical_field=fields[0] if fields else None,
+                field_key=fields[0] if fields else None,
                 operation="filter",
             )
             continue
@@ -402,7 +374,7 @@ def parse_knowledge_content(
             append_fact(
                 "ordering_rule",
                 stripped,
-                logical_field=fields[0] if fields else None,
+                field_key=fields[0] if fields else None,
                 operation="sort",
             )
             continue
@@ -412,7 +384,7 @@ def parse_knowledge_content(
         append_fact(
             "example_query",
             sql,
-            logical_table=_table_from_sql(sql) or current_table,
+            section_key=_table_from_sql(sql) or current_section,
             operation=_operation_from_sql(sql),
         )
     return tuple(facts)
@@ -468,7 +440,7 @@ def index_context_sources(context_root: Path) -> tuple[PhysicalBinding, ...]:
                         fields = tuple(str(row[1]) for row in cursor.fetchall())
                         bindings.append(
                             PhysicalBinding(
-                                logical_name=table,
+                                source_name_hint=table,
                                 source_path=virtual,
                                 source_type="sqlite",
                                 table_or_path=table,
@@ -487,7 +459,7 @@ def index_context_sources(context_root: Path) -> tuple[PhysicalBinding, ...]:
                 continue
             bindings.append(
                 PhysicalBinding(
-                    logical_name=stem,
+                    source_name_hint=stem,
                     source_path=virtual,
                     source_type="csv",
                     table_or_path=virtual,
@@ -504,7 +476,7 @@ def index_context_sources(context_root: Path) -> tuple[PhysicalBinding, ...]:
             keys = tuple(dict.fromkeys(_iter_json_keys(data)))
             bindings.append(
                 PhysicalBinding(
-                    logical_name=stem,
+                    source_name_hint=stem,
                     source_path=virtual,
                     source_type="json",
                     table_or_path=virtual,
@@ -516,7 +488,7 @@ def index_context_sources(context_root: Path) -> tuple[PhysicalBinding, ...]:
         elif suffix in DOC_SUFFIXES:
             bindings.append(
                 PhysicalBinding(
-                    logical_name=stem,
+                    source_name_hint=stem,
                     source_path=virtual,
                     source_type="doc",
                     table_or_path=virtual,
@@ -528,10 +500,17 @@ def index_context_sources(context_root: Path) -> tuple[PhysicalBinding, ...]:
     return tuple(bindings)
 
 
-def build_semantic_context(context_root: Path) -> SemanticContext:
+def build_semantic_context(
+    context_root: Path,
+    *,
+    knowledge_content: str | None = None,
+) -> SemanticContext:
     knowledge_path = context_root / "knowledge.md"
     raw_facts: tuple[KnowledgeFact, ...] = ()
-    if knowledge_path.exists():
+    if knowledge_content is not None:
+        if knowledge_content and not knowledge_content.startswith("<unreadable:"):
+            raw_facts = parse_knowledge_content(knowledge_content)
+    elif knowledge_path.exists():
         try:
             raw_facts = parse_knowledge_content(
                 knowledge_path.read_text(encoding="utf-8", errors="replace")
@@ -545,8 +524,8 @@ def build_semantic_context(context_root: Path) -> SemanticContext:
         else KnowledgeFact(
             fact_id=fact.fact_id,
             kind=fact.kind,
-            logical_table=fact.logical_table,
-            logical_field=fact.logical_field,
+            section_key=fact.section_key,
+            field_key=fact.field_key,
             operation=fact.operation,
             quote=fact.quote,
             source_path=fact.source_path,
@@ -556,12 +535,15 @@ def build_semantic_context(context_root: Path) -> SemanticContext:
     )
 
     issues: list[str] = []
-    binding_names = {_normalize_name(binding.logical_name) for binding in bindings}
+    binding_names = {_normalize_name(binding.source_name_hint) for binding in bindings}
     for fact in facts:
-        table = _normalize_name(fact.logical_table)
-        if table and table not in binding_names:
+        section = _normalize_name(fact.section_key)
+        if section and section not in binding_names:
             issues.append(
-                f"Knowledge logical table {fact.logical_table!r} has no exact physical binding."
+                (
+                    "Knowledge section/source hint "
+                    f"{fact.section_key!r} has no exact physical binding."
+                )
             )
     return SemanticContext(facts=facts, bindings=bindings, issues=tuple(dict.fromkeys(issues)))
 
@@ -570,7 +552,7 @@ def _matches_query(binding: PhysicalBinding, query_norm: str) -> bool:
     if not query_norm:
         return False
     names = [
-        binding.logical_name,
+        binding.source_name_hint,
         Path(binding.table_or_path).stem,
         binding.table_or_path,
         *binding.fields,
@@ -587,13 +569,13 @@ def _matches_query(binding: PhysicalBinding, query_norm: str) -> bool:
 
 
 def _binding_score(binding: PhysicalBinding, query_norm: str) -> tuple[int, int, str]:
-    logical_norm = _normalize_name(binding.logical_name)
+    source_hint_norm = _normalize_name(binding.source_name_hint)
     field_norms = [_normalize_name(item) for item in binding.fields]
     type_rank = {"sqlite": 0, "csv": 1, "json": 2, "doc": 3}.get(binding.source_type, 9)
-    if logical_norm == query_norm:
+    if source_hint_norm == query_norm:
         return (0, type_rank, binding.source_path)
-    if logical_norm and (
-        logical_norm in query_norm or query_norm in logical_norm
+    if source_hint_norm and (
+        source_hint_norm in query_norm or query_norm in source_hint_norm
     ):
         return (1, type_rank, binding.source_path)
     if query_norm in field_norms:
@@ -714,8 +696,8 @@ def query_semantic_context(
         if not scope_norms:
             return False
         fact_values = [
-            fact.logical_table or "",
-            fact.logical_field or "",
+            fact.section_key or "",
+            fact.field_key or "",
             fact.quote,
         ]
         return any(
@@ -737,13 +719,13 @@ def query_semantic_context(
     ]
 
     for fact in related_facts:
-        fact_table = _normalize_name(fact.logical_table)
+        fact_section = _normalize_name(fact.section_key)
         if not query_norm:
             continue
-        if not fact_table:
+        if not fact_section:
             continue
         for binding in semantic.bindings:
-            if _normalize_name(binding.logical_name) != fact_table:
+            if _normalize_name(binding.source_name_hint) != fact_section:
                 continue
             key = (binding.source_path, binding.table_or_path)
             add_candidate_terms(binding, _knowledge_fact_terms(fact))
@@ -753,21 +735,21 @@ def query_semantic_context(
     candidates.sort(key=lambda binding: _binding_score(binding, query_norm))
     candidates = candidates[:max_matches]
 
-    logical_bindings: dict[str, list[dict[str, Any]]] = {}
-    logical_binding_keys: dict[str, set[tuple[str, str]]] = {}
+    section_bindings: dict[str, list[dict[str, Any]]] = {}
+    section_binding_keys: dict[str, set[tuple[str, str]]] = {}
     for fact in related_facts:
-        logical = fact.logical_table or fact.logical_field
-        if not logical:
+        section_or_field = fact.section_key or fact.field_key
+        if not section_or_field:
             continue
-        logical_norm = _normalize_name(logical)
-        if fact.logical_table:
+        section_or_field_norm = _normalize_name(section_or_field)
+        if fact.section_key:
             matches = [
                 binding
                 for binding in semantic.bindings
-                if _normalize_name(binding.logical_name) == logical_norm
+                if _normalize_name(binding.source_name_hint) == section_or_field_norm
             ]
         else:
-            field_norm = _normalize_name(fact.logical_field)
+            field_norm = _normalize_name(fact.field_key)
             matches = [
                 binding
                 for binding in semantic.bindings
@@ -777,14 +759,14 @@ def query_semantic_context(
         matches = matches[:5]
         if not matches:
             continue
-        logical_bindings.setdefault(logical, [])
-        seen = logical_binding_keys.setdefault(logical, set())
+        section_bindings.setdefault(section_or_field, [])
+        seen = section_binding_keys.setdefault(section_or_field, set())
         for binding in matches:
             key = (binding.source_path, binding.table_or_path)
             if key in seen:
                 continue
             seen.add(key)
-            logical_bindings[logical].append(
+            section_bindings[section_or_field].append(
                 _binding_payload(
                     binding,
                     context_root,
@@ -799,10 +781,12 @@ def query_semantic_context(
     ]
     for fact in related_facts:
         if fact.status in {"binding_unresolved", "schema_conflict", "narrative_only"}:
+            section_text = fact.section_key or ""
+            field_text = fact.field_key or ""
             binding_issues.append(
                 (
-                    f"{fact.fact_id} {fact.kind} {fact.logical_table or ''}."
-                    f"{fact.logical_field or ''} status={fact.status}"
+                    f"{fact.fact_id} {fact.kind} section={section_text} "
+                    f"field={field_text} status={fact.status}"
                 ).strip()
             )
 
@@ -815,10 +799,19 @@ def query_semantic_context(
             )
             for binding in candidates
         ],
-        "logical_bindings": logical_bindings,
+        "section_bindings": section_bindings,
         "binding_issues": list(dict.fromkeys(binding_issues))[:max_matches],
         "knowledge_facts": [
-            asdict(fact)
+            {
+                "fact_id": fact.fact_id,
+                "kind": fact.kind,
+                "section_key": fact.section_key,
+                "field_key": fact.field_key,
+                "operation": fact.operation,
+                "quote": fact.quote,
+                "source_path": fact.source_path,
+                "binding_status": fact.status,
+            }
             for fact in (related_facts or list(semantic.facts))[:max_matches]
         ],
     }
