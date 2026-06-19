@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import json
+import sqlite3
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -9,7 +12,13 @@ from langgraph.prebuilt import InjectedState
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.agents.semantic_layer import query_semantic_context
 from data_agent_baseline.prompts.loader import load_tool_prompt
-from data_agent_baseline.tools._helpers import error, query_context_schema, success
+from data_agent_baseline.tools._helpers import (
+    error,
+    query_context_schema,
+    quote_identifier,
+    success,
+    virtual_path,
+)
 from data_agent_baseline.tools.observed_sources import (
     observed_sources_command,
     sample_hash,
@@ -42,38 +51,187 @@ def _semantic_observed_sources(
     for candidate in semantic_matches.get("source_candidates") or []:
         if not isinstance(candidate, dict):
             continue
-        if str(candidate.get("source_type") or "") != "doc":
-            continue
         path = str(candidate.get("source_path") or "").replace("\\", "/")
-        line_evidence = candidate.get("line_evidence")
-        if not path or not isinstance(line_evidence, list) or not line_evidence:
+        source_type = str(candidate.get("source_type") or "")
+        if not path:
             continue
-        matched_lines = [
-            {
-                "line_number": item.get("line_number"),
-                "content": item.get("content"),
-                **(
-                    {"score": item.get("score")}
-                    if isinstance(item.get("score"), int)
-                    else {}
-                ),
-            }
-            for item in line_evidence
-            if isinstance(item, dict)
-        ][:10]
-        sources.append(
-            {
-                "path": path,
-                "source_type": "doc",
-                "source_name_hint": candidate.get("source_name_hint"),
-                "semantic_query": field_text,
-                "semantic_confidence": candidate.get("confidence"),
-                "matched_lines": matched_lines,
-                "sample_hash": sample_hash(matched_lines),
-                "observed_by": "query_schema",
-            }
-        )
+        if source_type == "doc":
+            line_evidence = candidate.get("line_evidence")
+            matched_lines = [
+                {
+                    "line_number": item.get("line_number"),
+                    "content": item.get("content"),
+                    **(
+                        {"score": item.get("score")}
+                        if isinstance(item.get("score"), int)
+                        else {}
+                    ),
+                }
+                for item in line_evidence
+                if isinstance(item, dict)
+            ][:10] if isinstance(line_evidence, list) else []
+            sources.append(
+                {
+                    "path": path,
+                    "source_type": "doc",
+                    "source_name_hint": candidate.get("source_name_hint"),
+                    "semantic_query": field_text,
+                    "semantic_confidence": candidate.get("confidence"),
+                    "evidence_type": (
+                        "line" if matched_lines else "source_candidate"
+                    ),
+                    "matched_lines": matched_lines,
+                    "sample_hash": sample_hash(matched_lines),
+                    "observed_by": "query_schema",
+                }
+            )
+            continue
+        fields = candidate.get("fields")
+        if source_type in {"csv", "json", "sqlite"} and isinstance(fields, list | tuple):
+            table_or_path = str(candidate.get("table_or_path") or "")
+            observed_path = (
+                f"{path}::{table_or_path}"
+                if source_type == "sqlite" and table_or_path
+                else path
+            )
+            sources.append(
+                {
+                    "path": observed_path,
+                    "source_type": (
+                        "sqlite_table" if source_type == "sqlite" else source_type
+                    ),
+                    "base_path": path if source_type == "sqlite" else None,
+                    "table": table_or_path if source_type == "sqlite" else None,
+                    "source_name_hint": candidate.get("source_name_hint"),
+                    "semantic_query": field_text,
+                    "semantic_confidence": candidate.get("confidence"),
+                    "fields": list(fields)[:80],
+                    "sample_hash": sample_hash(
+                        {
+                            "path": observed_path,
+                            "fields": list(fields)[:80],
+                            "confidence": candidate.get("confidence"),
+                        }
+                    ),
+                    "observed_by": "query_schema",
+                }
+            )
     return sources
+
+
+def _json_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        records = payload.get("records")
+        if isinstance(records, list):
+            return [record for record in records if isinstance(record, dict)]
+        for value in payload.values():
+            if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+                return list(value)
+    if isinstance(payload, list):
+        return [record for record in payload if isinstance(record, dict)]
+    return []
+
+
+def _value_matches(cell: Any, value_text: str) -> bool:
+    cell_text = str(cell)
+    return cell_text == value_text or (
+        len(value_text) >= 3 and value_text.casefold() in cell_text.casefold()
+    )
+
+
+def _query_value_evidence(
+    context_root: Path,
+    value_text: str,
+    *,
+    max_matches: int,
+) -> list[dict[str, Any]]:
+    if not value_text:
+        return []
+    evidence: list[dict[str, Any]] = []
+    for path in sorted(context_root.rglob("*.csv")):
+        try:
+            with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row_index, row in enumerate(reader, start=1):
+                    for column, cell in row.items():
+                        if _value_matches(cell, value_text):
+                            evidence.append(
+                                {
+                                    "source_type": "csv",
+                                    "source_path": virtual_path(path, context_root),
+                                    "field": column,
+                                    "row_number": row_index,
+                                    "sample_row": row,
+                                }
+                            )
+                            break
+                    if len(evidence) >= max_matches:
+                        return evidence
+        except (OSError, csv.Error):
+            continue
+
+    for path in sorted(context_root.rglob("*.json")):
+        try:
+            records = _json_records(json.loads(path.read_text(encoding="utf-8-sig")))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for row_index, row in enumerate(records, start=1):
+            for column, cell in row.items():
+                if _value_matches(cell, value_text):
+                    evidence.append(
+                        {
+                            "source_type": "json",
+                            "source_path": virtual_path(path, context_root),
+                            "field": column,
+                            "row_number": row_index,
+                            "sample_row": row,
+                        }
+                    )
+                    break
+            if len(evidence) >= max_matches:
+                return evidence
+
+    for path in sorted(
+        [
+            *context_root.rglob("*.sqlite"),
+            *context_root.rglob("*.db"),
+            *context_root.rglob("*.sqlite3"),
+        ]
+    ):
+        try:
+            with sqlite3.connect(str(path)) as connection:
+                connection.row_factory = sqlite3.Row
+                cursor = connection.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [str(row[0]) for row in cursor.fetchall()]
+                for table in tables:
+                    cursor.execute(f"PRAGMA table_info({quote_identifier(table)})")
+                    columns = [str(row[1]) for row in cursor.fetchall()]
+                    for column in columns:
+                        sql = (
+                            f"SELECT * FROM {quote_identifier(table)} "
+                            f"WHERE CAST({quote_identifier(column)} AS TEXT) = ? LIMIT 3"
+                        )
+                        try:
+                            cursor.execute(sql, (value_text,))
+                        except sqlite3.Error:
+                            continue
+                        rows = [dict(row) for row in cursor.fetchall()]
+                        for row in rows:
+                            evidence.append(
+                                {
+                                    "source_type": "sqlite",
+                                    "source_path": virtual_path(path, context_root),
+                                    "table": table,
+                                    "field": column,
+                                    "sample_row": row,
+                                }
+                            )
+                            if len(evidence) >= max_matches:
+                                return evidence
+        except sqlite3.Error:
+            continue
+    return evidence
 
 
 def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
@@ -87,6 +245,7 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
         tool_call_id: Annotated[str, InjectedToolCallId],
         state: Annotated[dict[str, Any], InjectedState],
         scope: str | None = None,
+        value: str | None = None,
         max_matches: int = 25,
     ) -> Any:
         """Run the query_schema tool."""
@@ -121,14 +280,45 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
             max_matches=max_matches,
             scope=scope_terms,
         )
+        value_terms = []
+        explicit_value = str(value or "").strip()
+        if explicit_value:
+            value_terms.append(explicit_value)
+        elif scope_terms:
+            value_terms.extend(scope_terms)
+        value_evidence: list[dict[str, Any]] = []
+        seen_value_evidence: set[tuple[str, str, str, str]] = set()
+        for value_term in value_terms:
+            for item in _query_value_evidence(
+                context_root,
+                value_term,
+                max_matches=max_matches,
+            ):
+                key = (
+                    str(item.get("source_path") or ""),
+                    str(item.get("table") or ""),
+                    str(item.get("field") or ""),
+                    str(item.get("row_number") or ""),
+                )
+                if key in seen_value_evidence:
+                    continue
+                seen_value_evidence.add(key)
+                value_evidence.append({**item, "matched_value": value_term})
+                if len(value_evidence) >= max_matches:
+                    break
+            if len(value_evidence) >= max_matches:
+                break
         message = success(
             name="query_schema",
             tool_call_id=tool_call_id,
             payload={
                 "field": field_text,
+                "value": str(value or "").strip() or None,
+                "value_search_terms": value_terms,
                 "scope": scope_terms,
                 "matches": matches,
                 "match_count": len(matches),
+                "value_evidence": value_evidence,
                 "source_candidates": semantic_matches["source_candidates"],
                 "section_bindings": semantic_matches["section_bindings"],
                 "binding_issues": semantic_matches["binding_issues"],
@@ -141,6 +331,21 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
             semantic_matches,
             field_text=field_text,
         )
+        for item in value_evidence:
+            path = str(item.get("source_path") or "").replace("\\", "/")
+            if not path:
+                continue
+            sources.append(
+                {
+                    "path": path,
+                    "source_type": item.get("source_type"),
+                    "table": item.get("table"),
+                    "fields": [item.get("field")] if item.get("field") else [],
+                    "value_evidence": [item],
+                    "sample_hash": sample_hash(item),
+                    "observed_by": "query_schema",
+                }
+            )
         if not sources:
             return message
         return observed_sources_command(

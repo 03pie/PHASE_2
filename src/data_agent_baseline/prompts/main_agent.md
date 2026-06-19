@@ -45,7 +45,7 @@
 - 转换类答案提交时，audit 至少包含 `source_paths` 和 `operations`；`set_answer` 会按提交表机械写入 `output_row_count` 和 `output_hash`。source path 必须来自当前计划声明的来源。
 - 如果 `set_answer` 因列形状或审计契约失败但候选表已生成，下一步优先修订计划或调用 `finalize_answer_candidate` 从候选列中投影提交；不要从记忆重造同一答案。
 - 如果 knowledge 指向的逻辑表不在 SQLite 中，先调用 `query_schema` 并检查同 basename 的 CSV、JSON、doc/Markdown/PDF 来源，再判断 knowledge 是否只缺少物理绑定；不要直接退到语义相邻但字段不同的指标。
-- 如果 `analysis_plan.execution_spec.source_bindings` 将最终 `source_field` 绑定到 doc/Markdown/PDF 叙述来源，先用 `grep_file` 定位候选行，再用 `read_doc(start_line, max_lines)` 分批读取小切片；执行阶段调用 `extract_narrative_records(source_path, source_field, start_line, end_line)` 从确认后的绑定切片生成答案候选。不要用语义相邻 JSON/CSV 字段替代已绑定的叙述来源。
-- 字典表要匹配事件表领域：`D_LABITEMS` 对应 `LABEVENTS`；`D_ITEMS.LINKSTO` 指向它关联的事件表或文件。不要用另一个字典表里的相似 label 替代已命中的字典域。
+- 如果 knowledge 指向 doc/Markdown/PDF 叙述来源，`field_key` 只是抽取目标，不是已存在列。先用 `grep_file` 定位候选行，再用 `read_doc(start_line, max_lines)` 分批读取小切片；执行阶段调用 `extract_narrative_records(source_path, source_field=...)` 或 `extract_narrative_records(source_path, source_fields=[...])` 让工具报告抽取字段和行证据。不要用叙述定义表格推断物理列。
+- 字典表、维表或映射表只能在 observed schema、共享键、外键、link 字段或样例行证明可连接时使用；不要用相似 label 替代已命中的数据域。
 - 子代理工具只用于独立、复杂、可隔离的子任务；给子代理明确候选来源、目标、期望输出和验证要求。子代理报告必须由主代理再验证。
 - 不要在模型回复中打印完整结果表；最终表格必须由 `set_answer` 或候选恢复工具写入状态。

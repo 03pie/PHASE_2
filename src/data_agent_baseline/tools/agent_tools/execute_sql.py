@@ -144,14 +144,34 @@ def _sqlite_table_sources(
     table_names: list[str],
     read_tables: set[str],
 ) -> list[dict[str, Any]]:
+    columns_by_table: dict[str, list[str]] = {}
+    for table_name in table_names:
+        try:
+            cursor.execute(f"PRAGMA table_info({quote_identifier(table_name)})")
+            columns_by_table[table_name] = [str(row[1]) for row in cursor.fetchall()]
+        except sqlite3.Error:
+            columns_by_table[table_name] = []
+    observed_tables = [
+        table_name for table_name in table_names if table_name in read_tables
+    ]
+    field_to_tables: dict[str, list[str]] = {}
+    for table_name in observed_tables:
+        for field in columns_by_table.get(table_name, []):
+            field_to_tables.setdefault(field.casefold(), [])
+            if table_name not in field_to_tables[field.casefold()]:
+                field_to_tables[field.casefold()].append(table_name)
+    join_evidence = [
+        {"field": field, "tables": tables}
+        for field, tables in sorted(field_to_tables.items())
+        if len(tables) > 1
+    ][:20]
     sources: list[dict[str, Any]] = [
         {
             "path": base_path,
             "source_type": "sqlite",
             "tables": table_names,
-            "observed_tables": [
-                table_name for table_name in table_names if table_name in read_tables
-            ],
+            "observed_tables": observed_tables,
+            "join_evidence": join_evidence,
             "observed_by": "execute_sql",
         }
     ]

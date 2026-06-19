@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,7 @@ from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
 
 _REPLACE_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
+_TIMEOUT_TRACE_GRACE_SECONDS = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,8 +148,17 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
     buffer = StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(columns)
-    writer.writerows(rows)
+    writer.writerows(
+        [
+            [_csv_cell_value(cell) for cell in row]
+            for row in rows
+        ]
+    )
     _write_text_file(path, buffer.getvalue(), fallback_direct=False)
+
+
+def _csv_cell_value(value: Any) -> Any:
+    return value
 
 
 def _is_prepared_answer(value: Any) -> bool:
@@ -161,6 +172,28 @@ def _is_prepared_answer(value: Any) -> bool:
         and isinstance(rows, list)
         and bool(rows)
     )
+
+
+def _trace_has_prepared_answer(trace_path: Path) -> bool:
+    if not trace_path.exists():
+        return False
+    try:
+        payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and _is_prepared_answer(payload.get("answer"))
+
+
+def _wait_for_prepared_answer_trace(
+    trace_path: Path,
+    *,
+    timeout_seconds: float,
+) -> None:
+    deadline = perf_counter() + timeout_seconds
+    while perf_counter() < deadline:
+        if _trace_has_prepared_answer(trace_path):
+            return
+        time.sleep(0.05)
 
 
 def _failure_run_result_payload(
@@ -314,26 +347,45 @@ def _run_single_task_with_timeout(
     )
     process.start()
     send_connection.close()
-    deadline = perf_counter() + timeout_seconds
     result: dict[str, Any] | None = None
+    timed_out = False
+
+    def expire() -> None:
+        nonlocal timed_out
+        timed_out = True
+        try:
+            receive_connection.close()
+        except OSError:
+            pass
+        _wait_for_prepared_answer_trace(
+            trace_path,
+            timeout_seconds=_TIMEOUT_TRACE_GRACE_SECONDS,
+        )
+        if process.is_alive():
+            _terminate_process_tree(process)
+
+    timer = threading.Timer(timeout_seconds, expire)
+    timer.daemon = True
+    timer.start()
 
     try:
-        while perf_counter() < deadline:
-            remaining_seconds = deadline - perf_counter()
-            if receive_connection.poll(min(0.1, max(remaining_seconds, 0.0))):
-                try:
-                    received = receive_connection.recv()
-                except EOFError:
-                    break
-                if isinstance(received, dict):
-                    result = received
-                break
-            if not process.is_alive():
-                break
+        received = receive_connection.recv()
+        if isinstance(received, dict):
+            result = received
+    except (BrokenPipeError, EOFError, OSError):
+        result = None
     finally:
-        receive_connection.close()
+        timer.cancel()
+        try:
+            receive_connection.close()
+        except OSError:
+            pass
 
-    if result is None and process.is_alive():
+    if timed_out and result is None:
+        _wait_for_prepared_answer_trace(
+            trace_path,
+            timeout_seconds=_TIMEOUT_TRACE_GRACE_SECONDS,
+        )
         _stop_process(process)
         return _failure_run_result_payload(
             task_id,

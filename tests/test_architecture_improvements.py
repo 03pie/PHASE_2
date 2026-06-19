@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
-from data_agent_baseline.agents.middleware import _fact_targets_request
 from data_agent_baseline.agents.middleware import _discovery_state
+from data_agent_baseline.agents.middleware import _recover_analyze_plan_tagged_arguments
 from data_agent_baseline.agents.semantic_layer import query_semantic_context
 from data_agent_baseline.benchmark.schema import PublicTask, TaskAssets, TaskRecord
 from data_agent_baseline.prompts.loader import (
@@ -12,102 +11,15 @@ from data_agent_baseline.prompts.loader import (
     build_task_prompt,
     read_knowledge_content,
 )
-from data_agent_baseline.tools.agent_tools.extract_narrative_records import _extract_rows
+from data_agent_baseline.tools.agent_tools.extract_narrative_records import (
+    _coerce_string_list,
+    _extract_multi_field_rows,
+    _extract_rows,
+)
 from data_agent_baseline.tools.agent_tools.execute_python import (
     _try_preserve_source_projection,
 )
 from data_agent_baseline.tools.answer import validate_prepared_answer
-
-
-def test_fact_target_matching_uses_field_level_evidence() -> None:
-    requirements = [
-        {
-            "quote": "其他国外资产和国外负债的数据记录",
-            "statement": "Other foreign assets and foreign liabilities data records",
-            "requirement_type": "measure",
-        },
-        {
-            "quote": "还是在货币当局资产负债表中",
-            "statement": "monetary authority balance sheet",
-            "requirement_type": "entity",
-        },
-    ]
-    original_request = (
-        "你好，那你再查一下对其他国外资产和国外负债的数据记录，"
-        "还是在货币当局资产负债表中"
-    )
-
-    assert _fact_targets_request(
-        fact=SimpleNamespace(
-            field_key="otherforeignassets",
-            quote="Foreign assets not classified as forex or gold",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
-    assert _fact_targets_request(
-        fact=SimpleNamespace(
-            field_key="abroadliability",
-            quote="Total liabilities owed to foreign entities",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
-    assert not _fact_targets_request(
-        fact=SimpleNamespace(
-            field_key="totalassets",
-            quote="Total assets held by the monetary authority",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
-    assert not _fact_targets_request(
-        fact=SimpleNamespace(
-            field_key="forex",
-            quote="Foreign exchange reserves held as assets",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
-
-
-def test_fact_target_matching_does_not_translate_cross_language_filters() -> None:
-    requirements = [
-        {
-            "quote": "准备金存款",
-            "statement": "Filter by '准备金存款' item",
-            "requirement_type": "filter",
-        }
-    ]
-    original_request = "列出准备金存款在其他存款性公司资产负债表中的数据记录"
-
-    assert not _fact_targets_request(
-        fact=SimpleNamespace(
-            section_key="ed_otherdepositorycorpbs",
-            field_key="depositswithcentralbank",
-            quote="Reserves and deposits placed by ODCs at the central bank (PBoC)",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
-    assert not _fact_targets_request(
-        fact=SimpleNamespace(
-            section_key="ed_chinafibalancesheetrmb",
-            field_key="corporatesavings",
-            quote="Name could imply investment savings | corporate deposit balances (存款), not investment",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
-    assert not _fact_targets_request(
-        fact=SimpleNamespace(
-            section_key="ed_moneyauthoritybs",
-            field_key="reservedeposits",
-            quote="Deposits held by banks at the monetary authority",
-        ),
-        original_request=original_request,
-        requirements=requirements,
-    )
 
 
 def test_semantic_bindings_keep_section_scope(tmp_path) -> None:
@@ -217,6 +129,64 @@ def test_narrative_extractor_uses_field_value_across_line_breaks() -> None:
     assert evidence[0]["line_number"] == 1
 
 
+def test_narrative_extractor_handles_before_quantity_and_percentage_records() -> None:
+    rows, evidence, stats = _extract_multi_field_rows(
+        [
+            "记录 1 的转让方为甲。交易前，该实体持有 2,441,732 股，占总股本的 1.55%。交易后，其持股数降至 2,141,732 股，持股比例为 1.36%。",
+            "记录 2 的转让方信息缺失。其交易前后的持股数量与比例也无法确定。",
+        ],
+        source_fields=["sumbeforetran", "pctbeforetran"],
+        field_aliases=None,
+        record_anchor="转让方",
+        start_line=None,
+        end_line=None,
+        max_records=10,
+    )
+
+    assert rows == [[2441732.0, 0.0155], ["", ""]]
+    assert [item["line_number"] for item in evidence] == [1, 2]
+    assert stats["missing_counts"] == {
+        "sumbeforetran": 1,
+        "pctbeforetran": 1,
+    }
+
+
+def test_narrative_extractor_coerces_json_string_field_lists() -> None:
+    assert _coerce_string_list('["field_a", "field_b"]') == [
+        "field_a",
+        "field_b",
+    ]
+    assert _coerce_string_list("field_a|field_b") == ["field_a", "field_b"]
+
+
+def test_sql_knowledge_examples_expose_join_operation(tmp_path) -> None:
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "knowledge.md").write_text(
+        "\n".join(
+            [
+                "```sql",
+                "SELECT a.key, COUNT(*)",
+                "FROM source_a AS a",
+                "JOIN source_b AS b ON a.key = b.key",
+                "WHERE b.metric > 10",
+                "GROUP BY a.key;",
+                "```",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    semantic = query_semantic_context(context, "metric distribution", max_matches=10)
+
+    operations = {
+        fact["operation"]
+        for fact in semantic["knowledge_facts"]
+        if fact["kind"] == "example_query"
+    }
+    assert "join,filter,aggregate" in operations
+
+
 def test_task_prompt_injects_structured_knowledge_schema(tmp_path) -> None:
     task_dir = tmp_path / "task"
     context = task_dir / "context"
@@ -259,6 +229,58 @@ def test_task_prompt_injects_structured_knowledge_schema(tmp_path) -> None:
     assert '"source_path": "/context/doc/example_table.md"' in prompt
     assert bundle.raw_content == read_knowledge_content(context)
     assert "| `MetricValue` | Target metric value |" in read_knowledge_content(context)
+
+
+def test_task_prompt_focuses_knowledge_schema_sections(tmp_path) -> None:
+    task_dir = tmp_path / "task"
+    context = task_dir / "context"
+    doc_dir = context / "doc"
+    json_dir = context / "json"
+    doc_dir.mkdir(parents=True)
+    json_dir.mkdir()
+    (context / "knowledge.md").write_text(
+        "\n".join(
+            [
+                "### Primary Metrics (`metric_source`)",
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                "| `targetmetric` | Target metric value |",
+                "",
+                "```sql",
+                "SELECT targetmetric FROM metric_source;",
+                "```",
+                "",
+                "### Neighbor Metrics (`metric_neighbor`)",
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                "| `othermetric` | Unrelated neighbor value |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (doc_dir / "metric_source.md").write_text("targetmetric was 42.", encoding="utf-8")
+    (json_dir / "metric_neighbor.json").write_text(
+        '{"records":[{"OtherMetric": 7}]}',
+        encoding="utf-8",
+    )
+    task = PublicTask(
+        TaskRecord("task_focused_schema", "public", "Show target metric records."),
+        TaskAssets(task_dir, context),
+    )
+
+    prompt = build_task_prompt(
+        task,
+        question_structure='{"output":{"requested_columns":["target_metric"]}}',
+        knowledge_bundle=build_knowledge_bundle(context),
+    )
+    schema_text = prompt.split("<knowledge_schema>", 1)[1].split(
+        "</knowledge_schema>",
+        1,
+    )[0]
+
+    assert '"section_key": "metric_source"' in schema_text
+    assert '"section_key": "metric_neighbor"' not in schema_text
+    assert '"focus"' in schema_text
 
 
 def test_discovery_uses_state_knowledge_without_raw_prompt() -> None:
@@ -305,6 +327,107 @@ def test_answer_validation_projects_demoted_supporting_columns() -> None:
     assert answer is not None
     assert answer.columns == ["ThirdIndustryGDP"]
     assert answer.rows == [[144528.0], [74565.0]]
+
+
+def test_answer_validation_rejects_ambiguous_structured_cell_projection() -> None:
+    plan = {
+        "output_spec": {
+            "columns": [
+                {"name": "company", "source_fields": ["Commission", "ChiNameAbbr"]}
+            ],
+            "row_policy": "transform",
+            "transformations": [
+                {
+                    "operation": "sort",
+                    "description": "Select the row authorized by the user.",
+                    "authorization": {"source": "user", "quote": "highest"},
+                }
+            ],
+            "expected_row_count": 1,
+        },
+        "evidence": {
+            "context_sources": [{"path": "/context/json/lc_financialexpense.json"}],
+        },
+        "execution_spec": {
+            "sources": [{"path": "/context/json/lc_financialexpense.json"}],
+            "operations": [
+                {
+                    "operation": "sort",
+                    "description": "Sort by Commission.",
+                    "authorization": {"source": "user", "quote": "highest"},
+                }
+            ],
+        },
+    }
+    columns = ["company"]
+    rows = [[{"Commission": 144059466.29, "ChiNameAbbr": "广汇能源"}]]
+    audit = {
+        "source_paths": ["/context/json/lc_financialexpense.json"],
+        "operations": ["sort by Commission desc", "limit 1"],
+    }
+
+    answer, error = validate_prepared_answer(columns, rows, plan, audit)
+
+    assert answer is None
+    assert error is not None
+    assert "could not be uniquely projected" in error
+    assert "Commission" in error
+    assert "ChiNameAbbr" in error
+
+
+def test_answer_validation_uses_unique_source_field_as_final_column() -> None:
+    plan = {
+        "output_spec": {
+            "columns": [
+                {
+                    "name": "annualized_2yr_return",
+                    "source_fields": ["AnnualizedRRInTwoYear"],
+                }
+            ],
+            "row_policy": "preserve",
+            "transformations": [],
+            "expected_row_count": 2,
+        }
+    }
+
+    answer, error = validate_prepared_answer(
+        ["annualized_2yr_return"],
+        [[15.97], [-6.42]],
+        plan,
+    )
+
+    assert error is None
+    assert answer is not None
+    assert answer.columns == ["AnnualizedRRInTwoYear"]
+
+
+def test_recovers_plan_sections_from_mixed_json_and_tags() -> None:
+    recovered = _recover_analyze_plan_tagged_arguments(
+        {
+            "evidence": {
+                "knowledge_status": "unavailable",
+                "knowledge_rules": [],
+                "context_sources": [{"path": "/context/db/sub_db.sqlite::treatment"}],
+            },
+            "execution_spec": (
+                '{"sources":[{"path":"/context/db/sub_db.sqlite::treatment"}],'
+                '"operations":[{"operation":"limit","authorization":'
+                '{"source":"user","quote":"first"}}]}'
+                "\n<intent>\n"
+                '{"requirements":[{"quote":"first","requirement_type":"limit"}],'
+                '"unresolved":[]}'
+                "\n</intent>\n<output_spec>\n"
+                '{"columns":[{"name":"first_procedure_time",'
+                '"source_fields":["treatmenttime"]}],'
+                '"row_policy":"transform","transformations":[]}'
+                "\n</output_spec>"
+            ),
+        }
+    )
+
+    assert recovered["execution_spec"]["operations"][0]["operation"] == "limit"
+    assert recovered["intent"]["requirements"][0]["quote"] == "first"
+    assert recovered["output_spec"]["columns"][0]["source_fields"] == ["treatmenttime"]
 
 
 def test_preserve_source_projection_uses_plan_columns(tmp_path) -> None:

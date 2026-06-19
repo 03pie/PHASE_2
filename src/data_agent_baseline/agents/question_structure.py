@@ -120,7 +120,7 @@ def _fallback_structure(question: str, *, reason: str) -> dict[str, Any]:
             "requested_columns": [],
             "preserve_source_rows": "unknown",
         },
-        "intent_operators": _detect_intent_operators(question),
+        "intent_operators": [],
         "ambiguities": [reason],
     }
 
@@ -156,31 +156,68 @@ _CONDITION_TYPE_BY_KEY = {
     "output_columns": "output_column",
 }
 
-_INTENT_OPERATOR_PATTERNS: tuple[tuple[str, str, str], ...] = (
-    ("分布", "aggregate", "distribution"),
-    ("distribution", "aggregate", "distribution"),
-    ("平均", "aggregate", "average"),
-    ("均值", "aggregate", "average"),
-    ("average", "aggregate", "average"),
-    ("mean", "aggregate", "average"),
-    ("最高", "sort", "selector"),
-    ("最大", "sort", "selector"),
-    ("最低", "sort", "selector"),
-    ("最小", "sort", "selector"),
-    ("最近", "sort", "selector"),
-    ("最新", "sort", "selector"),
-    ("highest", "sort", "selector"),
-    ("maximum", "sort", "selector"),
-    ("minimum", "sort", "selector"),
-    ("most recent", "sort", "selector"),
-    ("first", "limit", "selector"),
-    ("last", "limit", "selector"),
-)
+_OPERATIONS_BY_REQUIREMENT_TYPE = {
+    "entity": {"filter"},
+    "filter": {"filter"},
+    "scope": {"filter"},
+    "time_range": {"filter"},
+    "value": {"filter"},
+    "grouping": set(),
+    "ordering": {"sort"},
+    "selector": {"limit", "sort"},
+    "limit": {"limit"},
+    "calculation": {"aggregate", "derive"},
+    "deduplication": {"deduplicate"},
+    "reshape": {"reshape"},
+}
 
+_REQUIREMENT_TYPE_BY_TARGET_CONSTRAINT = {
+    "entity": "entity",
+    "filter": "filter",
+    "geography": "scope",
+    "scope": "scope",
+    "source_scope": "scope",
+    "table_scope": "scope",
+    "time_range": "time_range",
+    "value": "value",
+    "grouping": "grouping",
+    "ordering": "ordering",
+    "limit": "limit",
+    "selector": "selector",
+    "output_shape": "reshape",
+    "calculation": "calculation",
+    "aggregate_min": "calculation",
+    "aggregate_max": "calculation",
+    "aggregate_sum": "calculation",
+    "aggregate_avg": "calculation",
+    "aggregate_average": "calculation",
+    "aggregate_count": "calculation",
+}
+
+_SELECTOR_EXPRESSION_PATTERN = re.compile(
+    (
+        r"\b(?:argmax|argmin|max|min)\s*\(|"
+        r"\b(?:maximum|minimum|highest|lowest|first|last|latest|earliest)\b|"
+        r"\bmost[\s_-]+recent\b"
+    ),
+    re.IGNORECASE,
+)
+_DISTRIBUTION_OPERATOR_PATTERN = re.compile(
+    r"\bdistribution\b|\bfrequency\b|\bbreakdown\b|分布|频数|频率|占比|比例分布",
+    re.IGNORECASE,
+)
 
 def _exact_substring(value: Any, question: str) -> str | None:
     text = str(value or "").strip()
-    return text if text and text in question else None
+    if not text or text not in question:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9]+", text):
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_-]){re.escape(text)}(?![A-Za-z0-9_-])"
+        )
+        if pattern.search(question) is None:
+            return None
+    return text
 
 
 def _condition_value(item: Any) -> str:
@@ -215,45 +252,52 @@ def _normalize_condition_item(item: Any, *, key: str, question: str) -> dict[str
     }
 
 
-def _detect_intent_operators(question: str) -> list[dict[str, str]]:
-    operators: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    question_folded = question.casefold()
-    for token, operation, operator_type in _INTENT_OPERATOR_PATTERNS:
-        index = question_folded.find(token.casefold())
-        if index < 0:
+def _condition_explicit_quote(item: Mapping[str, Any], question: str) -> str | None:
+    quote = _exact_substring(item.get("quote"), question)
+    explicitness = str(item.get("explicitness") or "")
+    if not quote or explicitness not in {"", "explicit"}:
+        return None
+    return quote
+
+
+def _constraint_requirement_type(item: Mapping[str, Any]) -> str | None:
+    constraint_type = str(item.get("constraint_type") or "")
+    value = str(item.get("value") or "")
+    quote = str(item.get("quote") or "")
+    if constraint_type in {"filter", "ordering"} and _SELECTOR_EXPRESSION_PATTERN.search(
+        f"{quote} {value}"
+    ):
+        return "selector"
+    return _REQUIREMENT_TYPE_BY_TARGET_CONSTRAINT.get(constraint_type)
+
+
+def _authorized_operations_by_quote(structure: Mapping[str, Any], question: str) -> dict[str, set[str]]:
+    operations_by_quote: dict[str, set[str]] = {}
+    conditions = _dict_value(structure.get("conditions"))
+    for container_name, requirement_type in _CONDITION_TYPE_BY_KEY.items():
+        operations = _OPERATIONS_BY_REQUIREMENT_TYPE.get(requirement_type, set())
+        if not operations:
             continue
-        quote = question[index : index + len(token)]
-        key = (quote, operation)
-        if key in seen:
+        for item in _list_value(conditions.get(container_name)):
+            if not isinstance(item, Mapping):
+                continue
+            quote = _condition_explicit_quote(item, question)
+            if quote:
+                operations_by_quote.setdefault(quote, set()).update(operations)
+
+    for item in _list_value(structure.get("target_constraints")):
+        if not isinstance(item, Mapping):
             continue
-        seen.add(key)
-        operators.append(
-            {
-                "quote": quote,
-                "operation": operation,
-                "operator_type": operator_type,
-            }
+        quote = _exact_substring(item.get("quote"), question)
+        if not quote or str(item.get("explicitness") or "") != "explicit":
+            continue
+        requirement_type = _constraint_requirement_type(item)
+        if requirement_type is None:
+            continue
+        operations_by_quote.setdefault(quote, set()).update(
+            _OPERATIONS_BY_REQUIREMENT_TYPE.get(requirement_type, set())
         )
-        if operator_type == "selector" and operation == "sort":
-            limit_key = (quote, "limit")
-            if limit_key not in seen:
-                seen.add(limit_key)
-                operators.append(
-                    {
-                        "quote": quote,
-                        "operation": "limit",
-                        "operator_type": operator_type,
-                    }
-                )
-    return operators
-
-
-def _explicit_operator_keys(question: str) -> set[tuple[str, str]]:
-    return {
-        (item["quote"], item["operation"])
-        for item in _detect_intent_operators(question)
-    }
+    return operations_by_quote
 
 
 def _target_requests_source_records(targets: list[Any], question: str) -> bool:
@@ -265,6 +309,23 @@ def _target_requests_source_records(targets: list[Any], question: str) -> bool:
     ):
         return True
     return False
+
+
+def _singular_which_target_quote(targets: list[Any], question: str) -> str | None:
+    for target in targets:
+        if not isinstance(target, Mapping):
+            continue
+        quote = str(target.get("quote") or "").strip()
+        if not quote or not _exact_substring(quote, question):
+            continue
+        normalized = quote.casefold()
+        if not normalized.startswith("which "):
+            continue
+        head = normalized.removeprefix("which ").strip().split(maxsplit=1)[0]
+        if not head or head.endswith("s"):
+            continue
+        return quote
+    return None
 
 
 def _ensure_exact_quotes(items: list[Any], question: str) -> list[Any]:
@@ -279,6 +340,17 @@ def _ensure_exact_quotes(items: list[Any], question: str) -> list[Any]:
             item_dict["quote"] = None
         normalized_items.append(item_dict)
     return normalized_items
+
+
+def _operator_self_authorized(item: Mapping[str, Any], question: str) -> bool:
+    quote = _exact_substring(item.get("quote"), question)
+    if not quote:
+        return False
+    return (
+        str(item.get("operation") or "") == "aggregate"
+        and str(item.get("operator_type") or "") == "distribution"
+        and bool(_DISTRIBUTION_OPERATOR_PATTERN.search(quote))
+    )
 
 
 def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
@@ -317,29 +389,21 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
             if isinstance(item, Mapping) or str(item or "").strip()
         ]
 
-    explicit_operator_keys = _explicit_operator_keys(question)
+    valid_operations = {"aggregate", "derive", "filter", "limit", "sort"}
+    authorized_operations = _authorized_operations_by_quote(normalized, question)
     existing_operators = [
         item
         for item in normalized["intent_operators"]
         if isinstance(item, Mapping)
         and _exact_substring(item.get("quote"), question)
         and str(item.get("operation") or "").strip()
+        and str(item.get("operation") or "") in valid_operations
         and (
-            str(item.get("quote") or ""),
-            str(item.get("operation") or ""),
+            str(item.get("operation") or "")
+            in authorized_operations.get(str(item.get("quote") or "").strip(), set())
+            or _operator_self_authorized(item, question)
         )
-        in explicit_operator_keys
     ]
-    detected_operators = _detect_intent_operators(question)
-    operator_keys = {
-        (str(item.get("quote")), str(item.get("operation")))
-        for item in existing_operators
-    }
-    for item in detected_operators:
-        key = (item["quote"], item["operation"])
-        if key not in operator_keys:
-            existing_operators.append(item)
-            operator_keys.add(key)
     normalized["intent_operators"] = [dict(item) for item in existing_operators]
 
     output = normalized["output"]
@@ -370,6 +434,19 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
     ):
         output["row_grain_hint"] = "source_records"
         output["preserve_source_rows"] = "true"
+    singular_which_quote = _singular_which_target_quote(
+        normalized["targets"],
+        question,
+    )
+    if conditions["orderings"] and not conditions["limits"] and singular_which_quote:
+        conditions["limits"].append(
+            {
+                "quote": singular_which_quote,
+                "value": "1",
+                "condition_type": "limit",
+                "explicitness": "explicit",
+            }
+        )
     return normalized
 
 

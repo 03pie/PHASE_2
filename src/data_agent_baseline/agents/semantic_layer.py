@@ -153,8 +153,7 @@ def _infer_heading_table(line: str) -> str | None:
         candidate = value.strip()
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", candidate):
             continue
-        if "_" in candidate or candidate.isupper():
-            return candidate
+        return candidate
     matches = [
         match
         for match in re.findall(r"\b[a-zA-Z][a-zA-Z0-9_]{2,}\b", stripped)
@@ -166,13 +165,15 @@ def _infer_heading_table(line: str) -> str | None:
 def _operation_from_sql(sql: str) -> str | None:
     upper = sql.upper()
     operations = []
-    if " WHERE " in f" {upper} ":
+    if re.search(r"\bJOIN\b", upper):
+        operations.append("join")
+    if re.search(r"\bWHERE\b", upper):
         operations.append("filter")
     if re.search(r"\b(GROUP\s+BY|COUNT|SUM|AVG|MIN|MAX)\s*\(?", upper):
         operations.append("aggregate")
-    if " ORDER BY " in f" {upper} ":
+    if re.search(r"\bORDER\s+BY\b", upper):
         operations.append("sort")
-    if " LIMIT " in f" {upper} ":
+    if re.search(r"\bLIMIT\b", upper):
         operations.append("limit")
     return ",".join(operations) if operations else None
 
@@ -262,6 +263,7 @@ def parse_knowledge_content(
     markdown_header: list[str] | None = None
     in_code = False
     code_lines: list[str] = []
+    plain_sql_lines: list[str] = []
 
     def append_fact(
         kind: str,
@@ -288,10 +290,25 @@ def parse_knowledge_content(
             )
         )
 
+    def flush_plain_sql() -> None:
+        nonlocal plain_sql_lines
+        sql = "\n".join(plain_sql_lines).strip()
+        plain_sql_lines = []
+        if not sql:
+            return
+        append_fact(
+            "example_query",
+            sql,
+            section_key=_table_from_sql(sql) or current_section,
+            operation=_operation_from_sql(sql),
+        )
+
     for raw_line in content.splitlines():
         line = raw_line.rstrip()
         stripped = line.strip()
         if stripped.startswith("```"):
+            if plain_sql_lines:
+                flush_plain_sql()
             if in_code:
                 sql = "\n".join(code_lines).strip()
                 operation = _operation_from_sql(sql)
@@ -306,6 +323,19 @@ def parse_knowledge_content(
             continue
         if in_code:
             code_lines.append(line)
+            continue
+        if plain_sql_lines:
+            if not stripped or stripped.startswith("#") or _split_markdown_row(stripped) is not None:
+                flush_plain_sql()
+            else:
+                plain_sql_lines.append(line)
+                if ";" in stripped:
+                    flush_plain_sql()
+                continue
+        if re.match(r"^(?:SELECT|WITH)\b", stripped, flags=re.IGNORECASE):
+            plain_sql_lines.append(line)
+            if ";" in stripped:
+                flush_plain_sql()
             continue
         if stripped.startswith("#"):
             current_section = _infer_heading_table(stripped)
@@ -347,38 +377,8 @@ def parse_knowledge_content(
                 )
             continue
 
-        lower = stripped.casefold()
-        if "join" in lower or "关联" in stripped or "连接" in stripped or "↔" in stripped:
-            append_fact("join", stripped, operation="join")
-            continue
-        if re.search(r"\b(formula|calculate|calculation)\b|公式|计算", stripped, re.IGNORECASE):
-            fields = _fields_from_text(stripped)
-            append_fact(
-                "calculation",
-                stripped,
-                field_key=fields[0] if fields else None,
-                operation="derive",
-            )
-            continue
-        if re.search(r"\b(where|filter)\b|筛选|过滤|条件", stripped, re.IGNORECASE):
-            fields = _fields_from_text(stripped)
-            append_fact(
-                "filter_rule",
-                stripped,
-                field_key=fields[0] if fields else None,
-                operation="filter",
-            )
-            continue
-        if re.search(r"\b(order|sort|top|limit)\b|排序|最高|最低|前\d+", stripped, re.IGNORECASE):
-            fields = _fields_from_text(stripped)
-            append_fact(
-                "ordering_rule",
-                stripped,
-                field_key=fields[0] if fields else None,
-                operation="sort",
-            )
-            continue
-
+    if plain_sql_lines:
+        flush_plain_sql()
     if in_code and code_lines:
         sql = "\n".join(code_lines).strip()
         append_fact(

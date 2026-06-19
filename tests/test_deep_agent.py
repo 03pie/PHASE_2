@@ -18,7 +18,28 @@ from data_agent_baseline.agents.deep_agent import DeepAgent
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.agents.filesystem import Utf8FilesystemBackend
 from data_agent_baseline.agents.middleware import _canonical_knowledge_quote
+from data_agent_baseline.agents.middleware import _canonicalize_direct_source_projection_plan
+from data_agent_baseline.agents.middleware import _canonicalize_duplicate_output_columns
+from data_agent_baseline.agents.middleware import _canonicalize_distribution_output_columns
+from data_agent_baseline.agents.middleware import _canonicalize_execution_supporting_fields
+from data_agent_baseline.agents.middleware import _canonicalize_extract_narrative_arguments
+from data_agent_baseline.agents.middleware import _canonicalize_missing_intent_requirements
+from data_agent_baseline.agents.middleware import _canonicalize_output_columns_from_valid_field_bindings
+from data_agent_baseline.agents.middleware import _canonicalize_output_columns_from_section_field_facts
+from data_agent_baseline.agents.middleware import _canonicalize_single_preserve_output_from_field_fact
+from data_agent_baseline.agents.middleware import _canonicalize_unrequested_knowledge_output_columns
+from data_agent_baseline.agents.middleware import _canonicalize_unrequested_measure_output_columns
+from data_agent_baseline.agents.middleware import _canonicalize_sort_null_policy
+from data_agent_baseline.agents.middleware import _canonicalize_unbacked_sort_keys
+from data_agent_baseline.agents.middleware import _canonicalize_unsatisfied_authoritative_source_hints
+from data_agent_baseline.agents.middleware import _decode_json_like_argument
 from data_agent_baseline.agents.middleware import _discovery_state
+from data_agent_baseline.agents.middleware import _DiscoveryState
+from data_agent_baseline.agents.middleware import _recover_analyze_plan_tagged_arguments
+from data_agent_baseline.agents.middleware import _question_requested_output_texts
+from data_agent_baseline.agents.middleware import _requirement_types_for_quote
+from data_agent_baseline.agents.middleware import _strip_extract_narrative_protocol_markup
+from data_agent_baseline.agents.middleware import _unresolved_explicit_scope_quotes
 from data_agent_baseline.agents.question_structure import _normalize_structure
 from data_agent_baseline.agents.semantic_layer import (
     parse_knowledge_content,
@@ -29,9 +50,13 @@ from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
 from data_agent_baseline.tools.agent_tools.execute_python import (
     create_execute_python_tool,
+    _try_candidate_plan_execution,
 )
 from data_agent_baseline.tools.agent_tools.extract_narrative_records import (
     create_extract_narrative_records_tool,
+)
+from data_agent_baseline.tools.agent_tools.extract_narrative_records import (
+    _extract_multi_field_rows,
 )
 from data_agent_baseline.tools.agent_tools.inspect_sqlite import (
     create_inspect_sqlite_tool,
@@ -41,11 +66,12 @@ from data_agent_baseline.tools.agent_tools.query_schema import create_query_sche
 from data_agent_baseline.tools.agent_tools.read_csv import create_read_csv_tool
 from data_agent_baseline.tools.agent_tools.read_doc import create_read_doc_tool
 from data_agent_baseline.tools.agent_tools.read_json import create_read_json_tool
-from data_agent_baseline.tools.answer import validate_prepared_answer
+from data_agent_baseline.tools.answer import answer_value_hash, validate_prepared_answer
 
 DISCOVERY_TOOLS = {
     "execute_sql",
     "execute_python",
+    "extract_narrative_records",
     "grep_file",
     "inspect_sqlite",
     "query_schema",
@@ -642,6 +668,13 @@ def test_question_structure_normalizes_unrequested_aggregate_grain() -> None:
                 "requested_columns": [],
                 "preserve_source_rows": "unknown",
             },
+            "intent_operators": [
+                {
+                    "quote": "记录",
+                    "operation": "aggregate",
+                    "operator_type": "distribution",
+                }
+            ],
             "ambiguities": [],
         },
         "显示这些记录",
@@ -649,6 +682,2749 @@ def test_question_structure_normalizes_unrequested_aggregate_grain() -> None:
 
     assert normalized["output"]["row_grain_hint"] == "source_records"
     assert normalized["output"]["preserve_source_rows"] == "true"
+    assert normalized["intent_operators"] == []
+
+
+def test_question_structure_drops_operator_without_matching_condition() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "Return the highest value.",
+            "targets": [
+                {
+                    "quote": "value",
+                    "name": "value",
+                    "target_type": "measure",
+                    "description": "Return the value.",
+                }
+            ],
+            "target_constraints": [
+                {
+                    "quote": "highest",
+                    "constraint_type": "ordering",
+                    "value": "descending",
+                    "explicitness": "explicit",
+                }
+            ],
+            "conditions": {
+                "orderings": [
+                    {
+                        "quote": "highest",
+                        "value": "descending",
+                        "condition_type": "ordering",
+                        "explicitness": "explicit",
+                    }
+                ],
+            },
+            "intent_operators": [
+                {
+                    "quote": "highest",
+                    "operation": "aggregate",
+                    "operator_type": "distribution",
+                },
+                {
+                    "quote": "highest",
+                    "operation": "sort",
+                    "operator_type": "selector",
+                },
+            ],
+        },
+        "Return the highest value.",
+    )
+
+    assert normalized["intent_operators"] == [
+        {
+            "quote": "highest",
+            "operation": "sort",
+            "operator_type": "selector",
+        }
+    ]
+
+
+def test_question_structure_grouping_does_not_authorize_aggregate() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "Which company has the highest fees?",
+            "targets": [
+                {
+                    "quote": "company",
+                    "name": "company",
+                    "target_type": "entity",
+                    "description": "Return the company.",
+                },
+                {
+                    "quote": "fees",
+                    "name": "fees",
+                    "target_type": "measure",
+                    "description": "Compare fees.",
+                },
+            ],
+            "target_constraints": [
+                {
+                    "quote": "highest",
+                    "constraint_type": "ordering",
+                    "value": "max(fees)",
+                    "explicitness": "explicit",
+                }
+            ],
+            "conditions": {
+                "groupings": [
+                    {
+                        "quote": "company",
+                        "value": "company",
+                        "condition_type": "grouping",
+                        "explicitness": "explicit",
+                    }
+                ],
+                "orderings": [],
+            },
+            "intent_operators": [
+                {
+                    "quote": "company",
+                    "operation": "aggregate",
+                    "operator_type": "distribution",
+                },
+                {
+                    "quote": "highest",
+                    "operation": "sort",
+                    "operator_type": "selector",
+                },
+            ],
+        },
+        "Which company has the highest fees?",
+    )
+
+    assert normalized["intent_operators"] == [
+        {
+            "quote": "highest",
+            "operation": "sort",
+            "operator_type": "selector",
+        }
+    ]
+
+
+def test_question_structure_explicit_scope_authorizes_filter_only() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "Return records for patient 017-30133 during the first visit.",
+            "targets": [
+                {
+                    "quote": "records",
+                    "name": "records",
+                    "target_type": "record_set",
+                    "description": "Return matching source records.",
+                }
+            ],
+            "target_constraints": [
+                {
+                    "quote": "patient 017-30133",
+                    "constraint_type": "entity",
+                    "value": "017-30133",
+                    "explicitness": "explicit",
+                },
+                {
+                    "quote": "first visit",
+                    "constraint_type": "scope",
+                    "value": "first_visit",
+                    "explicitness": "explicit",
+                },
+            ],
+            "conditions": {
+                "filters": [],
+                "time_ranges": [],
+                "groupings": [],
+                "orderings": [],
+                "limits": [],
+                "calculations": [],
+                "output_columns": [],
+            },
+            "intent_operators": [
+                {
+                    "quote": "patient 017-30133",
+                    "operation": "filter",
+                    "operator_type": "constraint",
+                },
+                {
+                    "quote": "first visit",
+                    "operation": "filter",
+                    "operator_type": "constraint",
+                },
+                {
+                    "quote": "first visit",
+                    "operation": "aggregate",
+                    "operator_type": "distribution",
+                },
+            ],
+        },
+        "Return records for patient 017-30133 during the first visit.",
+    )
+
+    assert normalized["intent_operators"] == [
+        {
+            "quote": "patient 017-30133",
+            "operation": "filter",
+            "operator_type": "constraint",
+        },
+        {
+            "quote": "first visit",
+            "operation": "filter",
+            "operator_type": "constraint",
+        },
+    ]
+
+
+def test_question_structure_selector_constraint_authorizes_sort_and_limit() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "When was the last time this patient had the minimum value?",
+            "targets": [
+                {
+                    "quote": "When was the last time",
+                    "name": "timestamp",
+                    "target_type": "measure",
+                    "description": "Return the selected timestamp.",
+                }
+            ],
+            "target_constraints": [
+                {
+                    "quote": "last time",
+                    "constraint_type": "ordering",
+                    "value": "most_recent",
+                    "explicitness": "explicit",
+                },
+                {
+                    "quote": "minimum value",
+                    "constraint_type": "filter",
+                    "value": "minimum_value",
+                    "explicitness": "explicit",
+                },
+            ],
+            "conditions": {
+                "filters": [],
+                "time_ranges": [],
+                "groupings": [],
+                "orderings": [],
+                "limits": [],
+                "calculations": [],
+                "output_columns": [],
+            },
+            "intent_operators": [
+                {
+                    "quote": "last time",
+                    "operation": "sort",
+                    "operator_type": "selector",
+                },
+                {
+                    "quote": "last time",
+                    "operation": "limit",
+                    "operator_type": "selector",
+                },
+                {
+                    "quote": "minimum value",
+                    "operation": "sort",
+                    "operator_type": "selector",
+                },
+                {
+                    "quote": "minimum value",
+                    "operation": "limit",
+                    "operator_type": "selector",
+                },
+                {
+                    "quote": "minimum value",
+                    "operation": "aggregate",
+                    "operator_type": "calculation",
+                },
+            ],
+        },
+        "When was the last time this patient had the minimum value?",
+    )
+
+    assert normalized["intent_operators"] == [
+        {
+            "quote": "last time",
+            "operation": "sort",
+            "operator_type": "selector",
+        },
+        {
+            "quote": "last time",
+            "operation": "limit",
+            "operator_type": "selector",
+        },
+        {
+            "quote": "minimum value",
+            "operation": "sort",
+            "operator_type": "selector",
+        },
+        {
+            "quote": "minimum value",
+            "operation": "limit",
+            "operator_type": "selector",
+        },
+    ]
+
+
+def test_requirement_types_include_generic_calculation_and_target_selector() -> None:
+    question_structure = {
+        "targets": [
+            {
+                "quote": "When was the last time",
+                "target_type": "measure",
+            }
+        ],
+        "target_constraints": [],
+        "conditions": {
+            "calculations": [
+                {
+                    "quote": "minimum -polys value",
+                    "condition_type": "calculation",
+                    "explicitness": "explicit",
+                }
+            ]
+        },
+    }
+    state = {
+        "question_structure": question_structure,
+        "question_structure_enforced": True,
+    }
+
+    assert _requirement_types_for_quote(
+        quote="minimum -polys value",
+        arguments={},
+        state=state,
+    ) == {"calculation"}
+    assert _requirement_types_for_quote(
+        quote="When was the last time",
+        arguments={},
+        state=state,
+    ) == {"measure", "selector"}
+
+
+def test_question_structure_distribution_quote_authorizes_aggregate() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "管理基金规模超过100亿的基金经理最高学历分布情况",
+            "targets": [
+                {
+                    "quote": "最高学历分布情况",
+                    "name": "education_distribution",
+                    "target_type": "measure",
+                    "description": "Return distribution.",
+                }
+            ],
+            "conditions": {
+                "groupings": [
+                    {
+                        "quote": "最高学历分布情况",
+                        "value": "education",
+                        "condition_type": "grouping",
+                        "explicitness": "ambiguous",
+                    }
+                ],
+            },
+            "intent_operators": [
+                {
+                    "quote": "分布情况",
+                    "operation": "aggregate",
+                    "operator_type": "distribution",
+                }
+            ],
+            "output": {"row_grain_hint": "aggregated_records"},
+        },
+        "管理基金规模超过100亿的基金经理最高学历分布情况",
+    )
+
+    assert normalized["intent_operators"] == [
+        {
+            "quote": "分布情况",
+            "operation": "aggregate",
+            "operator_type": "distribution",
+        }
+    ]
+
+
+def test_question_structure_rejects_embedded_ascii_token_quotes() -> None:
+    normalized = _normalize_structure(
+        {
+            "schema_version": "1.0",
+            "original_question": "Show the two-year return.",
+            "targets": [
+                {
+                    "quote": "two-year return",
+                    "name": "two-year return",
+                    "target_type": "measure",
+                    "description": "Return the metric.",
+                }
+            ],
+            "conditions": {
+                "time_ranges": [
+                    {
+                        "quote": "two-year",
+                        "value": "2 years",
+                        "condition_type": "time_range",
+                        "explicitness": "explicit",
+                    }
+                ],
+                "limits": [
+                    {
+                        "quote": "two",
+                        "value": "2",
+                        "condition_type": "limit",
+                        "explicitness": "explicit",
+                    }
+                ],
+            },
+            "intent_operators": [
+                {
+                    "quote": "two",
+                    "operation": "limit",
+                    "operator_type": "selector",
+                }
+            ],
+        },
+        "Show the two-year return.",
+    )
+
+    assert normalized["conditions"]["time_ranges"][0]["quote"] == "two-year"
+    assert normalized["conditions"]["limits"][0]["quote"] is None
+    assert normalized["intent_operators"] == []
+
+
+def test_question_structure_adds_top_one_for_singular_which_ordering() -> None:
+    normalized = _normalize_structure(
+        {
+            "targets": [
+                {
+                    "quote": "Which company",
+                    "target_type": "entity",
+                }
+            ],
+            "conditions": {
+                "orderings": [
+                    {
+                        "quote": "highest",
+                        "value": "metric descending",
+                        "explicitness": "explicit",
+                    }
+                ],
+                "limits": [],
+            },
+            "output": {},
+        },
+        "Which company has the highest metric?",
+    )
+
+    assert normalized["conditions"]["limits"] == [
+        {
+            "quote": "Which company",
+            "value": "1",
+            "condition_type": "limit",
+            "explicitness": "explicit",
+        }
+    ]
+
+
+def test_question_structure_does_not_add_top_one_for_plural_which() -> None:
+    normalized = _normalize_structure(
+        {
+            "targets": [
+                {
+                    "quote": "Which companies",
+                    "target_type": "entity",
+                }
+            ],
+            "conditions": {
+                "orderings": [
+                    {
+                        "quote": "highest",
+                        "value": "metric descending",
+                        "explicitness": "explicit",
+                    }
+                ],
+                "limits": [],
+            },
+            "output": {},
+        },
+        "Which companies have the highest metric?",
+    )
+
+    assert normalized["conditions"]["limits"] == []
+
+
+def test_decode_json_like_argument_tolerates_extra_closing_delimiter() -> None:
+    decoded = _decode_json_like_argument(
+        {
+            "output_spec": (
+                '{"columns": [{"name": "value"}], "transformations": []}}'
+            )
+        }
+    )
+
+    assert decoded == {
+        "output_spec": {"columns": [{"name": "value"}], "transformations": []}
+    }
+
+
+def test_direct_source_projection_plan_drops_noop_transformations() -> None:
+    class FakeRequest:
+        def __init__(self, args: dict[str, Any]) -> None:
+            self.tool_call = {"name": "analyze_plan", "args": args}
+            self.state = {
+                "messages": [],
+                "observed_sources": [
+                    {"path": "/context/data.csv", "row_count": 3}
+                ],
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest(kwargs["tool_call"]["args"])
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    request = FakeRequest(
+        {
+            "output_spec": {
+                "columns": [
+                    {
+                        "name": "value",
+                        "role": "measure",
+                        "source_fields": ["value"],
+                    }
+                ],
+                "row_policy": "transform",
+                "transformations": [
+                    {"operation": "derive"},
+                    {"operation": "filter"},
+                ],
+                "ordering": "source",
+                "sort_keys": [],
+                "null_policy": "preserve",
+                "expected_row_count": 3,
+            },
+            "evidence": {
+                "context_sources": [{"path": "/context/data.csv"}],
+            },
+            "execution_spec": {
+                "sources": [{"path": "/context/data.csv"}],
+                "operations": [{"operation": "derive"}],
+                "supporting_fields": [],
+            },
+        }
+    )
+
+    updated = _canonicalize_direct_source_projection_plan(request)
+    args = updated.tool_call["args"]
+
+    assert args["output_spec"]["row_policy"] == "preserve"
+    assert args["output_spec"]["transformations"] == []
+    assert args["execution_spec"]["operations"] == []
+
+
+def test_missing_intent_requirements_are_filled_without_operation_semantics() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {"name": "analyze_plan", "args": {"intent": {}}}
+            self.state = {"original_request": "Return the requested value."}
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_missing_intent_requirements(FakeRequest())
+    intent = updated.tool_call["args"]["intent"]
+
+    assert intent["requirements"] == [
+        {
+            "statement": "Answer the original user request.",
+            "requirement_type": "output",
+            "quote": "Return the requested value.",
+        }
+    ]
+
+
+def test_authoritative_knowledge_with_observed_unsatisfied_source_hint_is_downgraded() -> None:
+    knowledge = """# Guide
+
+## Source Alpha (`source_alpha`)
+
+| Column | Definition |
+|---|---|
+| `join_id` | Join key for requested records |
+| `metric_value` | Requested metric value |
+
+## Source Beta (`source_beta`)
+
+| Column | Definition |
+|---|---|
+| `join_id` | Join key |
+| `label` | Grouping label |
+
+### Example
+```sql
+SELECT b.label, COUNT(*)
+FROM source_alpha AS a
+JOIN source_beta AS b ON a.join_id = b.join_id
+WHERE a.metric_value > 100
+GROUP BY b.label;
+```
+"""
+    example_quote = next(
+        fact.quote
+        for fact in parse_knowledge_content(knowledge)
+        if fact.kind == "example_query"
+    )
+
+    class FakeRequest:
+        state = {
+            "original_request": (
+                "Return the label distribution for records with metric value above 100."
+            ),
+            "question_structure": {},
+            "observed_sources": [
+                {
+                    "path": "/context/doc/source_alpha.pdf",
+                    "source_type": "doc",
+                    "source_name_hint": "source_alpha",
+                    "observed_by": "read_doc",
+                },
+                {
+                    "path": "/context/db/data.sqlite::source_beta",
+                    "source_type": "sqlite_table",
+                    "base_path": "/context/db/data.sqlite",
+                    "table": "source_beta",
+                    "fields": ["join_id", "label"],
+                    "observed_by": "inspect_sqlite",
+                },
+                {
+                    "path": "/context/db/data.sqlite::source_gamma",
+                    "source_type": "sqlite_table",
+                    "base_path": "/context/db/data.sqlite",
+                    "table": "source_gamma",
+                    "fields": ["join_id", "metric_value"],
+                    "observed_by": "inspect_sqlite",
+                },
+            ],
+        }
+
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "intent": {
+                        "requirements": [
+                            {
+                                "statement": "Filter and aggregate.",
+                                "requirement_type": "filter",
+                                "quote": "above 100",
+                            }
+                        ],
+                        "unresolved": [],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {"name": "label", "source_fields": ["label"]},
+                            {"name": "count", "source_fields": []},
+                        ],
+                        "row_grain": "label",
+                        "row_policy": "transform",
+                        "transformations": [],
+                        "ordering": "unspecified",
+                        "sort_keys": [],
+                        "null_policy": "preserve",
+                        "expected_row_count": None,
+                    },
+                    "evidence": {
+                        "knowledge_status": "authoritative",
+                        "knowledge_rules": [
+                            {
+                                "quote": example_quote,
+                                "source_path": "/context/knowledge.md",
+                            }
+                        ],
+                        "knowledge_issue": (
+                            "The hinted source_alpha source was observed as a "
+                            "narrative document and cannot provide the physical "
+                            "metric_value field for this plan."
+                        ),
+                        "context_sources": [
+                            {
+                                "path": "/context/db/data.sqlite::source_beta",
+                                "observations": ["source_beta was inspected."],
+                            },
+                            {
+                                "path": "/context/db/data.sqlite::source_gamma",
+                                "observations": ["source_gamma was inspected."],
+                            },
+                        ],
+                        "cross_validated_inference": (
+                            "Use observed structured context evidence for the "
+                            "remaining binding after the hinted source failed."
+                        ),
+                    },
+                    "execution_spec": {
+                        "sources": [
+                            {"path": "/context/db/data.sqlite::source_beta"},
+                            {"path": "/context/db/data.sqlite::source_gamma"},
+                        ],
+                        "supporting_fields": [],
+                        "operations": [],
+                    },
+                    "revision": {
+                        "version": 1,
+                        "reason": "Initial evidence-based plan.",
+                        "evidence_changes": [],
+                        "changed_fields": [],
+                    },
+                    "steps": ["Compute"],
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=knowledge,
+        context_sources=frozenset(
+            {
+                "/context/doc/source_alpha.pdf",
+                "/context/db/data.sqlite::source_beta",
+                "/context/db/data.sqlite::source_gamma",
+            }
+        ),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_unsatisfied_authoritative_source_hints(
+        FakeRequest(),
+        discovery,
+    )
+
+    evidence = updated.tool_call["args"]["evidence"]
+    assert evidence["knowledge_status"] == "insufficient"
+    assert evidence["knowledge_rules"] == []
+    assert evidence["source_hint_issue"]["observed_missing_hints"] == ["source_alpha"]
+
+
+def test_unbacked_sort_keys_are_removed_from_plan() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.state = {"original_request": "Return the distribution."}
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "group", "source_fields": ["group"]},
+                            {"name": "count", "source_fields": ["count"]},
+                        ],
+                        "row_grain": "group",
+                        "row_policy": "transform",
+                        "transformations": [
+                            {
+                                "operation": "aggregate",
+                                "authorization": {
+                                    "source": "user",
+                                    "quote": "distribution",
+                                },
+                            }
+                        ],
+                        "ordering": "specified",
+                        "sort_keys": [{"field": "count", "direction": "descending"}],
+                        "null_policy": "preserve",
+                        "expected_row_count": None,
+                    },
+                    "execution_spec": {
+                        "sources": [{"path": "/context/data.csv"}],
+                        "supporting_fields": [],
+                        "operations": [
+                            {
+                                "operation": "aggregate",
+                                "authorization": {
+                                    "source": "user",
+                                    "quote": "distribution",
+                                },
+                            }
+                        ],
+                    },
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            return updated
+
+    updated = _canonicalize_unbacked_sort_keys(FakeRequest())
+    output_spec = updated.tool_call["args"]["output_spec"]
+    assert output_spec["ordering"] == "unspecified"
+    assert output_spec["sort_keys"] == []
+
+
+def test_table_scope_condition_is_not_filter_authorization() -> None:
+    state = {
+        "question_structure_enforced": True,
+        "question_structure": {
+            "conditions": {
+                "filters": [
+                    {
+                        "quote": "in the balance sheet",
+                        "value": "balance_sheet",
+                        "condition_type": "table_scope",
+                    },
+                    {
+                        "quote": "minimum value",
+                        "value": "x = min(x)",
+                        "condition_type": "aggregation_equality",
+                    }
+                ],
+                "calculations": [
+                    {
+                        "quote": "minimum value",
+                        "value": "min(x)",
+                        "condition_type": "min_aggregation",
+                    }
+                ],
+                "orderings": [
+                    {
+                        "quote": "last time",
+                        "value": "timestamp DESC",
+                        "condition_type": "descending_sort",
+                    }
+                ],
+                "limits": [
+                    {
+                        "quote": "last time",
+                        "value": "limit 1",
+                        "condition_type": "top_k",
+                    }
+                ],
+            }
+        },
+    }
+
+    scope_types = _requirement_types_for_quote(
+        quote="in the balance sheet",
+        arguments={},
+        state=state,
+    )
+    minimum_types = _requirement_types_for_quote(
+        quote="minimum value",
+        arguments={},
+        state=state,
+    )
+    last_types = _requirement_types_for_quote(
+        quote="last time",
+        arguments={},
+        state=state,
+    )
+
+    assert scope_types == {"scope"}
+    assert minimum_types == {"filter", "calculation"}
+    assert last_types == {"ordering", "limit"}
+
+
+def test_single_preserve_output_uses_authoritative_field_fact() -> None:
+    knowledge = """# Guide
+
+## Source Table (`source_table`)
+
+| Column | Semantic Definition |
+|---|---|
+| `target_metric` | Requested target metric |
+| `period_end` | Reporting period |
+"""
+
+    class FakeRequest:
+        state = {
+            "original_request": "Return the requested target metric.",
+            "question_structure": {},
+            "observed_sources": [
+                {
+                    "path": "/context/db/data.sqlite::source_table",
+                    "source_type": "sqlite_table",
+                    "base_path": "/context/db/data.sqlite",
+                    "table": "source_table",
+                    "fields": ["PeriodEnd", "TargetMetric"],
+                    "observed_by": "inspect_sqlite",
+                }
+            ],
+        }
+
+        def __init__(self) -> None:
+            fact = next(
+                fact
+                for fact in parse_knowledge_content(knowledge)
+                if fact.field_key == "target_metric"
+            )
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "PeriodEnd",
+                                "source_fields": ["PeriodEnd"],
+                                "role": "time_key",
+                            }
+                        ],
+                        "row_grain": "record",
+                        "row_policy": "preserve",
+                        "transformations": [],
+                        "ordering": "source",
+                        "sort_keys": [],
+                        "null_policy": "preserve",
+                        "expected_row_count": None,
+                    },
+                    "evidence": {
+                        "knowledge_status": "authoritative",
+                        "knowledge_rules": [
+                            {
+                                "fact_id": fact.fact_id,
+                                "quote": fact.quote,
+                                "source_path": "/context/knowledge.md",
+                            }
+                        ],
+                        "knowledge_issue": "",
+                        "context_sources": [
+                            {
+                                "path": "/context/db/data.sqlite::source_table",
+                                "observations": [
+                                    "source_table has PeriodEnd and TargetMetric columns."
+                                ],
+                            }
+                        ],
+                        "cross_validated_inference": "",
+                    },
+                    "execution_spec": {
+                        "sources": [
+                            {"path": "/context/db/data.sqlite::source_table"}
+                        ],
+                        "supporting_fields": [
+                            {
+                                "name": "TargetMetric",
+                                "source_fields": ["TargetMetric"],
+                                "purpose": "selector",
+                            }
+                        ],
+                        "operations": [],
+                    },
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=knowledge,
+        context_sources=frozenset({"/context/db/data.sqlite::source_table"}),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_single_preserve_output_from_field_fact(
+        FakeRequest(),
+        discovery,
+    )
+
+    column = updated.tool_call["args"]["output_spec"]["columns"][0]
+    assert column["name"] == "TargetMetric"
+    assert column["source_fields"] == ["TargetMetric"]
+    assert column["role"] == "measure"
+
+
+def test_duplicate_output_columns_with_same_source_field_are_deduplicated() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "entity", "source_fields": ["Name"]},
+                            {"name": "entity_alias", "source_fields": ["name"]},
+                        ]
+                    }
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_alpha.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_alpha",
+                        "fields": ["MetricValue", "DisplayEntityName"],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_duplicate_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "entity", "source_fields": ["Name"]}
+    ]
+
+
+def test_single_output_column_uses_unique_valid_source_binding() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "date", "source_fields": ["Date"]}
+                        ]
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {
+                                "fact_id": "kf_1",
+                                "source_field": "Value",
+                                "source_paths": ["/context/json/source_table.json"],
+                            }
+                        ]
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_table.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_table",
+                        "fields": ["Value"],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Demo `source_table`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `Value` | Target value. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_valid_field_bindings(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "date", "source_fields": ["Value"]}
+    ]
+
+
+def test_valid_binding_repair_does_not_replace_aggregate_count_output() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "education",
+                                "source_fields": ["Education"],
+                                "role": "entity_key",
+                            },
+                            {
+                                "name": "count(*)",
+                                "source_fields": ["count(*)"],
+                                "role": "calculation",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {
+                                "fact_id": "kf_1",
+                                "source_field": "Education",
+                                "source_paths": ["/context/db/source.sqlite::people"],
+                            },
+                            {
+                                "fact_id": "kf_2",
+                                "source_field": "ExperienceTime",
+                                "source_paths": ["/context/db/source.sqlite::people"],
+                            },
+                        ],
+                        "operations": [{"operation": "aggregate"}],
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/db/source.sqlite::people",
+                        "source_type": "sqlite_table",
+                        "fields": ["Education", "ExperienceTime"],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Demo `people`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `Education` | Highest education. |\n"
+            "| `ExperienceTime` | Experience duration. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_valid_field_bindings(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count(*)", "source_fields": ["count(*)"], "role": "calculation"},
+    ]
+
+
+def test_preserve_plan_demotes_unbound_extra_source_columns() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "value", "source_fields": ["Value"]},
+                            {"name": "context", "source_fields": ["Context"]},
+                        ],
+                        "row_policy": "preserve",
+                        "transformations": [],
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {
+                                "fact_id": "kf_1",
+                                "source_field": "Value",
+                                "source_paths": ["/context/json/source_table.json"],
+                            }
+                        ],
+                        "supporting_fields": [],
+                    },
+                },
+            }
+            self.state = {
+                "question_structure": {},
+                "original_request": "Show value.",
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_table.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_table",
+                        "fields": ["Value", "Context"],
+                    }
+                ],
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Demo `source_table`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `Value` | Target value. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_valid_field_bindings(
+        FakeRequest(),
+        discovery,
+    )
+    args = updated.tool_call["args"]
+
+    assert args["output_spec"]["columns"] == [
+        {"name": "value", "source_fields": ["Value"]}
+    ]
+    assert args["execution_spec"]["supporting_fields"] == [
+        {"name": "context", "source_fields": ["Context"], "purpose": "context"}
+    ]
+
+
+def test_doc_knowledge_field_binding_is_not_physical_field_evidence() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "date", "source_fields": ["Date"]}
+                        ]
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {
+                                "fact_id": "kf_1",
+                                "source_field": "Value",
+                                "source_paths": ["/context/doc/source_table.pdf"],
+                            }
+                        ]
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/doc/source_table.pdf",
+                        "source_type": "doc",
+                        "source_name_hint": "source_table",
+                        "matched_lines": [{"line_number": 1, "content": "Value"}],
+                        "observed_by": "read_doc",
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Demo `source_table`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `Value` | Target value. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_valid_field_bindings(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "date", "source_fields": ["Date"]}
+    ]
+
+
+def test_narrative_extraction_result_is_field_evidence() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "date", "source_fields": ["Date"]}
+                        ]
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {
+                                "fact_id": "kf_1",
+                                "source_field": "Value",
+                                "source_paths": ["/context/doc/source_table.pdf"],
+                            }
+                        ]
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/doc/source_table.pdf",
+                        "source_type": "doc",
+                        "source_name_hint": "source_table",
+                        "fields": ["Value"],
+                        "extracted_fields": ["Value"],
+                        "matched_lines": [{"line_number": 1, "content": "Value 42"}],
+                        "observed_by": "extract_narrative_records",
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Demo `source_table`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `Value` | Target value. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_valid_field_bindings(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "date", "source_fields": ["Value"]}
+    ]
+
+
+def test_section_field_repair_uses_observed_source_section() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "context_sources": [
+                            {"path": "/context/json/source_alpha.json"}
+                        ],
+                        "knowledge_rules": [
+                            {
+                                "quote": "| `MetricValue` | Ranking metric. |",
+                            },
+                            {
+                                "quote": "| `FullEntityName` | Full entity name. |",
+                            },
+                        ],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "entity",
+                                "source_fields": ["FullEntityName"],
+                            }
+                        ],
+                        "sort_keys": [{"field": "MetricValue"}],
+                    },
+                    "execution_spec": {
+                        "sources": [
+                            {
+                                "path": "/context/json/source_alpha.json",
+                                "source_type": "json",
+                            }
+                        ]
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_alpha.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_alpha",
+                        "fields": ["MetricValue", "DisplayEntityName"],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Primary `source_alpha`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `MetricValue` | Ranking metric. |\n"
+            "| `DisplayEntityName` | Display entity name. |\n\n"
+            "### Secondary `source_beta`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `FullEntityName` | Full entity name. |\n"
+            "| `OtherContext` | Other context. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_section_field_facts(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "entity", "source_fields": ["DisplayEntityName"]}
+    ]
+
+
+def test_section_field_repair_replaces_selector_source_field() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "context_sources": [
+                            {"path": "/context/json/source_alpha.json"}
+                        ],
+                        "knowledge_rules": [
+                            {"quote": "| `MetricValue` | Ranking metric. |"},
+                        ],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "entity_name",
+                                "source_fields": ["MetricValue"],
+                            }
+                        ],
+                        "sort_keys": [{"field": "MetricValue"}],
+                    },
+                    "execution_spec": {
+                        "sources": [
+                            {
+                                "path": "/context/json/source_alpha.json",
+                                "source_type": "json",
+                            }
+                        ]
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_alpha.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_alpha",
+                        "fields": ["MetricValue", "DisplayEntityName"],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Primary `source_alpha`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `MetricValue` | Ranking metric. |\n"
+            "| `DisplayEntityName` | Display entity name. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_section_field_facts(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "entity_name", "source_fields": ["DisplayEntityName"]}
+    ]
+
+
+def test_section_field_repair_uses_execution_sort_key_as_selector() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "context_sources": [
+                            {"path": "/context/json/source_alpha.json"}
+                        ],
+                        "knowledge_rules": [
+                            {"quote": "| `SortDate` | Date used for sorting. |"},
+                        ],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "entity_name",
+                                "source_fields": ["SortDate"],
+                            }
+                        ],
+                        "sort_keys": [],
+                    },
+                    "execution_spec": {
+                        "sources": [
+                            {
+                                "path": "/context/json/source_alpha.json",
+                                "source_type": "json",
+                            }
+                        ],
+                        "operations": [
+                            {
+                                "operation": "sort",
+                                "sort_key": "SortDate",
+                                "authorization": {
+                                    "source": "user",
+                                    "quote": "most recent",
+                                },
+                            }
+                        ],
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_alpha.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_alpha",
+                        "fields": ["DisplayEntityName", "SortDate"],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Primary `source_alpha`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `DisplayEntityName` | Display entity name. |\n"
+            "| `SortDate` | Date used for sorting. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_section_field_facts(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "entity_name", "source_fields": ["DisplayEntityName"]}
+    ]
+
+
+def test_valid_binding_demotion_preserves_requested_measure_targets() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "code", "source_fields": ["SecuCode"]},
+                            {
+                                "name": "pre_transfer_quantity",
+                                "source_fields": ["pre_transfer_quantity"],
+                            },
+                            {
+                                "name": "pre_transfer_ratio",
+                                "source_fields": ["pre_transfer_ratio"],
+                            },
+                        ],
+                        "row_policy": "preserve",
+                        "transformations": [],
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {
+                                "fact_id": "kf_1",
+                                "source_field": "SecuCode",
+                                "source_paths": ["/context/json/source_alpha.json"],
+                            },
+                        ],
+                        "supporting_fields": [],
+                    },
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "targets": [
+                        {
+                            "quote": "pre-transfer shareholding quantity",
+                            "name": "pre_transfer_shareholding_quantity",
+                            "target_type": "measure",
+                        },
+                        {
+                            "quote": "pre-transfer shareholding ratio",
+                            "name": "pre_transfer_shareholding_ratio",
+                            "target_type": "measure",
+                        },
+                    ],
+                    "conditions": {},
+                    "output": {
+                        "requested_columns": [
+                            "pre_transfer_shareholding_quantity",
+                            "pre_transfer_shareholding_ratio",
+                        ]
+                    },
+                },
+                "observed_sources": [
+                    {
+                        "path": "/context/json/source_alpha.json",
+                        "source_type": "json",
+                        "source_name_hint": "source_alpha",
+                        "fields": ["SecuCode"],
+                    }
+                ],
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content=(
+            "### Primary `source_alpha`\n\n"
+            "| Field | Semantic Definition |\n"
+            "| --- | --- |\n"
+            "| `SecuCode` | Security code. |\n"
+        ),
+        context_sources=frozenset(),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_valid_field_bindings(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "code", "source_fields": ["SecuCode"]},
+        {
+            "name": "pre_transfer_quantity",
+            "source_fields": ["pre_transfer_quantity"],
+        },
+        {"name": "pre_transfer_ratio", "source_fields": ["pre_transfer_ratio"]},
+    ]
+
+
+def test_distribution_plan_adds_count_output_column() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {"name": "Education", "source_fields": ["Education"]}
+                        ],
+                        "transformations": [
+                            {
+                                "operation": "aggregate",
+                                "authorization": {
+                                    "source": "user",
+                                    "quote": "分布情况",
+                                },
+                            }
+                        ],
+                    },
+                    "execution_spec": {"operations": []},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "分布情况",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_distribution_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "Education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "Count", "source_fields": ["Count"], "role": "measure"},
+    ]
+
+
+def test_distribution_plan_promotes_group_dimension_from_supporting_fields() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "Count",
+                                "source_fields": ["Count"],
+                                "role": "measure",
+                            }
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {
+                        "supporting_fields": [
+                            {
+                                "name": "Education",
+                                "source_fields": ["Education"],
+                                "purpose": "selector",
+                            }
+                        ],
+                        "operations": [{"operation": "aggregate"}],
+                    },
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_distribution_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "Education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "Count", "source_fields": ["Count"], "role": "measure"},
+    ]
+
+
+def test_distribution_count_source_field_is_not_deduplicated_with_group_key() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "Education",
+                                "source_fields": ["Education"],
+                                "role": "entity_key",
+                            },
+                            {
+                                "name": "count",
+                                "source_fields": ["Education"],
+                                "role": "measure",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {"operations": [{"operation": "aggregate"}]},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_distribution_output_columns(FakeRequest())
+    updated = _canonicalize_duplicate_output_columns(updated)
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "Education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count", "source_fields": ["count"], "role": "measure"},
+    ]
+
+
+def test_distribution_count_uses_knowledge_count_expression() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "knowledge_rules": [
+                            {
+                                "quote": (
+                                    "SELECT education, COUNT(*) FROM source "
+                                    "GROUP BY education"
+                                )
+                            }
+                        ]
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "Education",
+                                "source_fields": ["Education"],
+                                "role": "entity_key",
+                            },
+                            {
+                                "name": "count",
+                                "source_fields": [],
+                                "role": "measure",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {"operations": [{"operation": "aggregate"}]},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_distribution_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "Education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count(*)", "source_fields": ["count(*)"], "role": "measure"},
+    ]
+
+
+def test_distribution_count_output_is_not_demoted_by_knowledge_field_filter() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "knowledge_rules": [
+                            {
+                                "fact_id": "kf_edu",
+                                "quote": "| `education` | Highest academic degree |",
+                            }
+                        ],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "education",
+                                "source_fields": ["Education"],
+                                "role": "entity_key",
+                            },
+                            {
+                                "name": "count",
+                                "source_fields": ["count"],
+                                "role": "measure",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {"operations": [{"operation": "aggregate"}]},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "分布情况",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content="| field | definition |\n| --- | --- |\n| `education` | Highest academic degree |",
+        context_sources=frozenset({"/context/db/sub_db.sqlite::mf_personalinfo"}),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_unrequested_knowledge_output_columns(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count", "source_fields": ["count"], "role": "measure"},
+    ]
+    assert updated.tool_call["args"]["execution_spec"].get("supporting_fields") in (
+        None,
+        [],
+    )
+
+
+def test_requested_measure_target_is_not_demoted_without_requested_columns() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "EndDate",
+                                "source_fields": ["EndDate"],
+                                "role": "time_key",
+                            },
+                            {
+                                "name": "TotalAssets",
+                                "source_fields": ["TotalAssets"],
+                                "role": "measure",
+                            },
+                        ]
+                    },
+                    "execution_spec": {"operations": [], "supporting_fields": []},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "targets": [
+                        {
+                            "target_type": "measure",
+                            "quote": "total assets amount",
+                            "name": "TotalAssets",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_unrequested_measure_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "EndDate", "source_fields": ["EndDate"], "role": "time_key"},
+        {"name": "TotalAssets", "source_fields": ["TotalAssets"], "role": "measure"},
+    ]
+
+
+def test_distribution_non_count_measure_is_canonicalized_as_group_key() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "education",
+                                "source_fields": ["Education"],
+                                "role": "measure",
+                            },
+                            {
+                                "name": "count",
+                                "source_fields": [],
+                                "role": "measure",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {"operations": [{"operation": "aggregate"}]},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_distribution_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count", "source_fields": ["count"], "role": "measure"},
+    ]
+
+
+def test_distribution_output_column_is_canonicalized_as_group_key() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "education",
+                                "source_fields": ["Education"],
+                                "role": "output_column",
+                            },
+                            {
+                                "name": "count",
+                                "source_fields": [],
+                                "role": "measure",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {"operations": [{"operation": "aggregate"}]},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_distribution_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count", "source_fields": ["count"], "role": "measure"},
+    ]
+
+
+def test_section_field_repair_uses_json_leaf_field_aliases() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "context_sources": [
+                            {"path": "/context/json/lc_financialexpense.json"}
+                        ],
+                        "knowledge_rules": [
+                            {
+                                "fact_id": "kf_2",
+                                "quote": "| `commission` | Commission fees |",
+                            }
+                        ],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "company_name",
+                                "source_fields": ["ChiName"],
+                                "role": "output_column",
+                            }
+                        ],
+                        "sort_keys": [{"field": "Commission", "direction": "descending"}],
+                    },
+                    "execution_spec": {
+                        "sources": [
+                            {"path": "/context/json/lc_financialexpense.json"}
+                        ],
+                        "operations": [{"operation": "sort"}],
+                    },
+                },
+            }
+            self.state = {
+                "observed_sources": [
+                    {
+                        "path": "/context/json/lc_financialexpense.json",
+                        "source_type": "json",
+                        "source_name_hint": "lc_financialexpense",
+                        "fields": [
+                            "records.ChiName",
+                            "records.ChiNameAbbr",
+                            "records.Commission",
+                        ],
+                    }
+                ]
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content="\n".join(
+            [
+                "### Financial Expense (`lc_financialexpense`)",
+                "| Field | Semantic Definition |",
+                "| --- | --- |",
+                "| `chinameabbr` | Abbreviated company name. |",
+                "| `commission` | Commission fees. |",
+            ]
+        ),
+        context_sources=frozenset({"/context/json/lc_financialexpense.json"}),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_output_columns_from_section_field_facts(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {
+            "name": "company_name",
+            "source_fields": ["chinameabbr"],
+            "role": "output_column",
+        }
+    ]
+
+
+def test_distribution_key_output_is_not_demoted_by_knowledge_field_filter() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "evidence": {
+                        "knowledge_rules": [
+                            {
+                                "fact_id": "kf_metric",
+                                "quote": "| `metric` | Filter metric |",
+                            }
+                        ],
+                    },
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "education",
+                                "source_fields": ["Education"],
+                                "role": "entity_key",
+                            },
+                            {
+                                "name": "count",
+                                "source_fields": ["count"],
+                                "role": "measure",
+                            },
+                        ],
+                        "transformations": [{"operation": "aggregate"}],
+                    },
+                    "execution_spec": {"operations": [{"operation": "aggregate"}]},
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "分布情况",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content="| field | definition |\n| --- | --- |\n| `metric` | Filter metric |",
+        context_sources=frozenset({"/context/db/sub_db.sqlite::mf_personalinfo"}),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_unrequested_knowledge_output_columns(
+        FakeRequest(),
+        discovery,
+    )
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "education", "source_fields": ["Education"], "role": "entity_key"},
+        {"name": "count", "source_fields": ["count"], "role": "measure"},
+    ]
+
+
+def test_requested_evidence_bound_measure_output_is_preserved() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "key",
+                                "role": "entity_key",
+                                "source_fields": ["RecordKey"],
+                            },
+                            {
+                                "name": "metric_a",
+                                "role": "measure",
+                                "source_fields": ["MetricA"],
+                            },
+                            {
+                                "name": "metric_b",
+                                "role": "measure",
+                                "source_fields": ["MetricB"],
+                            },
+                        ]
+                    },
+                    "execution_spec": {
+                        "source_bindings": [
+                            {"source_field": "MetricA"},
+                            {"source_field": "MetricB"},
+                        ],
+                        "supporting_fields": [],
+                    },
+                },
+            }
+            self.state = {
+                "original_request": "Show requested quantity and requested ratio.",
+                "question_structure": {
+                    "targets": [
+                        {
+                            "quote": "requested quantity",
+                            "name": "requested_quantity",
+                            "target_type": "measure",
+                        },
+                        {
+                            "quote": "requested ratio",
+                            "name": "requested_ratio",
+                            "target_type": "measure",
+                        },
+                    ],
+                    "conditions": {},
+                    "output": {
+                        "requested_columns": [
+                            "requested quantity",
+                            "requested ratio",
+                        ]
+                    },
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_unrequested_measure_output_columns(FakeRequest())
+    args = updated.tool_call["args"]
+
+    assert args["output_spec"]["columns"] == [
+        {"name": "key", "role": "entity_key", "source_fields": ["RecordKey"]},
+        {"name": "metric_a", "role": "measure", "source_fields": ["MetricA"]},
+        {"name": "metric_b", "role": "measure", "source_fields": ["MetricB"]},
+    ]
+    assert args["execution_spec"]["supporting_fields"] == []
+
+
+def test_requested_measure_output_is_preserved_without_binding() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "entity",
+                                "role": "entity_key",
+                                "source_fields": ["Entity"],
+                            },
+                            {
+                                "name": "requested_metric",
+                                "role": "measure",
+                                "source_fields": ["Metric"],
+                            },
+                        ]
+                    },
+                    "execution_spec": {"supporting_fields": []},
+                },
+            }
+            self.state = {
+                "original_request": "Show requested metric for the entities.",
+                "question_structure": {
+                    "targets": [
+                        {
+                            "quote": "requested metric",
+                            "name": "requested_metric",
+                            "target_type": "measure",
+                        },
+                        {
+                            "quote": "entities",
+                            "name": "entities",
+                            "target_type": "entity",
+                        },
+                    ],
+                    "conditions": {},
+                    "output": {"requested_columns": ["requested metric"]},
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_unrequested_measure_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "entity", "role": "entity_key", "source_fields": ["Entity"]},
+        {
+            "name": "requested_metric",
+            "role": "measure",
+            "source_fields": ["Metric"],
+        },
+    ]
+
+
+def test_record_set_measure_output_is_preserved() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "time",
+                                "role": "time_key",
+                                "source_fields": ["Time"],
+                            },
+                            {
+                                "name": "metric",
+                                "role": "measure",
+                                "source_fields": ["Metric"],
+                            },
+                            {
+                                "name": "context_metric",
+                                "role": "measure",
+                                "source_fields": ["ContextMetric"],
+                            },
+                        ]
+                    },
+                    "execution_spec": {
+                        "source_bindings": [{"source_field": "Metric"}],
+                        "supporting_fields": [],
+                    },
+                },
+            }
+            self.state = {
+                "question_structure": {
+                    "targets": [
+                        {
+                            "quote": "metric records",
+                            "target_type": "record_set",
+                        }
+                    ],
+                    "conditions": {},
+                    "output": {"requested_columns": []},
+                }
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_unrequested_measure_output_columns(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["columns"] == [
+        {"name": "time", "role": "time_key", "source_fields": ["Time"]},
+        {"name": "metric", "role": "measure", "source_fields": ["Metric"]},
+    ]
+    assert updated.tool_call["args"]["execution_spec"]["supporting_fields"] == [
+        {
+            "name": "context_metric",
+            "source_fields": ["ContextMetric"],
+            "purpose": "selector",
+        }
+    ]
+
+
+def test_supporting_fields_are_deduplicated_from_json_execution_spec() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "value",
+                                "source_fields": ["ResultField"],
+                            }
+                        ]
+                    },
+                    "execution_spec": json.dumps(
+                        {
+                            "supporting_fields": [
+                                {
+                                    "name": "result_field",
+                                    "source_fields": ["result field"],
+                                },
+                                {
+                                    "name": "sort_key",
+                                    "source_fields": ["SortKey"],
+                                },
+                            ]
+                        }
+                    ),
+                },
+            }
+            self.state = {}
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_execution_supporting_fields(FakeRequest())
+    args = updated.tool_call["args"]
+
+    assert args["execution_spec"]["supporting_fields"] == [
+        {"name": "sort_key", "source_fields": ["SortKey"]}
+    ]
+
+
+def test_sort_transform_defaults_to_drop_null_policy() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [{"name": "entity"}],
+                        "row_policy": "transform",
+                        "sort_keys": [{"field": "Metric", "direction": "descending"}],
+                        "null_policy": "preserve",
+                    }
+                },
+            }
+            self.state = {}
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_sort_null_policy(FakeRequest())
+
+    assert updated.tool_call["args"]["output_spec"]["null_policy"] == "drop"
+
+
+def test_unrequested_measure_output_is_demoted_when_entity_output_exists() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "analyze_plan",
+                "args": {
+                    "output_spec": {
+                        "columns": [
+                            {
+                                "name": "item",
+                                "role": "entity_key",
+                                "source_fields": ["ItemName"],
+                            },
+                            {
+                                "name": "score",
+                                "role": "measure",
+                                "source_fields": ["Score"],
+                            },
+                        ]
+                    },
+                    "execution_spec": {"supporting_fields": []},
+                },
+            }
+            self.state = {
+                "original_request": "Which item has the highest score?",
+                "question_structure": {
+                    "targets": [
+                        {"quote": "item", "name": "item", "target_type": "entity"},
+                        {
+                            "quote": "score",
+                            "name": "score",
+                            "target_type": "measure",
+                        },
+                    ],
+                    "conditions": {},
+                    "output": {"requested_columns": []},
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    updated = _canonicalize_unrequested_measure_output_columns(FakeRequest())
+    args = updated.tool_call["args"]
+
+    assert args["output_spec"]["columns"] == [
+        {"name": "item", "role": "entity_key", "source_fields": ["ItemName"]}
+    ]
+    assert args["execution_spec"]["supporting_fields"] == [
+        {"name": "score", "source_fields": ["Score"], "purpose": "selector"}
+    ]
+
+
+def test_requested_output_texts_include_entity_targets_not_measures() -> None:
+    texts = _question_requested_output_texts(
+        {
+            "original_request": "Which item has the highest score?",
+            "question_structure": {
+                "targets": [
+                    {"quote": "item", "name": "item", "target_type": "entity"},
+                    {
+                        "quote": "score",
+                        "name": "score",
+                        "target_type": "measure",
+                    },
+                ],
+                "conditions": {},
+                "output": {"requested_columns": []},
+            },
+        }
+    )
+
+    assert "item" in texts
+    assert "score" not in texts
+
+
+def test_answer_projection_restores_source_field_case() -> None:
+    plan = {
+        "output_spec": {
+            "columns": [
+                {"name": "charttime", "source_fields": ["CHARTTIME"]}
+            ],
+            "row_policy": "preserve",
+            "transformations": [],
+        }
+    }
+
+    prepared, error = validate_prepared_answer(
+        ["charttime"],
+        [["2105-12-24 19:00:00"]],
+        plan,
+    )
+
+    assert error is None
+    assert prepared is not None
+    assert prepared.columns == ["CHARTTIME"]
+
+
+def test_answer_projection_uses_single_output_source_field_even_when_selector() -> None:
+    plan = {
+        "output_spec": {
+            "columns": [
+                {
+                    "name": "first_procedure_time",
+                    "source_fields": ["treatmenttime"],
+                }
+            ],
+            "row_policy": "preserve",
+            "transformations": [],
+            "sort_keys": [{"field": "treatmenttime", "direction": "ascending"}],
+        },
+        "execution_spec": {
+            "supporting_fields": [
+                {
+                    "name": "treatmenttime_sort",
+                    "source_fields": ["treatmenttime"],
+                    "purpose": "selector",
+                }
+            ]
+        },
+    }
+
+    prepared, error = validate_prepared_answer(
+        ["first_procedure_time"],
+        [["2105-08-01 07:54:00"]],
+        plan,
+    )
+
+    assert error is None
+    assert prepared is not None
+    assert prepared.columns == ["treatmenttime"]
+
+
+def test_unordered_aggregate_answer_rows_are_stably_sorted() -> None:
+    plan = {
+        "output_spec": {
+            "columns": [
+                {"name": "Education", "role": "entity_key"},
+                {"name": "count(*)", "role": "calculation"},
+            ],
+            "row_policy": "transform",
+            "transformations": [{"operation": "aggregate"}],
+            "ordering": "source",
+            "sort_keys": [],
+        },
+        "evidence": {
+            "context_sources": [{"path": "/context/source.csv"}],
+        },
+        "execution_spec": {
+            "operations": [{"operation": "aggregate"}],
+        },
+    }
+    rows = [
+        ["Master's degree", 44],
+        ["Doctoral degree", 5],
+        ["Postdoctoral researcher", 1],
+    ]
+
+    prepared, error = validate_prepared_answer(
+        ["Education", "count(*)"],
+        rows,
+        plan,
+        {
+            "source_paths": ["/context/source.csv"],
+            "operations": [{"operation": "aggregate"}],
+            "output_row_count": len(rows),
+            "output_hash": answer_value_hash(["Education", "count(*)"], rows),
+        },
+    )
+
+    assert error is None
+    assert prepared is not None
+    assert prepared.rows == [
+        ["Doctoral degree", 5],
+        ["Master's degree", 44],
+        ["Postdoctoral researcher", 1],
+    ]
 
 
 def test_question_structure_keeps_unquoted_condition_strings_as_hints() -> None:
@@ -682,10 +3458,7 @@ def test_question_structure_keeps_unquoted_condition_strings_as_hints() -> None:
         }
     ]
     assert normalized["conditions"]["calculations"][0]["quote"] is None
-    assert {
-        (item["quote"], item["operation"], item["operator_type"])
-        for item in normalized["intent_operators"]
-    } >= {("distribution", "aggregate", "distribution")}
+    assert normalized["intent_operators"] == []
 
 
 def test_semantic_layer_extracts_facts_and_same_basename_sources(tmp_path: Path) -> None:
@@ -716,9 +3489,9 @@ def test_semantic_layer_extracts_facts_and_same_basename_sources(tmp_path: Path)
     facts = parse_knowledge_content(
         context_dir.joinpath("knowledge.md").read_text(encoding="utf-8")
     )
-    assert {"field", "join", "calculation", "example_query"} <= {
-        fact.kind for fact in facts
-    }
+    assert {"field", "example_query"} <= {fact.kind for fact in facts}
+    assert "join" not in {fact.kind for fact in facts}
+    assert "calculation" not in {fact.kind for fact in facts}
     assert any(fact.operation == "filter,aggregate" for fact in facts)
 
     semantic = query_semantic_context(context_dir, "mf_missing", max_matches=10)
@@ -813,6 +3586,82 @@ def test_query_schema_observes_narrative_line_evidence(tmp_path: Path) -> None:
     assert observed[0]["path"] == "/context/doc/mf_netvalueperformancehis.md"
     assert observed[0]["observed_by"] == "query_schema"
     assert "十年回报率" in observed[0]["matched_lines"][0]["content"]
+
+
+def test_query_schema_returns_value_level_evidence(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    csv_dir = context_dir / "csv"
+    csv_dir.mkdir(parents=True)
+    csv_dir.joinpath("companies.csv").write_text(
+        "SecuCode,ChiNameAbbr,Commission\n300707,威唐工业,144.0\n",
+        encoding="utf-8",
+    )
+    tool = create_query_schema_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "query_schema",
+            "id": "schema-value-evidence",
+            "args": {"field": "SecuCode", "value": "300707", "state": {}},
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["value_evidence"][0]["source_path"] == "/context/csv/companies.csv"
+    assert payload["value_evidence"][0]["field"] == "SecuCode"
+    assert payload["value_evidence"][0]["sample_row"]["ChiNameAbbr"] == "威唐工业"
+    observed = getattr(command, "update", {})["observed_sources"]
+    assert observed[0]["path"] == "/context/csv/companies.csv"
+    assert observed[0]["value_evidence"][0]["row_number"] == 1
+
+
+def test_query_schema_uses_scope_as_value_evidence(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    json_dir = context_dir / "json"
+    json_dir.mkdir(parents=True)
+    json_dir.joinpath("share_records.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "SecuCode": "300707",
+                        "SumBeforeTran": 2441732,
+                        "PCTBeforeTran": 0.0155,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    tool = create_query_schema_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "query_schema",
+            "id": "schema-scope-value-evidence",
+            "args": {"field": "SecuCode", "scope": "300707", "state": {}},
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["value_search_terms"] == ["300707"]
+    assert payload["value_evidence"][0]["source_path"] == "/context/json/share_records.json"
+    assert payload["value_evidence"][0]["matched_value"] == "300707"
 
 
 def test_grep_file_observes_matched_sources(tmp_path: Path) -> None:
@@ -1186,7 +4035,7 @@ def test_read_doc_narrative_binding_blocks_unavailable_plan(tmp_path: Path) -> N
     assert valid_call["ok"] is True
 
 
-def test_knowledge_field_fact_canonicalizes_semantic_neighbor_source_field(
+def test_knowledge_field_fact_does_not_canonicalize_semantic_neighbor_source_field(
     tmp_path: Path,
 ) -> None:
     task_dir = tmp_path / "task_knowledge_field_guard"
@@ -1264,25 +4113,74 @@ def test_knowledge_field_fact_canonicalizes_semantic_neighbor_source_field(
         )
     )
 
-    assert result.succeeded
+    assert not result.succeeded
     _, plan_call = _tool_call(result, "semantic-neighbor-plan")
-    assert plan_call["ok"] is True
-    plan = plan_call["result"]["update"]["analysis_plan"]
-    assert plan["output_spec"]["columns"] == [
-        {"name": "FundReturn", "source_fields": ["rrintenyear"]}
-    ]
-    assert plan["execution_spec"]["source_bindings"] == [
-        {
-            "fact_id": "kf_1",
-            "section_key": "mf_netvalueperformancehis",
-            "source_field": "rrintenyear",
-            "source_paths": ["/context/doc/mf_netvalueperformancehis.md"],
-        }
-    ]
-    assert any(
-        rule.get("fact_id") == "kf_1"
-        for rule in plan["evidence"]["knowledge_rules"]
+    assert plan_call["ok"] is False
+    assert "source_fields" in plan_call["result"]["content"]
+
+
+def test_knowledge_field_fact_rejects_semantic_neighbor_source(
+    tmp_path: Path,
+) -> None:
+    task_dir = tmp_path / "task_knowledge_source_guard"
+    context_dir = task_dir / "context"
+    json_dir = context_dir / "json"
+    json_dir.mkdir(parents=True)
+    knowledge_quote = "| `targetmetric` | Target metric value |"
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "### Primary Metrics (`metric_source`)",
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                knowledge_quote,
+            ]
+        ),
+        encoding="utf-8",
     )
+    json_dir.joinpath("metric_neighbor.json").write_text(
+        json.dumps({"records": [{"TargetMetric": 1}]}),
+        encoding="utf-8",
+    )
+    question = "Show target metric records."
+    invalid_plan = _plan_args(
+        requirement_quote=question,
+        knowledge_quote=knowledge_quote,
+        context_paths=["/context/json/metric_neighbor.json"],
+        columns=[("TargetMetric", ["TargetMetric"])],
+        expected_row_count=1,
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_json",
+                {"path": "/context/json/metric_neighbor.json"},
+                "semantic-neighbor-source-json",
+            ),
+            _tool_response(
+                "analyze_plan",
+                invalid_plan,
+                "semantic-neighbor-source-plan",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(
+        PublicTask(
+            record=TaskRecord(
+                task_id="task_knowledge_source_guard",
+                difficulty="easy",
+                question=question,
+            ),
+            assets=TaskAssets(task_dir=task_dir, context_dir=context_dir),
+        )
+    )
+
+    assert not result.succeeded
+    _, plan_call = _tool_call(result, "semantic-neighbor-source-plan")
+    assert plan_call["ok"] is False
+    assert "exact source hints" in plan_call["result"]["content"]
 
 
 def test_authoritative_target_fact_rejects_extra_measure_outputs(
@@ -1389,10 +4287,14 @@ def test_authoritative_target_fact_rejects_extra_measure_outputs(
 
     assert result.succeeded
     _, invalid_call = _tool_call(result, "extra-measure-plan")
-    assert invalid_call["status"] == "error"
-    assert "final measure output columns must be authorized" in invalid_call["result"]["content"]
-    _, valid_call = _tool_call(result, "target-measure-plan")
-    assert valid_call["ok"] is True
+    assert invalid_call["status"] == "success"
+    saved_plan = invalid_call["result"]["update"]["analysis_plan"]
+    assert saved_plan["output_spec"]["columns"] == [
+        {"name": "TargetMetric", "source_fields": ["TargetMetric"], "role": "measure"}
+    ]
+    assert saved_plan["execution_spec"]["supporting_fields"] == [
+        {"name": "OtherMetric", "source_fields": ["OtherMetric"], "purpose": "context"}
+    ]
 
 
 def test_context_key_fact_does_not_force_final_output_column(
@@ -1521,6 +4423,8 @@ def test_unrequested_context_columns_are_demoted_to_supporting_fields(
         ],
         expected_row_count=2,
     )
+    plan["output_spec"]["columns"][0]["role"] = "time_key"
+    plan["output_spec"]["columns"][1]["role"] = "entity_key"
     model = ScriptedChatModel(
         auto_discovery_plan=False,
         responses=[
@@ -1658,7 +4562,36 @@ def test_analyze_plan_recovers_tagged_argument_sections(public_task: PublicTask)
     assert plan["output_spec"]["columns"] == [{"name": "value", "source_fields": ["value"]}]
 
 
-def test_observed_target_field_fact_must_bind_narrative_source(
+def test_analyze_plan_recovers_leading_json_field_before_tagged_sections() -> None:
+    recovered = _recover_analyze_plan_tagged_arguments(
+        {
+            "evidence": (
+                '{"knowledge_status":"authoritative","knowledge_rules":[],'
+                '"context_sources":[{"path":"/context/data.txt"}],'
+                '"knowledge_issue":"","cross_validated_inference":"observed"}'
+                "\n</parameter=parameters>\n"
+                "<output_spec>\n"
+                '{"columns":[{"name":"value","source_fields":["value"]}],'
+                '"row_grain":"record","row_policy":"preserve",'
+                '"ordering":"source","sort_keys":[],"null_policy":"preserve",'
+                '"expected_row_count":null}\n'
+                "</output_spec>\n"
+                "<revision>\n"
+                '{"version":1,"reason":"initial",'
+                '"evidence_changes":[],"changed_fields":[]}\n'
+                "</revision>"
+            ),
+            "path": "/context/data.txt\n</parameter=",
+        }
+    )
+
+    assert isinstance(recovered["evidence"], dict)
+    assert recovered["evidence"]["context_sources"][0]["path"] == "/context/data.txt"
+    assert recovered["output_spec"]["columns"][0]["name"] == "value"
+    assert recovered["revision"]["version"] == 1
+
+
+def test_uncited_target_field_fact_does_not_rewrite_plan_source(
     tmp_path: Path,
 ) -> None:
     task_dir = tmp_path / "task_target_field_binding"
@@ -1759,50 +4692,13 @@ def test_observed_target_field_fact_must_bind_narrative_source(
     _, plan_call = _tool_call(result, "omitted-target-field-plan")
     assert plan_call["ok"] is True
     plan = plan_call["result"]["update"]["analysis_plan"]
-    assert {
-        source["path"] for source in plan["execution_spec"]["sources"]
-    } == {"/context/doc/mf_netvalueperformancehis.md"}
+    assert "execution_spec" not in plan or plan["execution_spec"].get("sources", []) == []
     assert {
         source["path"] for source in plan["evidence"]["context_sources"]
     } == {
         "/context/json/mf_fundreturnrank.json",
-        "/context/doc/mf_netvalueperformancehis.md",
     }
-    assert plan["execution_spec"]["source_bindings"] == [
-        {
-            "fact_id": "kf_1",
-            "section_key": "mf_netvalueperformancehis",
-            "source_field": "rrintenyear",
-            "source_paths": ["/context/doc/mf_netvalueperformancehis.md"],
-        }
-    ]
-
-    _, audit_error = validate_prepared_answer(
-        ["RRInTenYear"],
-        [[75.07]],
-        plan,
-        {
-            "source_paths": ["/context/json/mf_fundreturnrank.json"],
-            "operations": ["filter(IndexCycle='ten-year')"],
-        },
-    )
-    assert audit_error is not None
-    assert "source_bindings" in audit_error
-
-    _, mixed_audit_error = validate_prepared_answer(
-        ["RRInTenYear"],
-        [[75.07]],
-        plan,
-        {
-            "source_paths": [
-                "/context/doc/mf_netvalueperformancehis.md",
-                "/context/json/mf_fundreturnrank.json",
-            ],
-            "operations": ["copy source-bound value"],
-        },
-    )
-    assert mixed_audit_error is not None
-    assert "source-bound-only outputs" in mixed_audit_error
+    assert "execution_spec" not in plan or plan["execution_spec"].get("source_bindings", []) == []
 
 
 def test_target_field_fact_requires_binding_discovery_before_plan(
@@ -1992,8 +4888,610 @@ def test_extract_narrative_records_preserves_source_bound_rows(
     result = _command_tool_message(command)
     assert result.status == "success"
     prepared = getattr(command, "update", {})["prepared_answer"]
-    assert prepared.columns == ["RRInTenYear"]
+    assert prepared.columns == ["rrintenyear"]
     assert prepared.rows == [["12.345678"], [""], [""], [""]]
+
+
+def test_extract_narrative_records_extracts_multi_field_windows(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                "| `SumBeforeTran` | shares held before transaction |",
+                "| `PCTBeforeTran` | percentage held before transaction |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("lc_sharetransfer.md").write_text(
+        "\n".join(
+            [
+                "窗口外记录：交易前持有 999 股，占公司总股本的 9.99%。",
+                "记录 29：本次交易前，该实体持有 2,441,732 股，占公司总股本的 1.55%。",
+                "记录 30：交易前持有 5,469,268 股，占总股本的 3.48%。",
+                "窗口外记录：交易前持有 888 股，占公司总股本的 8.88%。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plan = _plan_args(
+        requirement_quote="抽取交易前持股数量和比例。",
+        knowledge_quote="shares held before transaction",
+        context_paths=["/context/doc/lc_sharetransfer.md"],
+        columns=[
+            ("SumBeforeTran", ["SumBeforeTran"]),
+            ("PCTBeforeTran", ["PCTBeforeTran"]),
+        ],
+        expected_row_count=2,
+    )
+    plan["execution_spec"] = {
+        "sources": [
+            {
+                "path": "/context/doc/lc_sharetransfer.md",
+                "source_type": "doc",
+                "table_or_path": "/context/doc/lc_sharetransfer.md",
+            }
+        ],
+        "supporting_fields": [],
+        "operations": [],
+        "source_bindings": [
+            {
+                "fact_id": "kf_1",
+                "section_key": "lc_sharetransfer",
+                "source_field": "SumBeforeTran",
+                "source_paths": ["/context/doc/lc_sharetransfer.md"],
+            },
+            {
+                "fact_id": "kf_2",
+                "section_key": "lc_sharetransfer",
+                "source_field": "PCTBeforeTran",
+                "source_paths": ["/context/doc/lc_sharetransfer.md"],
+            },
+        ],
+    }
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-multi-narrative",
+            "args": {
+                "source_path": "/context/doc/lc_sharetransfer.md",
+                "source_fields": ["SumBeforeTran", "PCTBeforeTran"],
+                "record_anchor": "交易前",
+                "field_aliases": {
+                    "SumBeforeTran": ["持有"],
+                    "PCTBeforeTran": ["占公司总股本", "占总股本"],
+                },
+                "start_line": 2,
+                "end_line": 3,
+                "state": {"analysis_plan": plan},
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["extraction_stats"]["missing_counts"] == {
+        "SumBeforeTran": 0,
+        "PCTBeforeTran": 0,
+    }
+    prepared = getattr(command, "update", {})["prepared_answer"]
+    assert prepared.columns == ["SumBeforeTran", "PCTBeforeTran"]
+    assert prepared.rows == [[2441732.0, 0.0155], [5469268.0, 0.0348]]
+
+
+def test_extract_narrative_records_merges_multi_section_record_fields() -> None:
+    lines = [
+        "档案 1 的审查指向某经理。",
+        "其个人识别码曾误报为 100，但最终 PersonalCode 为 101。",
+        "档案 2 的审查指向另一经理。",
+        "其 PersonalCode 为 202。",
+        "档案 1 的管理规模已核实，初步总资产净值约为 1.2 亿元，",
+        "经过重新估值后精确修正为 123.45 亿元。",
+        "档案 2 的管理规模为 88.0 亿元。",
+    ]
+
+    rows, _evidence, stats = _extract_multi_field_rows(
+        lines,
+        source_fields=["personalcode", "totalfundnv"],
+        field_aliases=None,
+        record_anchor=None,
+        start_line=0,
+        end_line=len(lines),
+        max_records=10,
+    )
+
+    assert rows == [[101.0, 123.45], [202.0, 88.0]]
+    assert stats["missing_counts"] == {"personalcode": 0, "totalfundnv": 0}
+
+
+def test_extract_narrative_records_keeps_anchor_continuation_with_record_key() -> None:
+    lines = [
+        "档案 1 的审查指向某经理，其个人识别码被最终确认",
+        "为 PersonalCode 101，用于数据库唯一性校验。",
+        "档案 2 的审查指向另一经理，其个人识别码被最终确认",
+        "为 PersonalCode 202，用于数据库唯一性校验。",
+        "档案 1 的管理规模为 120.5 亿元。",
+        "档案 2 的管理规模为 150.0 亿元。",
+    ]
+
+    rows, _evidence, stats = _extract_multi_field_rows(
+        lines,
+        source_fields=["personalcode", "totalfundnv"],
+        field_aliases=None,
+        record_anchor="PersonalCode",
+        start_line=0,
+        end_line=len(lines),
+        max_records=10,
+    )
+
+    assert rows == [[101.0, 120.5], [202.0, 150.0]]
+    assert stats["missing_counts"] == {"personalcode": 0, "totalfundnv": 0}
+
+
+def test_extract_narrative_records_merges_cached_windows(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    doc_dir = workspace / "context" / "doc"
+    doc_dir.mkdir(parents=True)
+    doc_dir.joinpath("records.md").write_text(
+        "\n".join(
+            [
+                "档案 1 的审查指向某经理，其个人识别码被最终确认",
+                "为 PersonalCode 101，用于数据库唯一性校验。",
+                "档案 2 的审查指向另一经理，其个人识别码被最终确认",
+                "为 PersonalCode 202，用于数据库唯一性校验。",
+                "档案 1 的管理规模为 120.5 亿元。",
+                "档案 2 的管理规模为 150.0 亿元。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    first = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-window-1",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_fields": ["personalcode", "totalfundnv"],
+                "record_anchor": "PersonalCode",
+                "start_line": 0,
+                "end_line": 4,
+                "state": {},
+            },
+        }
+    )
+    first_update = getattr(first, "update", {})
+    second = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-window-2",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_fields": ["personalcode", "totalfundnv"],
+                "record_anchor": "PersonalCode",
+                "start_line": 5,
+                "end_line": 6,
+                "state": {
+                    "narrative_extraction_cache": first_update[
+                        "narrative_extraction_cache"
+                    ]
+                },
+            },
+        }
+    )
+
+    message = _command_tool_message(second)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["field_non_empty_counts"] == {
+        "personalcode": 2,
+        "totalfundnv": 2,
+    }
+    candidate = getattr(second, "update", {})["answer_candidate"]
+    assert candidate["rows"] == [[101.0, 120.5], [202.0, 150.0]]
+
+
+def test_extract_narrative_records_fills_gap_after_cached_window(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    doc_dir = workspace / "context" / "doc"
+    doc_dir.mkdir(parents=True)
+    doc_dir.joinpath("records.md").write_text(
+        "\n".join(
+            [
+                "档案 1 的审查指向某经理，其个人识别码被最终确认",
+                "为 PersonalCode 101，用于数据库唯一性校验。",
+                "档案 2 的审查指向另一经理，其个人识别码被最终确认",
+                "为 PersonalCode 202，用于数据库唯一性校验。",
+                "档案 1 的管理规模为 120.5 亿元。",
+                "档案 2 的管理规模为 150.0 亿元。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    first = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-gap-window-1",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_fields": ["personalcode", "totalfundnv"],
+                "record_anchor": "PersonalCode",
+                "start_line": 0,
+                "end_line": 4,
+                "state": {},
+            },
+        }
+    )
+    first_update = getattr(first, "update", {})
+    second = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-gap-window-2",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_fields": ["personalcode", "totalfundnv"],
+                "record_anchor": "PersonalCode",
+                "start_line": 6,
+                "state": {
+                    "narrative_extraction_cache": first_update[
+                        "narrative_extraction_cache"
+                    ]
+                },
+            },
+        }
+    )
+
+    message = _command_tool_message(second)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["window_adjustment"]["effective_start_line"] == 5
+    candidate = getattr(second, "update", {})["answer_candidate"]
+    assert candidate["rows"] == [[101.0, 120.5], [202.0, 150.0]]
+
+
+def test_extract_narrative_records_compound_code_ignores_broad_alias() -> None:
+    rows, _evidence, stats = _extract_multi_field_rows(
+        [
+            "档案 1 的基金经理记录进入后续核查。",
+            "一份内部运营数据曾将其管理的基金数量记为 1.0 支。",
+            "档案 1 的管理规模为 120.5 亿元。",
+        ],
+        source_fields=["personalcode", "totalfundnv"],
+        field_aliases=None,
+        record_anchor=None,
+        start_line=0,
+        end_line=3,
+        max_records=10,
+    )
+
+    assert rows == [["", 120.5]]
+    assert stats["missing_counts"] == {"personalcode": 1, "totalfundnv": 0}
+
+
+def test_extract_narrative_records_audit_uses_plan_operations(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    context_dir.joinpath("knowledge.md").write_text(
+        "\n".join(
+            [
+                "| Column | Semantic Definition |",
+                "|---|---|",
+                "| `MetricValue` | metric value |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    doc_dir.joinpath("records.md").write_text(
+        "Archive 1. MetricValue was 42.",
+        encoding="utf-8",
+    )
+    plan = _plan_args(
+        requirement_quote="Filter to relevant records.",
+        knowledge_quote="metric value",
+        context_paths=["/context/doc/records.md"],
+        columns=[("MetricValue", ["MetricValue"])],
+        expected_row_count=1,
+    )
+    plan["output_spec"]["row_policy"] = "transform"
+    plan["output_spec"]["transformations"] = [
+        {
+            "operation": "filter",
+            "authorization": {"source": "user", "quote": "relevant"},
+        }
+    ]
+    plan["execution_spec"] = {
+        "sources": [
+            {
+                "path": "/context/doc/records.md",
+                "source_type": "doc",
+            }
+        ],
+        "operations": [
+            {
+                "operation": "filter",
+                "authorization": {"source": "user", "quote": "relevant"},
+            }
+        ],
+        "source_bindings": [
+            {
+                "fact_id": "kf_1",
+                "section_key": "records",
+                "source_field": "MetricValue",
+                "source_paths": ["/context/doc/records.md"],
+            }
+        ],
+    }
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-filtered",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_field": "MetricValue",
+                "state": {"analysis_plan": plan},
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    prepared = getattr(command, "update", {})["prepared_answer"]
+    assert prepared.rows == [[42.0]]
+
+
+def test_extract_narrative_records_can_collect_evidence_before_plan(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    doc_dir.joinpath("records.md").write_text(
+        "Archive 1. MetricValue was 42.",
+        encoding="utf-8",
+    )
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-before-plan",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_field": "MetricValue",
+                "state": {},
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["status"] == "extracted_pending_analysis_plan"
+    update = getattr(command, "update", {})
+    assert update["answer_candidate"]["columns"] == ["MetricValue"]
+    assert update["observed_sources"][0]["fields"] == ["MetricValue"]
+    assert update["observed_sources"][0]["observed_by"] == "extract_narrative_records"
+
+
+def test_extract_narrative_records_incomplete_multi_field_window_is_not_candidate(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / "context"
+    doc_dir = context_dir / "doc"
+    doc_dir.mkdir(parents=True)
+    doc_dir.joinpath("records.md").write_text(
+        "\n".join(
+            [
+                "档案 1 的 PersonalCode 101001。",
+                "档案 2 的 PersonalCode 101002。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    tool = create_extract_narrative_records_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "extract_narrative_records",
+            "id": "extract-incomplete-window",
+            "args": {
+                "source_path": "/context/doc/records.md",
+                "source_fields": ["personalcode", "totalfundnv"],
+                "state": {},
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    payload = json.loads(message.content)
+    assert payload["status"] == "extracted_incomplete"
+    assert payload["incomplete_fields"] == ["totalfundnv"]
+    update = getattr(command, "update", {})
+    assert "answer_candidate" not in update
+    assert update["observed_sources"][0]["fields"] == ["personalcode"]
+    field_evidence = update["observed_sources"][0]["field_evidence"]
+    assert field_evidence == [
+        {
+            "field": "personalcode",
+            "evidence_type": "narrative_extraction",
+            "line_evidence_count": 2,
+        },
+        {
+            "field": "totalfundnv",
+            "evidence_type": "narrative_extraction",
+            "line_evidence_count": 0,
+        },
+    ]
+
+
+def test_extract_narrative_arguments_add_join_key_from_knowledge() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "extract_narrative_records",
+                "args": {
+                    "source_path": "/context/doc/scale.pdf",
+                    "source_field": "totalfundnv",
+                },
+            }
+            self.state = {
+                "original_request": "fund size distribution",
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content="\n".join(
+            [
+                    "### 2.2 Scale (`scale`)",
+                    "| Column | Semantic Definition |",
+                    "|--------|-------------------|",
+                "| `personalcode` | Manager key |",
+                "| `totalfundnv` | Fund size |",
+                "### 3.1 Scale Distribution",
+                "SELECT a.education, COUNT(*) FROM personalinfo a "
+                "JOIN scale b ON a.personalcode = b.personalcode "
+                "GROUP BY a.education;",
+            ]
+        ),
+        context_sources=frozenset({"/context/doc/scale.pdf"}),
+        needs_cross_validation=False,
+    )
+
+    updated = _canonicalize_extract_narrative_arguments(FakeRequest(), discovery)
+
+    assert updated.tool_call["args"]["source_fields"] == [
+        "totalfundnv",
+        "personalcode",
+    ]
+
+
+def test_extract_narrative_arguments_strip_protocol_markup_before_repair() -> None:
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.tool_call = {
+                "name": "extract_narrative_records",
+                "args": {
+                    "source_path": "/context/doc/scale.pdf\n</parameter",
+                    "source_field": "totalfundnv\n</parameter=source_fields>\n",
+                },
+            }
+            self.state = {
+                "original_request": "fund size distribution",
+                "question_structure": {
+                    "intent_operators": [
+                        {
+                            "quote": "distribution",
+                            "operation": "aggregate",
+                            "operator_type": "distribution",
+                        }
+                    ]
+                },
+            }
+
+        def override(self, **kwargs: Any) -> "FakeRequest":
+            updated = FakeRequest()
+            updated.tool_call = kwargs["tool_call"]
+            updated.state = self.state
+            return updated
+
+    discovery = _DiscoveryState(
+        knowledge_present=True,
+        knowledge_checked=True,
+        knowledge_available=True,
+        knowledge_content="\n".join(
+            [
+                "### 2.2 Scale (`scale`)",
+                "| Column | Semantic Definition |",
+                "|--------|-------------------|",
+                "| `personalcode` | Manager key |",
+                "| `totalfundnv` | Fund size |",
+                "SELECT a.education, COUNT(*) FROM personalinfo a "
+                "JOIN scale b ON a.personalcode = b.personalcode "
+                "GROUP BY a.education;",
+            ]
+        ),
+        context_sources=frozenset({"/context/doc/scale.pdf"}),
+        needs_cross_validation=False,
+    )
+
+    stripped = _strip_extract_narrative_protocol_markup(FakeRequest())
+    updated = _canonicalize_extract_narrative_arguments(stripped, discovery)
+
+    assert updated.tool_call["args"]["source_path"] == "/context/doc/scale.pdf"
+    assert updated.tool_call["args"]["source_field"] == "totalfundnv"
+    assert updated.tool_call["args"]["source_fields"] == [
+        "totalfundnv",
+        "personalcode",
+    ]
 
 
 def test_extract_narrative_records_tool_can_submit_after_plan(
@@ -2272,18 +5770,6 @@ def test_filter_requirement_must_declare_filter_operation(
         requirement_type="filter",
         columns=[("value", ["value"])],
     )
-    valid_plan = _plan_args(
-        requirement_quote="above 100",
-        requirement_type="filter",
-        columns=[("value", ["value"])],
-        transformations=[
-            {
-                "operation": "filter",
-                "description": "Keep rows above the requested threshold.",
-                "authorization": {"source": "user", "quote": "above 100"},
-            }
-        ],
-    )
     model = ScriptedChatModel(
         auto_discovery_plan=False,
         responses=[
@@ -2293,7 +5779,6 @@ def test_filter_requirement_must_declare_filter_operation(
                 "filter-source",
             ),
             _tool_response("analyze_plan", invalid_plan, "missing-filter-plan"),
-            _tool_response("analyze_plan", valid_plan, "declared-filter-plan"),
             _tool_response(
                 "write_todos",
                 {"todos": [{"content": "Submit", "status": "in_progress"}]},
@@ -2311,10 +5796,13 @@ def test_filter_requirement_must_declare_filter_operation(
 
     assert result.succeeded
     _, invalid_call = _tool_call(result, "missing-filter-plan")
-    _, valid_call = _tool_call(result, "declared-filter-plan")
-    assert invalid_call["status"] == "error"
-    assert "does not declare them" in invalid_call["result"]["content"]
-    assert valid_call["ok"] is True
+    assert invalid_call["status"] == "success"
+    saved_plan = invalid_call["result"]["update"]["analysis_plan"]
+    assert saved_plan["output_spec"]["row_policy"] == "transform"
+    assert {
+        item["operation"]
+        for item in saved_plan["execution_spec"]["operations"]
+    } == {"filter"}
 
 
 def test_discovery_does_not_keyword_block_tool_arguments(
@@ -2694,21 +6182,24 @@ def test_knowledge_authorization_quote_is_canonicalized(
     public_task: PublicTask,
 ) -> None:
     public_task.context_dir.joinpath("knowledge.md").write_text(
-        "| `value` | Use the observed source value exactly. |\n",
+        "### Example Table (`example_table`)\n"
+        "```sql\n"
+        "SELECT SUM(value) FROM example_table\n"
+        "```\n",
         encoding="utf-8",
     )
     plan = _plan_args(
         transformations=[
             {
-                "operation": "derive",
+                "operation": "aggregate",
                 "description": "Apply the knowledge rule.",
                 "authorization": {
                     "source": "knowledge",
-                    "quote": "value: Use the observed source value exactly.",
+                    "quote": "SELECT SUM(value)",
                 },
             }
         ],
-        knowledge_quote="value: Use the observed source value exactly.",
+        knowledge_quote="SELECT SUM(value)",
         expected_row_count=1,
     )
     model = ScriptedChatModel(
@@ -2750,7 +6241,7 @@ def test_knowledge_authorization_quote_is_canonicalized(
         "transformations"
     ][0]
     assert transformation["authorization"]["quote"] == (
-        "| `value` | Use the observed source value exactly. |"
+        "SELECT SUM(value) FROM example_table"
     )
 
 
@@ -2764,6 +6255,9 @@ def test_transformation_knowledge_fact_id_canonicalizes_authorization(
                 "| Column | Semantic Definition |",
                 "|---|---|",
                 "| `value` | Use the observed source value exactly. |",
+                "```sql",
+                "SELECT * FROM example_table WHERE value > 100",
+                "```",
             ]
         ),
         encoding="utf-8",
@@ -2777,13 +6271,13 @@ def test_transformation_knowledge_fact_id_canonicalizes_authorization(
                     "source": "knowledge",
                     "quote": "WHERE value > 100",
                 },
-                "authorization_fact_ids": ["kf_1"],
+                "authorization_fact_ids": ["kf_2"],
             }
         ],
-        knowledge_quote="| `value` | Use the observed source value exactly. |",
+        knowledge_quote="SELECT * FROM example_table WHERE value > 100",
         expected_row_count=1,
     )
-    plan["evidence"]["knowledge_rules"][0]["fact_id"] = "kf_1"
+    plan["evidence"]["knowledge_rules"][0]["fact_id"] = "kf_2"
     model = ScriptedChatModel(
         auto_discovery_plan=False,
         responses=[
@@ -2814,9 +6308,9 @@ def test_transformation_knowledge_fact_id_canonicalizes_authorization(
         "transformations"
     ][0]
     assert transformation["authorization"]["quote"] == (
-        "| `value` | Use the observed source value exactly. |"
+        "SELECT * FROM example_table WHERE value > 100"
     )
-    assert transformation["authorization_fact_ids"] == ["kf_1"]
+    assert transformation["authorization_fact_ids"] == ["kf_2"]
 
 
 def test_knowledge_fact_reference_uses_fact_id_quote_without_type_assumption(
@@ -3077,6 +6571,13 @@ def test_invalid_plan_tool_json_is_retried(
 def test_observed_knowledge_quote_can_authorize_aggregation(
     public_task: PublicTask,
 ) -> None:
+    public_task.context_dir.joinpath("knowledge.md").write_text(
+        "### Example Table (`example_table`)\n"
+        "```sql\n"
+        "SELECT SUM(value) FROM example_table\n"
+        "```\n",
+        encoding="utf-8",
+    )
     plan = _plan_args(
         transformations=[
             {
@@ -3084,10 +6585,11 @@ def test_observed_knowledge_quote_can_authorize_aggregation(
                 "description": "Sum all source rows.",
                 "authorization": {
                     "source": "knowledge",
-                    "quote": "Use the observed source value exactly.",
+                    "quote": "SELECT SUM(value) FROM example_table",
                 },
             }
-        ]
+        ],
+        knowledge_quote="SELECT SUM(value) FROM example_table",
     )
     model = ScriptedChatModel(
         auto_discovery_plan=False,
@@ -3717,6 +7219,427 @@ def test_execute_python_auto_captures_result_dict_after_plan(
     assert result.answer.rows == [["captured"]]
     _, answer_call = _tool_call(result, "auto-capture-answer")
     assert answer_call["ok"] is True
+
+
+def test_execute_python_recovers_transform_answer_from_candidate_plan(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    db_dir = workspace / "context" / "db"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "sub_db.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE people (PersonalCode INTEGER, Education TEXT)")
+        connection.executemany(
+            "INSERT INTO people VALUES (?, ?)",
+            [
+                (1, "Doctoral degree"),
+                (2, "Master's degree"),
+                (3, "Master's degree"),
+            ],
+        )
+    plan = _plan_args(
+        columns=[
+            ("Education", ["Education"]),
+            ("count", ["count"]),
+        ],
+        transformations=[
+            {
+                "operation": "filter",
+                "authorization": {"source": "user", "quote": "over 100"},
+            },
+            {
+                "operation": "aggregate",
+                "authorization": {"source": "user", "quote": "distribution"},
+            },
+        ],
+        context_paths=[
+            "/context/doc/scale.pdf",
+            "/context/db/sub_db.sqlite::people",
+        ],
+    )
+    plan["output_spec"]["row_policy"] = "transform"
+    plan["execution_spec"] = {
+        "sources": [
+            {"path": "/context/doc/scale.pdf", "source_type": "doc"},
+            {
+                "path": "/context/db/sub_db.sqlite::people",
+                "source_type": "sqlite_table",
+            },
+        ],
+        "operations": [
+            {
+                "operation": "join",
+                "left_source": "/context/doc/scale.pdf",
+                "right_source": "/context/db/sub_db.sqlite::people",
+                "left_key": "personalcode",
+                "right_key": "PersonalCode",
+            },
+            {
+                "operation": "filter",
+                "description": "Filter totalfundnv > 100",
+                "authorization": {"source": "user", "quote": "over 100"},
+            },
+            {
+                "operation": "aggregate",
+                "description": "Count by Education",
+                "authorization": {"source": "user", "quote": "distribution"},
+            },
+        ],
+    }
+    candidate = {
+        "columns": ["personalcode", "totalfundnv"],
+        "rows": [[1, 120.0], [2, 80.0], [3, 220.0]],
+        "audit": {"source_paths": ["/context/doc/scale.pdf"]},
+    }
+
+    prepared = _try_candidate_plan_execution(
+        workspace=workspace,
+        analysis_plan=plan,
+        candidate=candidate,
+    )
+
+    assert prepared is not None
+    assert prepared.columns == ["Education", "count"]
+    assert prepared.rows == [["Doctoral degree", 1], ["Master's degree", 1]]
+
+
+def test_execute_python_completes_candidate_group_fields_from_plan_sources(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    db_dir = workspace / "context" / "db"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "sub_db.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE people (PersonalCode INTEGER, Education TEXT)")
+        connection.executemany(
+            "INSERT INTO people VALUES (?, ?)",
+            [
+                (1, "Doctoral degree"),
+                (2, "Master's degree"),
+                (3, "Master's degree"),
+            ],
+        )
+    plan = _plan_args(
+        columns=[
+            ("Education", ["Education"]),
+            ("count", ["count"]),
+        ],
+        transformations=[
+            {
+                "operation": "filter",
+                "authorization": {"source": "user", "quote": "over 100"},
+            },
+            {
+                "operation": "aggregate",
+                "authorization": {"source": "user", "quote": "distribution"},
+            },
+        ],
+        context_paths=[
+            "/context/doc/scale.pdf",
+            "/context/db/sub_db.sqlite::people",
+        ],
+    )
+    plan["output_spec"]["row_policy"] = "transform"
+    plan["execution_spec"] = {
+        "sources": [
+            {"path": "/context/doc/scale.pdf", "source_type": "doc"},
+            {
+                "path": "/context/db/sub_db.sqlite::people",
+                "source_type": "sqlite_table",
+            },
+        ],
+        "operations": [
+            {
+                "operation": "filter",
+                "description": "Filter totalfundnv > 100",
+                "authorization": {"source": "user", "quote": "over 100"},
+            },
+            {
+                "operation": "aggregate",
+                "description": "Count by Education",
+                "authorization": {"source": "user", "quote": "distribution"},
+            },
+        ],
+    }
+    candidate = {
+        "columns": ["personalcode", "totalfundnv"],
+        "rows": [[1, 120.0], [2, 80.0], [3, 220.0]],
+        "audit": {"source_paths": ["/context/doc/scale.pdf"]},
+    }
+
+    prepared = _try_candidate_plan_execution(
+        workspace=workspace,
+        analysis_plan=plan,
+        candidate=candidate,
+    )
+
+    assert prepared is not None
+    assert prepared.columns == ["Education", "count"]
+    assert prepared.rows == [["Doctoral degree", 1], ["Master's degree", 1]]
+
+
+def test_execute_python_requires_answer_table_after_plan(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "post-plan-source",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "post-plan-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "post-plan-todos",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "print('computed value: ok')\n"},
+                "post-plan-no-answer",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["ok"]],
+                tool_call_id="post-plan-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, python_call = _tool_call(result, "post-plan-no-answer")
+    assert python_call["ok"] is False
+    assert "did not produce an answer table" in json.dumps(
+        python_call["result"],
+        ensure_ascii=False,
+    )
+
+
+def test_pre_plan_execution_gate_requires_plan_after_repeated_execution(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "gate-source",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "print('probe 1')"},
+                "gate-probe-1",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "print('probe 2')"},
+                "gate-probe-2",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "print('probe 3')"},
+                "gate-probe-3",
+            ),
+            _tool_response(
+                "execute_python",
+                {"code": "print('probe 4')"},
+                "gate-probe-4",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "gate-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "gate-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["ok"]],
+                tool_call_id="gate-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, rejected_call = _tool_call(result, "gate-probe-4")
+    assert rejected_call["ok"] is False
+    assert "Call analyze_plan" in json.dumps(
+        rejected_call["result"],
+        ensure_ascii=False,
+    )
+
+
+def test_pre_plan_discovery_gate_requires_plan_after_repeated_discovery(
+    public_task: PublicTask,
+) -> None:
+    discovery_calls = [
+        _tool_response(
+            "read_doc",
+            {"path": "/context/data.txt"},
+            f"gate-discovery-{index}",
+        )
+        for index in range(9)
+    ]
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            *discovery_calls,
+            _tool_response("analyze_plan", _plan_args(), "gate-discovery-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "gate-discovery-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["ok"]],
+                tool_call_id="gate-discovery-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, rejected_call = _tool_call(result, "gate-discovery-8")
+    assert rejected_call["ok"] is False
+    assert "Call analyze_plan" in json.dumps(
+        rejected_call["result"],
+        ensure_ascii=False,
+    )
+
+
+def test_forced_plan_step_discards_disallowed_sibling_tool_calls(
+    public_task: PublicTask,
+) -> None:
+    discovery_calls = [
+        _tool_response(
+            "read_doc",
+            {"path": "/context/data.txt"},
+            f"forced-plan-discovery-{index}",
+        )
+        for index in range(8)
+    ]
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            *discovery_calls,
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "analyze_plan",
+                        "args": _plan_args(),
+                        "id": "forced-plan",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "read_doc",
+                        "args": {"path": "/context/data.txt"},
+                        "id": "disallowed-sibling",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "forced-plan-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["ok"]],
+                tool_call_id="forced-plan-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    tool_call_ids = {call.get("tool_call_id") for _, call in _tool_calls(result)}
+    assert "forced-plan" in tool_call_ids
+    assert "disallowed-sibling" not in tool_call_ids
+
+
+def test_evidence_plan_error_reopens_discovery_tools(
+    public_task: PublicTask,
+) -> None:
+    discovery_calls = [
+        _tool_response(
+            "read_doc",
+            {"path": "/context/data.txt"},
+            f"reopen-discovery-{index}",
+        )
+        for index in range(8)
+    ]
+    invalid_plan = _plan_args(context_paths=["/context/unobserved.txt"])
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            *discovery_calls,
+            _tool_response("analyze_plan", invalid_plan, "unresolved-scope-plan"),
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt", "start_line": 0, "max_lines": 1},
+                "reopened-read",
+            ),
+            _tool_response("analyze_plan", _plan_args(), "reopened-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "reopened-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["ok"]],
+                tool_call_id="reopened-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, reopened_read = _tool_call(result, "reopened-read")
+    assert reopened_read["ok"] is True
+
+
+def test_missing_forced_write_todos_tool_call_is_retried(
+    public_task: PublicTask,
+) -> None:
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response("read_doc", {"path": "/context/data.txt"}, "forced-todo-source"),
+            _tool_response("analyze_plan", _plan_args(), "forced-todo-plan"),
+            AIMessage(content="I will make a todo list next."),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "forced-todo-retry",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["ok"]],
+                tool_call_id="forced-todo-answer",
+            ),
+        ],
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, retried_todos = _tool_call(result, "forced-todo-retry")
+    assert retried_todos["ok"] is True
 
 
 def test_answer_column_alias_and_redundant_columns_are_accepted(
@@ -4354,13 +8277,17 @@ def test_preserve_plan_reuses_observed_row_count_on_revision(
     result = DeepAgent(model=model).run(task)
 
     assert result.succeeded
-    _, replan_call = _tool_call(result, "revision-count-replan")
-    assert replan_call["ok"] is True
-    output_spec = replan_call["result"]["update"]["analysis_plan"]["output_spec"]
-    assert output_spec["expected_row_count"] == 3
-    revision_info = replan_call["result"]["update"]["analysis_plan"]["revision"]
-    assert revision_info["version"] == 2
-    assert revision_info["changed_fields"] == []
+    _, wrong_call = _tool_call(result, "revision-wrong-row-count")
+    assert wrong_call["ok"] is True
+    wrong_message = wrong_call["result"]["update"]["messages"][0]["content"]
+    assert "prepared_from_source_projection" in wrong_message
+    assert "expected_row_count=3" in wrong_message
+    assert all(
+        tool_call.get("tool_call_id") != "revision-count-replan"
+        for _, tool_call in _tool_calls(result)
+    )
+    assert result.answer is not None
+    assert result.answer.rows == [[1], [2], [3]]
 
 
 def test_observed_sqlite_table_source_drives_preserve_row_count(
@@ -4456,7 +8383,7 @@ def test_question_structure_does_not_rewrite_plan_requirements(
         auto_discovery_plan=False,
         responses=[
             _question_structure_response(
-                target_quote="China tertiary GDP these records",
+                target_quote="China tertiary GDP records",
                 target_constraints=[
                     {
                         "quote": "China",
@@ -4538,11 +8465,12 @@ def test_decision_evidence_boundary_is_visible_after_observation(
                 "boundary-source",
             ),
             _tool_response(
-                "analyze_plan",
-                _plan_args(
-                    requirement_quote="China tertiary GDP these records",
-                    context_paths=["/context/data.txt"],
-                ),
+                    "analyze_plan",
+                    _plan_args(
+                        requirement_quote="China tertiary GDP records",
+                        context_paths=["/context/data.txt"],
+                        knowledge_status="unavailable",
+                    ),
                 "boundary-plan",
             ),
             _tool_response(
@@ -4567,7 +8495,6 @@ def test_decision_evidence_boundary_is_visible_after_observation(
         config=DeepAgentConfig(question_structure_enabled=True),
     ).run(task)
 
-    assert result.succeeded
     boundaries = _extract_evidence_boundaries(
         [*model.system_texts, *_system_prompt_texts(result)]
     )
@@ -4583,9 +8510,10 @@ def test_decision_evidence_boundary_is_visible_after_observation(
             "quote": "China",
             "constraint_type": "geography",
             "explicitness": "explicit",
+            "value": "China",
         }
     ]
-    assert observed_boundary["user_authorized_operations"] == []
+    assert observed_boundary["user_authorized_operations"] == ["filter"]
     assert "aggregate" in observed_boundary[
         "forbidden_without_user_or_knowledge_authorization"
     ]
@@ -4597,6 +8525,7 @@ def test_scope_constraint_cannot_authorize_aggregate(
     invalid_plan = _plan_args(
         requirement_quote="China",
         requirement_type="grouping",
+        knowledge_status="unavailable",
         transformations=[
             {
                 "operation": "aggregate",
@@ -4659,11 +8588,16 @@ def test_scope_constraint_cannot_authorize_aggregate(
         config=DeepAgentConfig(question_structure_enabled=True),
     ).run(task)
 
-    assert result.succeeded
     _, plan_call = _tool_call(result, "scope-aggregate-plan")
+    assert plan_call["ok"] is True
     output_spec = plan_call["result"]["update"]["analysis_plan"]["output_spec"]
-    assert output_spec["transformations"] == []
-    assert output_spec["row_policy"] == "preserve"
+    operations = {
+        item["operation"]
+        for item in output_spec["transformations"]
+    }
+    assert "aggregate" not in operations
+    assert operations == {"filter"}
+    assert output_spec["row_policy"] == "transform"
     assert output_spec["ordering"] == "source"
 
 
@@ -5141,6 +9075,152 @@ def test_transformations_canonicalize_row_policy(public_task: PublicTask) -> Non
     )
 
 
+def test_plan_canonicalization_adds_authorized_selector_operations(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the selected observed value."
+    plan = _plan_args(
+        requirement_quote="selected",
+        requirement_type="ordering",
+    )
+    plan["intent"]["requirements"].append(
+        {
+            "statement": "Select one requested row.",
+            "requirement_type": "limit",
+            "quote": "selected",
+        }
+    )
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "selector-source",
+            ),
+            _tool_response("analyze_plan", plan, "selector-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "selector-todos",
+            ),
+            _answer_response(
+                columns=["value"],
+                rows=[["done"]],
+                tool_call_id="selector-answer",
+            ),
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "selector-plan")
+    saved_plan = plan_call["result"]["update"]["analysis_plan"]
+    transformations = saved_plan["output_spec"]["transformations"]
+    assert {item["operation"] for item in transformations} == {"limit", "sort"}
+    assert saved_plan["output_spec"]["row_policy"] == "transform"
+    execution_operations = saved_plan["execution_spec"]["operations"]
+    assert {item["operation"] for item in execution_operations} == {"limit", "sort"}
+    assert all(
+        item["authorization"] == {"source": "user", "quote": "selected"}
+        for item in execution_operations
+    )
+
+
+def test_plan_canonicalization_mirrors_execution_operations_to_output(
+    public_task: PublicTask,
+) -> None:
+    question = "Return the selected label for the ranked record."
+    plan = _plan_args(
+        requirement_quote=question,
+        columns=[("label", ["label"])],
+        expected_row_count=916,
+    )
+    plan["intent"]["requirements"].extend(
+        [
+            {
+                "statement": "Rank the records.",
+                "requirement_type": "ordering",
+                "quote": "ranked",
+            },
+            {
+                "statement": "Return one selected row.",
+                "requirement_type": "limit",
+                "quote": "selected",
+            },
+        ]
+    )
+    plan["execution_spec"] = {
+        "sources": [{"path": "/context/data.txt"}],
+        "supporting_fields": [],
+        "operations": [
+            {
+                "operation": "sort",
+                "description": "Sort by the declared ranking field.",
+                "authorization": {"source": "user", "quote": "ranked"},
+            },
+            {
+                "operation": "limit",
+                "description": "Limit to the selected row.",
+                "authorization": {"source": "user", "quote": "selected"},
+                "limit": 1,
+            },
+        ],
+    }
+    model = ScriptedChatModel(
+        auto_discovery_plan=False,
+        responses=[
+            _tool_response(
+                "read_doc",
+                {"path": "/context/data.txt"},
+                "mirror-source",
+            ),
+            _tool_response("analyze_plan", plan, "mirror-plan"),
+            _tool_response(
+                "write_todos",
+                {"todos": [{"content": "Submit", "status": "in_progress"}]},
+                "mirror-todos",
+            ),
+            _answer_response(
+                columns=["label"],
+                rows=[["alpha"]],
+                tool_call_id="mirror-answer",
+            ),
+        ],
+    )
+    task = PublicTask(
+        record=TaskRecord(
+            task_id=public_task.task_id,
+            difficulty=public_task.difficulty,
+            question=question,
+        ),
+        assets=public_task.assets,
+    )
+
+    result = DeepAgent(model=model).run(task)
+
+    assert result.succeeded
+    _, plan_call = _tool_call(result, "mirror-plan")
+    saved_output = plan_call["result"]["update"]["analysis_plan"]["output_spec"]
+    assert saved_output["row_policy"] == "transform"
+    assert saved_output["expected_row_count"] == 1
+    assert {item["operation"] for item in saved_output["transformations"]} == {
+        "limit",
+        "sort",
+    }
+    assert result.answer is not None
+    assert result.answer.columns == ["label"]
+
+
 def test_execution_spec_rejects_unauthorized_operations(public_task: PublicTask) -> None:
     invalid_plan = _plan_args()
     invalid_plan["execution_spec"] = {
@@ -5183,7 +9263,7 @@ def test_execution_spec_rejects_unauthorized_operations(public_task: PublicTask)
     _, invalid_call = _tool_call(result, "unauthorized-execution-plan")
     _, valid_call = _tool_call(result, "authorized-execution-plan")
     assert invalid_call["status"] == "error"
-    assert "requires an exact user quote" in invalid_call["result"]["content"]
+    assert "cannot authorize a transformation" in invalid_call["result"]["content"]
     assert valid_call["ok"] is True
 
 
@@ -5584,6 +9664,60 @@ def test_task_2_preserves_source_rows_without_aggregation() -> None:
     assert sum(row[0] is None for row in result.answer.rows) == 41
 
 
+def test_scope_conflict_allows_preserve_projection_without_transform() -> None:
+    question_structure = {
+        "target_constraints": [
+            {
+                "quote": "我国",
+                "constraint_type": "geography",
+                "value": "China",
+                "explicitness": "explicit",
+            },
+            {
+                "quote": "第三产业",
+                "constraint_type": "entity",
+                "value": "tertiary industry",
+                "explicitness": "explicit",
+            },
+        ]
+    }
+    arguments = {
+        "intent": {
+            "unresolved": [
+                "用户要求我国数据，但数据源中没有全国级别记录，只有各省份的分省数据。"
+            ]
+        },
+        "evidence": {
+            "context_sources": [
+                {
+                    "path": "/context/json/ed_grossdomesticproduct.json",
+                    "observations": [
+                        "字段包括 Province, EndDate, ThirdIndustryGDP（第三产业GDP）",
+                    ],
+                }
+            ]
+        },
+        "output_spec": {
+            "row_policy": "preserve",
+            "transformations": [],
+        },
+        "execution_spec": {"operations": []},
+    }
+
+    assert (
+        _unresolved_explicit_scope_quotes(
+            question_structure=question_structure,
+            arguments=arguments,
+        )
+        == []
+    )
+    arguments["execution_spec"] = {"operations": [{"operation": "aggregate"}]}
+    assert _unresolved_explicit_scope_quotes(
+        question_structure=question_structure,
+        arguments=arguments,
+    )
+
+
 def test_successful_answer_stops_before_another_model_call(public_task: PublicTask) -> None:
     model = ScriptedChatModel(
         responses=[
@@ -5901,6 +10035,104 @@ def test_read_json_returns_paged_functional_view(tmp_path: Path) -> None:
     assert observed[0]["path"] == "/context/records.json"
     assert observed[0]["row_count"] == 3
     assert observed[0]["fields"] == ["id", "value", "other"]
+
+
+def test_execute_python_auto_captures_result_dict(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "context").mkdir(parents=True)
+    tool = create_execute_python_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+    plan = {
+        "output_spec": {
+            "columns": [{"name": "value", "source_fields": ["value"]}],
+            "row_policy": "preserve",
+            "transformations": [],
+        }
+    }
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "execute_python",
+            "id": "auto-capture-result",
+            "args": {
+                "code": "result = {'columns': ['value'], 'rows': [[1], [2]]}",
+                "state": {
+                    "analysis_plan": plan,
+                    "todos": [{"content": "Submit result", "status": "pending"}],
+                },
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    prepared = getattr(command, "update", {})["prepared_answer"]
+    assert prepared.columns == ["value"]
+    assert prepared.rows == [[1], [2]]
+
+
+def test_execute_python_recovers_final_stdout_mapping(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "context").mkdir(parents=True)
+    tool = create_execute_python_tool(
+        workspace,
+        DeepAgentConfig(max_output_bytes=100_000),
+    )
+    plan = {
+        "output_spec": {
+            "columns": [
+                {"name": "timestamp", "source_fields": ["labresulttime"]},
+            ],
+            "row_policy": "transform",
+            "transformations": [
+                {
+                    "operation": "filter",
+                    "authorization": {"source": "user", "quote": "minimum value"},
+                }
+            ],
+        },
+        "evidence": {
+            "context_sources": [{"path": "/context/db/sub_db.sqlite"}],
+        },
+        "execution_spec": {
+            "sources": [{"path": "/context/db/sub_db.sqlite"}],
+            "operations": [
+                {
+                    "operation": "filter",
+                    "authorization": {"source": "user", "quote": "minimum value"},
+                }
+            ],
+        },
+    }
+
+    command = tool.invoke(
+        {
+            "type": "tool_call",
+            "name": "execute_python",
+            "id": "stdout-final-result",
+            "args": {
+                "code": "print(\"Final result:\")\nprint({'timestamp': '2105-12-30 04:51:00'})",
+                "state": {
+                    "analysis_plan": plan,
+                    "todos": [{"content": "Submit result", "status": "pending"}],
+                    "original_request": "minimum value",
+                },
+            },
+        }
+    )
+
+    message = _command_tool_message(command)
+    assert message.status == "success"
+    prepared = getattr(command, "update", {})["prepared_answer"]
+    assert prepared.columns == ["labresulttime"]
+    assert prepared.rows == [["2105-12-30 04:51:00"]]
 
 
 def test_read_doc_defaults_to_paged_window(tmp_path: Path) -> None:
@@ -6469,6 +10701,39 @@ def test_execute_python_reads_pdf_text_with_helper(public_task: PublicTask) -> N
 
     assert result.succeeded
     _, output_call = _tool_call(result, "pdf-helper-output")
+    output = json.dumps(output_call["result"], ensure_ascii=False)
+    assert "Portable context text" in output
+
+
+def test_execute_python_text_open_extracts_pdf_text(public_task: PublicTask) -> None:
+    fitz = pytest.importorskip("fitz")
+    pdf_path = public_task.context_dir / "sample.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Portable context text")
+    document.save(pdf_path)
+    document.close()
+    model = ScriptedChatModel(
+        responses=[
+            _tool_response(
+                "execute_python",
+                {
+                    "code": (
+                        "text = open('/context/sample.pdf', 'r', "
+                        "encoding='utf-8').read()\n"
+                        "print(text[:80])\n"
+                    )
+                },
+                "pdf-open-output",
+            ),
+            _answer_response(columns=["value"], rows=[["ok"]]),
+        ]
+    )
+
+    result = DeepAgent(model=model).run(public_task)
+
+    assert result.succeeded
+    _, output_call = _tool_call(result, "pdf-open-output")
     output = json.dumps(output_call["result"], ensure_ascii=False)
     assert "Portable context text" in output
 

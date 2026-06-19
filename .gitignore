@@ -37,3 +37,4 @@ configs/*
 .DS_Store
 .ipynb_checkpoints/
 .tmp-pytest/
+tests/

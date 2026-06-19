@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import hashlib
+import re
+import unicodedata
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
@@ -53,6 +55,110 @@ _FILE_INFO_HOOKS: dict[str, _FileInfoHook] = {
     ".sqlite": _sqlite_table_info,
     ".sqlite3": _sqlite_table_info,
 }
+
+_KNOWLEDGE_SCHEMA_STOP_TERMS = {
+    "column",
+    "data",
+    "database",
+    "definition",
+    "field",
+    "fields",
+    "record",
+    "records",
+    "semantic",
+    "source",
+    "table",
+    "unit",
+    "value",
+    "values",
+}
+
+
+def _schema_terms(value: object) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    terms: set[str] = set()
+    for token in re.findall(r"[0-9a-z_]{2,}", text):
+        parts = [part for part in token.split("_") if part]
+        for part in [token, *parts]:
+            if len(part) > 3 and part.endswith("ies"):
+                part = f"{part[:-3]}y"
+            elif len(part) > 3 and part.endswith("s"):
+                part = part[:-1]
+            if part and part not in _KNOWLEDGE_SCHEMA_STOP_TERMS:
+                terms.add(part)
+    for sequence in re.findall(r"[\u3400-\u9fff]+", text):
+        if len(sequence) < 2:
+            continue
+        terms.add(sequence)
+        for size in (2, 3, 4):
+            if len(sequence) < size:
+                continue
+            terms.update(
+                sequence[index : index + size]
+                for index in range(0, len(sequence) - size + 1)
+            )
+    return terms
+
+
+def _source_hints_from_fact_text(text: object) -> set[str]:
+    source_hints: set[str] = set()
+    raw_text = str(text or "")
+    for match in re.finditer(
+        r"\b(?:FROM|JOIN)\s+[`\"\[]?([A-Za-z][A-Za-z0-9_]*)",
+        raw_text,
+        flags=re.IGNORECASE,
+    ):
+        source_hints.add(match.group(1))
+    for match in re.finditer(r"`([A-Za-z][A-Za-z0-9_]*)\.[^`]+`", raw_text):
+        source_hints.add(match.group(1))
+    for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9_]*)\.[A-Za-z][A-Za-z0-9_]*", raw_text):
+        source_hints.add(match.group(1))
+    return source_hints
+
+
+def _focused_section_keys(
+    semantic_facts: object,
+    *,
+    focus_text: str | None,
+    known_sections: set[str],
+) -> set[str] | None:
+    focus_terms = _schema_terms(focus_text)
+    if not focus_terms:
+        return None
+
+    facts = list(semantic_facts or [])
+    section_scores: dict[str, int] = {}
+    relevant_fact_sections: set[str] = set()
+    for fact in facts:
+        section_key = str(getattr(fact, "section_key", "") or "").strip()
+        if not section_key:
+            continue
+        fact_text = " ".join(
+            str(item or "")
+            for item in (
+                getattr(fact, "section_key", ""),
+                getattr(fact, "field_key", ""),
+                getattr(fact, "operation", ""),
+                getattr(fact, "quote", ""),
+            )
+        )
+        overlap = _schema_terms(fact_text) & focus_terms
+        score = len(overlap)
+        if score < 2:
+            continue
+        section_scores[section_key] = max(section_scores.get(section_key, 0), score)
+        relevant_fact_sections.add(section_key)
+        for source_hint in _source_hints_from_fact_text(getattr(fact, "quote", "")):
+            if source_hint in known_sections:
+                relevant_fact_sections.add(source_hint)
+
+    if not section_scores:
+        return None
+    return {
+        section_key
+        for section_key in relevant_fact_sections
+        if section_key in known_sections
+    }
 
 
 def load_prompt(filename: str) -> str:
@@ -119,6 +225,7 @@ def _knowledge_schema_context(
     context_dir: Path,
     *,
     raw_content: str | None = None,
+    focus_text: str | None = None,
 ) -> str:
     content = read_knowledge_content(context_dir) if raw_content is None else raw_content
     content_hash = _knowledge_content_hash(content)
@@ -185,6 +292,40 @@ def _knowledge_schema_context(
         else:
             global_facts.append(payload)
 
+    focused_section_keys = _focused_section_keys(
+        semantic.facts,
+        focus_text=focus_text,
+        known_sections=set(sections),
+    )
+    omitted_section_count = 0
+    if focused_section_keys:
+        omitted_section_count = len(
+            [key for key in sections if key not in focused_section_keys]
+        )
+        sections = {
+            key: value
+            for key, value in sections.items()
+            if key in focused_section_keys
+        }
+        focused_text_terms = _schema_terms(focus_text)
+        focused_section_text = " ".join(focused_section_keys)
+        global_facts = [
+            fact
+            for fact in global_facts
+            if (
+                _schema_terms(" ".join(str(value or "") for value in fact.values()))
+                & focused_text_terms
+            )
+            or any(
+                section_key and section_key in str(fact.get("quote") or "")
+                for section_key in focused_section_keys
+            )
+            or bool(
+                _schema_terms(str(fact.get("quote") or ""))
+                & _schema_terms(focused_section_text)
+            )
+        ]
+
     schema = {
         "availability": "available",
         "knowledge_status_for_plan": "authoritative",
@@ -195,12 +336,18 @@ def _knowledge_schema_context(
             "Use fact_id plus quote when a knowledge fact authorizes a plan decision or output field.",
             "section_key/source_name_hint is a knowledge-document grouping and source-name hint, not proof of a physical data table or row grain.",
             "Treat binding_status values such as binding_unresolved/schema_conflict/narrative_only as local source-binding states, not as proof that all knowledge is invalid.",
-            "When a target fact has binding_status narrative_only, bind execution_spec.source_bindings to the observed doc source and use the narrative extraction tool.",
+            "When a target fact has binding_status narrative_only, use the doc source only for locate/read/extract workflow; field_key is an extraction target, not proof of an existing physical column.",
         ],
         "knowledge_sections": list(sections.values()),
         "global_facts": global_facts,
         "issues": list(semantic.issues),
     }
+    if focused_section_keys:
+        schema["focus"] = {
+            "applied": True,
+            "section_keys": sorted(focused_section_keys),
+            "omitted_section_count": omitted_section_count,
+        }
     return json.dumps(schema, ensure_ascii=False, indent=2)
 
 
@@ -230,5 +377,9 @@ def build_task_prompt(
         question=task.question,
         question_structure=question_structure,
         context_inventory=_context_inventory(task.context_dir),
-        knowledge_schema=bundle.schema_json,
+        knowledge_schema=_knowledge_schema_context(
+            task.context_dir,
+            raw_content=bundle.raw_content,
+            focus_text=f"{task.question}\n{question_structure}",
+        ),
     )

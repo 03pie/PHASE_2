@@ -10,3 +10,8 @@ When the user question names a table, source, report, dataset, or business
 scope, pass that wording or the corresponding knowledge `section_key` or
 `source_name_hint` in `scope`. Scope is used to narrow source candidates before
 choosing semantically similar fields.
+
+When a user constraint is a concrete value/code, pass it as `value`; if it is
+already being used as `scope`, the tool will also mechanically search for that
+scope term as value-level evidence and return matching source paths, fields,
+counts, and sample rows. Inspect the reported source before relying on it.
