@@ -485,6 +485,19 @@ def query_context_schema(
     return matches[:max_matches]
 
 
+def _normalized_schema_lookup(value: str) -> str:
+    return re.sub(r"[^0-9a-z]+", "", value.casefold())
+
+
+def _schema_name_matches(field_lower: str, candidate: Any) -> bool:
+    candidate_lower = str(candidate).casefold()
+    if field_lower in candidate_lower:
+        return True
+    normalized_field = _normalized_schema_lookup(field_lower)
+    normalized_candidate = _normalized_schema_lookup(candidate_lower)
+    return bool(normalized_field and normalized_field in normalized_candidate)
+
+
 def _query_csv_schema(
     context_root: Path,
     field_lower: str,
@@ -498,7 +511,7 @@ def _query_csv_schema(
         except (OSError, csv.Error):
             continue
         for column in columns:
-            if field_lower in str(column).casefold():
+            if _schema_name_matches(field_lower, column):
                 matches.append(
                     {
                         "source_type": "csv",
@@ -523,7 +536,7 @@ def _query_json_schema(
         except (OSError, json.JSONDecodeError):
             continue
         for json_key in iter_json_keys(data):
-            if field_lower in json_key.casefold():
+            if _schema_name_matches(field_lower, json_key):
                 matches.append(
                     {
                         "source_type": "json",
@@ -557,7 +570,10 @@ def _query_sqlite_schema(
                     cursor.execute(f"PRAGMA table_info({quote_identifier(table)})")
                     for row in cursor.fetchall():
                         column = str(row[1])
-                        if field_lower not in column.casefold() and field_lower not in table.casefold():
+                        if not _schema_name_matches(
+                            field_lower,
+                            column,
+                        ) and not _schema_name_matches(field_lower, table):
                             continue
                         matches.append(
                             {

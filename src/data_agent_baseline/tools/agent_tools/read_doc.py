@@ -29,6 +29,15 @@ _NARRATIVE_QUERY_HINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _MAX_DOC_LINES_PER_READ = 240
+_MAX_DOC_LINE_CHARS = 600
+
+
+def _render_numbered_line(line_number: int, line: str) -> str:
+    text = line
+    if len(text) > _MAX_DOC_LINE_CHARS:
+        omitted = len(text) - _MAX_DOC_LINE_CHARS
+        text = f"{text[:_MAX_DOC_LINE_CHARS]} ... [truncated {omitted} chars]"
+    return f"{line_number:>6}->{text}"
 
 
 def _read_strategy_payload(
@@ -218,7 +227,7 @@ def create_read_doc_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
             lines = text.splitlines()
             slice_lines = lines[start_line : start_line + effective_max_lines]
             numbered = [
-                f"{line_number:>6}->{line}"
+                _render_numbered_line(line_number, line)
                 for line_number, line in enumerate(slice_lines, start=start_line + 1)
             ]
             headings = [

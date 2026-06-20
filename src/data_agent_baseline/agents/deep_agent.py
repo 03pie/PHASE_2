@@ -336,7 +336,7 @@ class DeepAgent:
                     scope="main",
                     rate_limiter=rate_limiter,
                 ),
-                PlanningMiddleware(),
+                PlanningMiddleware(workspace),
                 AnswerMiddleware(),
                 DisabledToolGuardMiddleware(),
                 ModelCallLimitMiddleware(

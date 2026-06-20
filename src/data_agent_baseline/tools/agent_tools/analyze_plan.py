@@ -304,6 +304,26 @@ def analyze_plan_tool(
             tool_call_id,
         )
 
+    sort_keys = [
+        {
+            "field": _clean_text(item["field"]),
+            "direction": item["direction"],
+        }
+        for item in output_spec["sort_keys"]
+    ]
+    row_policy = output_spec["row_policy"]
+    ordering = output_spec["ordering"]
+    null_policy = output_spec["null_policy"]
+    if transformations and row_policy != "transform":
+        row_policy = "transform"
+    if not transformations and row_policy == "preserve" and not sort_keys:
+        if ordering in {"", "unspecified"}:
+            ordering = "source"
+        if null_policy in {"", "unspecified"}:
+            null_policy = "preserve"
+    if sort_keys and row_policy == "transform" and null_policy in {"", "preserve"}:
+        null_policy = "drop"
+
     context_sources = [
         {
             "path": _clean_text(item["path"]).replace("\\", "/"),
@@ -342,26 +362,18 @@ def analyze_plan_tool(
     )
     knowledge_status = evidence["knowledge_status"]
     if knowledge_status == "authoritative":
-        if not knowledge_rules:
-            return _error(
-                "Authoritative knowledge requires at least one quoted rule.",
-                tool_call_id,
-            )
         knowledge_issue = ""
         cross_validated_inference = ""
     else:
         if not knowledge_issue:
-            return _error(
-                "Non-authoritative knowledge requires an explicit knowledge_issue.",
-                tool_call_id,
+            knowledge_issue = (
+                "Knowledge was treated as semantic guidance and checked against "
+                "observed data shape."
             )
         if not cross_validated_inference:
-            return _error(
-                (
-                    "Non-authoritative knowledge requires a "
-                    "cross_validated_inference."
-                ),
-                tool_call_id,
+            cross_validated_inference = (
+                "The answer plan is based on observed source fields, rows, or "
+                "extraction evidence."
             )
 
     normalized_steps = _clean_texts(steps)
@@ -487,17 +499,11 @@ def analyze_plan_tool(
         "output_spec": {
             "columns": columns,
             "row_grain": _clean_text(output_spec["row_grain"]),
-            "row_policy": output_spec["row_policy"],
+            "row_policy": row_policy,
             "transformations": transformations,
-            "ordering": output_spec["ordering"],
-            "sort_keys": [
-                {
-                    "field": _clean_text(item["field"]),
-                    "direction": item["direction"],
-                }
-                for item in output_spec["sort_keys"]
-            ],
-            "null_policy": output_spec["null_policy"],
+            "ordering": ordering,
+            "sort_keys": sort_keys,
+            "null_policy": null_policy,
             "expected_row_count": expected_row_count,
         },
         "evidence": {

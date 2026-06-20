@@ -164,6 +164,18 @@ def _plan_column_aliases(column: Mapping[str, Any]) -> list[str]:
     return aliases
 
 
+def _plan_column_value_aliases(column: Mapping[str, Any]) -> list[str]:
+    source_fields = [
+        str(field or "").strip()
+        for field in column.get("source_fields") or []
+        if str(field or "").strip()
+    ]
+    if source_fields:
+        return list(dict.fromkeys(source_fields))
+    name = str(column.get("name") or "").strip()
+    return [name] if name else []
+
+
 def _display_column_name(
     column: Mapping[str, Any],
     selected_key: str | None,
@@ -259,7 +271,7 @@ def _select_dict_key_for_column(
     key_by_alias = {_normalized_alias(key): key for key in keys}
     if len(keys) == 1:
         return keys[0]
-    aliases = _plan_column_aliases(column)
+    aliases = _plan_column_value_aliases(column)
     matched_keys: list[str] = []
     for alias in aliases:
         key = key_by_alias.get(_normalized_alias(alias))
@@ -404,7 +416,7 @@ def _project_to_plan_columns(
     for plan_column in plan_columns:
         matched_index: int | None = None
         matched_key: str | None = None
-        for alias in _plan_column_aliases(plan_column):
+        for alias in _plan_column_value_aliases(plan_column):
             index = source_columns_by_alias.get(_normalized_alias(alias))
             if index is not None:
                 matched_index = index
@@ -762,6 +774,12 @@ def validate_prepared_answer(
     )
 
     columns, normalized_rows, audit = _project_supporting_columns(
+        columns=columns,
+        rows=normalized_rows,
+        analysis_plan=analysis_plan,
+        audit=audit,
+    )
+    columns, normalized_rows, audit = _project_to_plan_columns(
         columns=columns,
         rows=normalized_rows,
         analysis_plan=analysis_plan,

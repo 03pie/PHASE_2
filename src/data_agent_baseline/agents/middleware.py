@@ -5,6 +5,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from deepagents.middleware.filesystem import FilesystemPermission
@@ -27,6 +28,10 @@ from langgraph.types import Command
 from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
 from data_agent_baseline.agents.semantic_layer import parse_knowledge_content
 from data_agent_baseline.tools.agent_tools.analyze_plan import analyze_plan_tool
+from data_agent_baseline.tools.agent_tools.execute_python import (
+    _try_candidate_plan_execution,
+    _try_preserve_source_projection,
+)
 from data_agent_baseline.tools.answer import (
     normalize_answer_columns,
     validate_prepared_answer,
@@ -92,7 +97,7 @@ _STRUCTURED_SOURCE_TYPES = frozenset(
 )
 _NARRATIVE_FIELD_EVIDENCE_TOOLS = frozenset({"extract_narrative_records"})
 _OPERATION_REQUIREMENT_TYPES: dict[str, frozenset[str]] = {
-    "filter": frozenset({"entity", "filter", "scope", "time_range", "value"}),
+    "filter": frozenset({"filter", "time_range"}),
     "aggregate": frozenset({"calculation"}),
     "derive": frozenset({"calculation"}),
     "sort": frozenset({"ordering", "selector"}),
@@ -112,14 +117,6 @@ _REQUIREMENT_TYPE_OPERATIONS: dict[str, frozenset[str]] = {
         for item in requirement_types
     }
 }
-_SELECTOR_EXPRESSION_PATTERN = re.compile(
-    (
-        r"\b(?:argmax|argmin|max|min)\s*\(|"
-        r"\b(?:maximum|minimum|highest|lowest|first|last|latest|earliest)\b|"
-        r"\bmost[\s_-]+recent\b"
-    ),
-    re.IGNORECASE,
-)
 _TRANSFORM_OPERATIONS = frozenset(
     {
         "aggregate",
@@ -262,7 +259,7 @@ def _constrain_model_tool_calls(
             if matching_calls:
                 kept_calls = matching_calls[:_FORCED_TOOL_CALL_LIMIT]
             else:
-                kept_calls = original_calls[:_FORCED_TOOL_CALL_LIMIT]
+                kept_calls = []
         else:
             kept_calls = [
                 call
@@ -376,6 +373,60 @@ def _decode_json_like_argument(value: Any) -> Any:
     if isinstance(value, list):
         return [_decode_json_like_argument(item) for item in value]
     return value
+
+
+def _json_array_after_key(text: str, key: str) -> list[Any] | None:
+    marker = f'"{key}"'
+    key_index = text.find(marker)
+    if key_index < 0:
+        return None
+    colon_index = text.find(":", key_index + len(marker))
+    if colon_index < 0:
+        return None
+    start = text.find("[", colon_index + 1)
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start : index + 1])
+                except json.JSONDecodeError:
+                    return None
+                return value if isinstance(value, list) else None
+    return None
+
+
+def _recover_execution_spec_json_string(value: Any) -> dict[str, Any] | None:
+    decoded = _decode_json_like_argument(value)
+    if isinstance(decoded, Mapping):
+        return dict(decoded)
+    if not isinstance(value, str):
+        return None
+    recovered: dict[str, Any] = {}
+    for key in ("sources", "supporting_fields", "source_bindings"):
+        items = _json_array_after_key(value, key)
+        if items is not None:
+            recovered[key] = items
+    return recovered or None
 
 
 def _tagged_block(text: str, tag: str) -> str | None:
@@ -565,9 +616,16 @@ def _normalize_tool_call_arguments(request: ToolCallRequest) -> ToolCallRequest:
         normalized_arguments = _recover_analyze_plan_tagged_arguments(
             normalized_arguments,
         )
+        normalized_arguments = _strip_protocol_markup_value(normalized_arguments)
         execution_spec = normalized_arguments.get("execution_spec")
         if execution_spec is not None and not isinstance(execution_spec, Mapping):
-            normalized_arguments.pop("execution_spec", None)
+            recovered_execution_spec = _recover_execution_spec_json_string(
+                execution_spec,
+            )
+            if recovered_execution_spec is None:
+                normalized_arguments.pop("execution_spec", None)
+            else:
+                normalized_arguments["execution_spec"] = recovered_execution_spec
         allowed_keys = {
             "schema_version",
             "intent",
@@ -674,6 +732,53 @@ def _narrative_extraction_fields_for_source(
     ]
 
 
+def _latest_read_doc_window_for_source_path(
+    *,
+    state: Mapping[str, Any],
+    source_path: str,
+) -> dict[str, int] | None:
+    normalized_path = source_path.replace("\\", "/").strip()
+    if not normalized_path:
+        return None
+    messages = state.get("messages")
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if not isinstance(message, ToolMessage):
+                continue
+            if str(getattr(message, "name", "") or "") != "read_doc":
+                continue
+            payload = _tool_payload(message)
+            if payload is None:
+                continue
+            path = str(payload.get("path") or "").replace("\\", "/")
+            if path != normalized_path and not _source_path_matches_hint(
+                path,
+                _path_source_hint(normalized_path),
+            ):
+                continue
+            start_line = payload.get("start_line")
+            end_line = payload.get("end_line")
+            if isinstance(start_line, int) and isinstance(end_line, int):
+                return {"start_line": start_line, "end_line": end_line}
+    for source in reversed(_state_observed_sources(state)):
+        if str(source.get("observed_by") or "") != "read_doc":
+            continue
+        source_paths = _source_mapping_paths(source)
+        if normalized_path not in source_paths and not any(
+            _source_path_matches_hint(path, _path_source_hint(normalized_path))
+            for path in source_paths
+        ):
+            continue
+        start_line = source.get("observed_line_start")
+        line_count = source.get("observed_line_count")
+        if isinstance(start_line, int) and isinstance(line_count, int) and line_count > 0:
+            return {
+                "start_line": start_line,
+                "end_line": start_line + line_count - 1,
+            }
+    return None
+
+
 def _canonicalize_extract_narrative_arguments(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
@@ -722,17 +827,44 @@ def _canonicalize_extract_narrative_arguments(
     if source_field:
         provided_fields.append(source_field)
     merged_fields = list(dict.fromkeys([*provided_fields, *source_fields]))
-    if not merged_fields:
+    updated_arguments = dict(arguments)
+    changed = False
+    if merged_fields:
+        if (
+            len(merged_fields) == 1
+            and not source_field
+            and "source_fields" not in arguments
+        ):
+            updated_arguments["source_field"] = merged_fields[0]
+            changed = True
+        elif not (
+            source_field
+            and "source_fields" not in arguments
+            and merged_fields == [source_field]
+        ) and not (
+            merged_fields == provided_fields and arguments.get("source_fields")
+        ):
+            updated_arguments["source_fields"] = merged_fields
+            changed = True
+    if source_path and (
+        not isinstance(arguments.get("start_line"), int)
+        and not isinstance(arguments.get("end_line"), int)
+    ):
+        window = _latest_read_doc_window_for_source_path(
+            state=request.state,
+            source_path=source_path,
+        )
+        if window is not None:
+            updated_arguments.update(window)
+            changed = True
+    if not merged_fields and not changed:
         return request
-    if merged_fields == provided_fields and arguments.get("source_fields"):
+    if not changed:
         return request
     return request.override(
         tool_call={
             **request.tool_call,
-            "args": {
-                **dict(arguments),
-                "source_fields": merged_fields,
-            },
+            "args": updated_arguments,
         }
     )
 
@@ -741,13 +873,336 @@ _PROTOCOL_PARAMETER_MARKER = re.compile(
     r"\s*</?parameter[^>\n]*(?:>|\n|$)",
     re.IGNORECASE,
 )
+_PROTOCOL_NAMED_PARAMETER_BLOCK = re.compile(
+    (
+        r"</?\s*parameter(?:=|\s+)(?P<key>[A-Za-z_][\w-]*)\s*>\s*"
+        r"(?P<value>.*?)(?="
+        r"\s*</?\s*parameter(?:=|\s+)[A-Za-z_][\w-]*\s*>|"
+        r"\s*</?\s*tool_call\b|"
+        r"\s*<function=|"
+        r"\Z)"
+    ),
+    re.IGNORECASE | re.DOTALL,
+)
+_ARG_KEY_VALUE_BLOCK = re.compile(
+    (
+        r"<arg_key>\s*(?P<key>[^<\n]+?)\s*</arg_value>\s*"
+        r"<arg_value>\s*(?P<value>.*?)\s*</arg_value>"
+    ),
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _strip_protocol_markup_text(value: str) -> str:
-    match = _PROTOCOL_PARAMETER_MARKER.search(value)
+    cleaned = re.sub(
+        r"^\s*</?\s*arg_value\s*>\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*</?\s*arg_value\s*>\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    match = _PROTOCOL_PARAMETER_MARKER.search(cleaned)
     if match is None:
+        return cleaned
+    return cleaned[: match.start()].strip()
+
+
+def _tagged_parameter_values(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for match in _PROTOCOL_NAMED_PARAMETER_BLOCK.finditer(text):
+        key = match.group("key").strip()
+        value = _strip_protocol_markup_text(match.group("value")).strip()
+        if key and value and key not in values:
+            values[key] = value
+    for match in _ARG_KEY_VALUE_BLOCK.finditer(text):
+        key = match.group("key").strip()
+        value = _strip_protocol_markup_text(match.group("value")).strip()
+        if key and value and key not in values:
+            values[key] = value
+    return values
+
+
+def _integer_argument(value: Any, *, allow_zero: bool = False) -> int | None:
+    if isinstance(value, int) and (value > 0 or (allow_zero and value == 0)):
         return value
-    return value[: match.start()].strip()
+    if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        parsed = int(value.strip())
+        if parsed > 0 or (allow_zero and parsed == 0):
+            return parsed
+    return None
+
+
+def _string_list_argument(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [
+            str(item).strip()
+            for item in value
+            if str(item).strip()
+        ]
+    if not isinstance(value, str):
+        return []
+    text = _strip_protocol_markup_text(value).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, list):
+            return [
+                str(item).strip()
+                for item in decoded
+                if str(item).strip()
+            ]
+    return [
+        item.strip()
+        for item in re.split(r"[,;|]", text)
+        if item.strip()
+    ]
+
+
+def _mapping_argument(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str):
+        return None
+    text = _strip_protocol_markup_text(value).strip()
+    if not text:
+        return None
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return dict(decoded) if isinstance(decoded, Mapping) else None
+
+
+def _recover_allowed_protocol_keys(
+    arguments: Mapping[str, Any],
+    allowed_keys: set[str],
+) -> dict[str, Any]:
+    recovered: dict[str, Any] = {
+        key: arguments[key] for key in allowed_keys if key in arguments
+    }
+    for raw_key, raw_value in arguments.items():
+        if not isinstance(raw_key, str):
+            continue
+        match = re.match(r"\s*(?P<key>[A-Za-z_][\w-]*)", raw_key)
+        if match is None:
+            continue
+        key = match.group("key")
+        if key in allowed_keys and key not in recovered:
+            recovered[key] = raw_value
+    return recovered
+
+
+def _strip_protocol_markup_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _strip_protocol_markup_text(value)
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_protocol_markup_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_strip_protocol_markup_value(item) for item in value]
+    return value
+
+
+def _recover_protocol_markup_arguments(request: ToolCallRequest) -> ToolCallRequest:
+    tool_name = str(request.tool_call.get("name") or "")
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    if tool_name not in {
+        "grep_file",
+        "read_doc",
+        "query_schema",
+        "extract_narrative_records",
+        "write_todos",
+    }:
+        return request
+
+    text_fragments: list[str] = []
+    for key, value in arguments.items():
+        if isinstance(key, str):
+            text_fragments.append(key)
+        if isinstance(value, str):
+            text_fragments.append(value)
+    tagged_values: dict[str, str] = {}
+    for text in text_fragments:
+        tagged_values.update(_tagged_parameter_values(text))
+
+    if tool_name == "grep_file":
+        allowed_keys = {
+            "pattern",
+            "path",
+            "include",
+            "output_mode",
+            "context_lines",
+            "max_matches",
+            "offset",
+        }
+        updated: dict[str, Any] = _recover_allowed_protocol_keys(
+            arguments,
+            allowed_keys,
+        )
+        for key in ("pattern", "path", "include", "output_mode"):
+            raw_value = updated.get(key, tagged_values.get(key))
+            if isinstance(raw_value, str):
+                cleaned = _strip_protocol_markup_text(raw_value)
+                if cleaned:
+                    updated[key] = cleaned
+                else:
+                    updated.pop(key, None)
+        output_mode = str(updated.get("output_mode") or "").strip()
+        if output_mode and output_mode not in {"content", "files_with_matches"}:
+            updated.pop("output_mode", None)
+        for key in ("context_lines", "max_matches", "offset"):
+            parsed = _integer_argument(
+                updated.get(key, tagged_values.get(key)),
+                allow_zero=(key in {"context_lines", "offset"}),
+            )
+            if parsed is not None:
+                updated[key] = parsed
+            elif key in updated and not isinstance(updated[key], int):
+                updated.pop(key, None)
+    elif tool_name == "read_doc":
+        allowed_keys = {"path", "start_line", "max_lines"}
+        updated = _recover_allowed_protocol_keys(arguments, allowed_keys)
+        raw_path = str(updated.get("path") or "").strip()
+        path = _strip_protocol_markup_text(raw_path) if raw_path else ""
+        if not path:
+            for text in text_fragments:
+                match = re.search(r"(/context/[^\s<>\"']+)", text)
+                if match is not None:
+                    path = match.group(1)
+                    break
+        if path:
+            updated["path"] = path
+        for key in ("start_line", "max_lines"):
+            parsed = _integer_argument(
+                updated.get(key, tagged_values.get(key)),
+                allow_zero=(key == "start_line"),
+            )
+            if parsed is not None:
+                updated[key] = parsed
+            elif key in updated and not isinstance(updated[key], int):
+                updated.pop(key, None)
+    elif tool_name == "write_todos":
+        updated = {
+            key: _strip_protocol_markup_value(value)
+            for key, value in arguments.items()
+            if key == "todos"
+        }
+    else:
+        if tool_name == "query_schema":
+            allowed_keys = {"field", "scope", "value", "max_matches"}
+            updated = _recover_allowed_protocol_keys(arguments, allowed_keys)
+            for key in ("field", "scope", "value"):
+                raw_value = updated.get(key, tagged_values.get(key))
+                if isinstance(raw_value, str):
+                    cleaned = _strip_protocol_markup_text(raw_value)
+                    if cleaned:
+                        updated[key] = cleaned
+                    else:
+                        updated.pop(key, None)
+            parsed_max = _integer_argument(
+                updated.get("max_matches", tagged_values.get("max_matches")),
+            )
+            if parsed_max is not None:
+                updated["max_matches"] = parsed_max
+            elif "max_matches" in updated and not isinstance(updated["max_matches"], int):
+                updated.pop("max_matches", None)
+        else:
+            allowed_keys = {
+                "source_path",
+                "path",
+                "source_field",
+                "source_fields",
+                "record_anchor",
+                "field_aliases",
+                "column",
+                "start_line",
+                "end_line",
+                "max_records",
+            }
+            updated = _recover_allowed_protocol_keys(arguments, allowed_keys)
+            raw_path = str(
+                updated.get("source_path")
+                or updated.get("path")
+                or tagged_values.get("source_path")
+                or tagged_values.get("path")
+                or ""
+            ).strip()
+            path = _strip_protocol_markup_text(raw_path) if raw_path else ""
+            if not path:
+                for text in text_fragments:
+                    match = re.search(r"(/context/[^\s<>\"']+)", text)
+                    if match is not None:
+                        path = match.group(1)
+                        break
+            if path:
+                updated["source_path"] = path
+            updated.pop("path", None)
+
+            recovered_fields = _string_list_argument(
+                updated.get("source_fields", tagged_values.get("source_fields"))
+            )
+            recovered_field = str(
+                updated.get("source_field") or tagged_values.get("source_field") or ""
+            ).strip()
+            if recovered_field:
+                recovered_field = _strip_protocol_markup_text(recovered_field)
+            if recovered_fields:
+                updated["source_fields"] = recovered_fields
+                updated.pop("source_field", None)
+            elif recovered_field:
+                updated["source_field"] = recovered_field
+
+            for key in ("record_anchor", "column"):
+                raw_value = updated.get(key, tagged_values.get(key))
+                if isinstance(raw_value, str):
+                    cleaned = _strip_protocol_markup_text(raw_value)
+                    if cleaned:
+                        updated[key] = cleaned
+                    else:
+                        updated.pop(key, None)
+
+            aliases = _mapping_argument(
+                updated.get("field_aliases", tagged_values.get("field_aliases"))
+            )
+            if aliases is not None:
+                updated["field_aliases"] = aliases
+            elif "field_aliases" in updated and not isinstance(
+                updated["field_aliases"],
+                Mapping,
+            ):
+                updated.pop("field_aliases", None)
+
+            for key in ("start_line", "end_line", "max_records"):
+                parsed = _integer_argument(
+                    updated.get(key, tagged_values.get(key)),
+                    allow_zero=(key == "start_line"),
+                )
+                if parsed is not None:
+                    updated[key] = parsed
+                elif key in updated and not isinstance(updated[key], int):
+                    updated.pop(key, None)
+
+    if dict(arguments) == updated:
+        return request
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": updated,
+        }
+    )
 
 
 def _strip_extract_narrative_protocol_markup(
@@ -979,7 +1434,10 @@ def _pre_plan_execution_gate_active(
         return False
     if _last_plan_error_requests_more_evidence(messages):
         return False
-    if _last_narrative_extraction_incomplete(messages):
+    if (
+        _last_narrative_extraction_incomplete(messages)
+        and _recent_narrative_incomplete_repeat_count(messages) < 2
+    ):
         return False
     return (
         discovery.context_ready
@@ -1013,6 +1471,138 @@ def _last_narrative_extraction_incomplete(messages: list[BaseMessage]) -> bool:
         return bool(payload.get("incomplete_fields")) or (
             str(payload.get("status") or "") == "extracted_incomplete"
         )
+    return False
+
+
+def _narrative_extraction_signature_from_payload(
+    payload: Mapping[str, Any],
+) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[tuple[str, int], ...]] | None:
+    path = str(payload.get("path") or "").replace("\\", "/").strip()
+    columns = tuple(
+        _normalized_field_alias(column)
+        for column in payload.get("columns") or []
+        if _normalized_field_alias(column)
+    )
+    incomplete_fields = tuple(
+        sorted(
+            _normalized_field_alias(field)
+            for field in payload.get("incomplete_fields") or []
+            if _normalized_field_alias(field)
+        )
+    )
+    if not path or not columns or not incomplete_fields:
+        return None
+    raw_counts = payload.get("field_non_empty_counts")
+    counts = (
+        tuple(
+            sorted(
+                (
+                    _normalized_field_alias(field),
+                    int(count) if isinstance(count, int) else 0,
+                )
+                for field, count in raw_counts.items()
+                if _normalized_field_alias(field)
+            )
+        )
+        if isinstance(raw_counts, Mapping)
+        else ()
+    )
+    return path, columns, incomplete_fields, counts
+
+
+def _narrative_extraction_signature_from_args(
+    arguments: Any,
+) -> tuple[str, tuple[str, ...]] | None:
+    if not isinstance(arguments, Mapping):
+        return None
+    path = str(arguments.get("source_path") or arguments.get("path") or "")
+    path = path.replace("\\", "/").strip()
+    raw_fields = _decode_json_like_argument(arguments.get("source_fields"))
+    fields: list[str] = []
+    if isinstance(raw_fields, list):
+        fields.extend(str(field) for field in raw_fields)
+    elif isinstance(raw_fields, str) and raw_fields.strip():
+        fields.append(raw_fields)
+    source_field = str(arguments.get("source_field") or "").strip()
+    if source_field:
+        fields.append(source_field)
+    columns = tuple(
+        _normalized_field_alias(field)
+        for field in fields
+        if _normalized_field_alias(field)
+    )
+    if not path or not columns:
+        return None
+    return path, columns
+
+
+def _recent_narrative_incomplete_repeat_count(
+    messages: list[BaseMessage],
+) -> int:
+    last_signature: tuple[
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[tuple[str, int], ...],
+    ] | None = None
+    repeat_count = 0
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") != "extract_narrative_records":
+            break
+        payload = _tool_payload(message)
+        if payload is None:
+            break
+        if not (
+            payload.get("incomplete_fields")
+            or str(payload.get("status") or "") == "extracted_incomplete"
+        ):
+            break
+        signature = _narrative_extraction_signature_from_payload(payload)
+        if signature is None:
+            break
+        if last_signature is None:
+            last_signature = signature
+        elif signature != last_signature:
+            break
+        repeat_count += 1
+    return repeat_count
+
+
+def _recent_narrative_no_progress_for_request(
+    messages: list[BaseMessage],
+    arguments: Any,
+    *,
+    threshold: int,
+) -> bool:
+    request_signature = _narrative_extraction_signature_from_args(arguments)
+    if request_signature is None:
+        return False
+    repeat_count = 0
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") != "extract_narrative_records":
+            break
+        payload = _tool_payload(message)
+        if payload is None:
+            break
+        if not (
+            payload.get("incomplete_fields")
+            or str(payload.get("status") or "") == "extracted_incomplete"
+        ):
+            break
+        signature = _narrative_extraction_signature_from_payload(payload)
+        if signature is None:
+            break
+        path, columns, _incomplete, _counts = signature
+        request_path, request_columns = request_signature
+        if path != request_path or columns != request_columns:
+            break
+        repeat_count += 1
+        if repeat_count >= threshold:
+            return True
     return False
 
 
@@ -1151,14 +1741,22 @@ def _pre_plan_observed_narrative_hint_needs_extraction(
             continue
         path = str(source.get("path") or "").replace("\\", "/")
         source_name_hint = str(source.get("source_name_hint") or "")
-        if any(
-            _source_path_matches_hint(path, hint)
-            or (
-                source_name_hint
-                and _normalized_quote_text(source_name_hint)
-                == _normalized_quote_text(hint)
-            )
-            for hint in hinted_sources
+        matching_hint = next(
+            (
+                hint
+                for hint in hinted_sources
+                if _source_path_matches_hint(path, hint)
+                or (
+                    source_name_hint
+                    and _normalized_quote_text(source_name_hint)
+                    == _normalized_quote_text(hint)
+                )
+            ),
+            None,
+        )
+        if matching_hint and _observed_narrative_hint_has_read_window(
+            state=state,
+            source_hint=matching_hint,
         ):
             return True
     return False
@@ -1203,6 +1801,16 @@ def _source_mapping_paths(source: Mapping[str, Any]) -> set[str]:
     for key in ("path", "base_path"):
         paths.update(_source_path_aliases(source.get(key)))
     return {path for path in paths if path}
+
+
+def _normalized_plan_field_aliases(value: Any) -> set[str]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    aliases = {_normalized_field_alias(text)}
+    if "." in text:
+        aliases.add(_normalized_field_alias(text.rsplit(".", 1)[-1]))
+    return {alias for alias in aliases if alias}
 
 
 def _source_path_is_narrative(path: Any) -> bool:
@@ -1261,6 +1869,22 @@ def _field_aliases_from_observed_source(source: Mapping[str, Any]) -> set[str]:
             if str(item or "").strip()
         )
     return {alias for alias in aliases if alias}
+
+
+def _field_names_from_observed_source(source: Mapping[str, Any]) -> list[str]:
+    names: list[str] = []
+    fields = source.get("fields")
+    if isinstance(fields, list):
+        for item in fields:
+            field = item.get("name") if isinstance(item, Mapping) else item
+            text = str(field or "").strip()
+            if text and text not in names:
+                names.append(text)
+    for key in ("field", "source_field"):
+        text = str(source.get(key) or "").strip()
+        if text and text not in names:
+            names.append(text)
+    return names
 
 
 def _observed_source_matches_path(
@@ -1388,6 +2012,77 @@ def _field_fact_has_observed_narrative_extraction(
     return False
 
 
+def _observed_field_binding_entries(
+    *,
+    facts: Iterable[Any],
+    state: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for fact in facts:
+        if not _knowledge_fact_defines_field(fact):
+            continue
+        section_key = _normalized_quote_text(str(getattr(fact, "section_key", "") or ""))
+        field_aliases = _knowledge_fact_field_aliases(fact)
+        if not section_key or not field_aliases:
+            continue
+        for source in _state_observed_sources(state):
+            source_is_structured = _observed_source_is_structured(source)
+            source_is_extraction = (
+                _observed_source_is_narrative(source)
+                and str(source.get("observed_by") or "").strip()
+                in _NARRATIVE_FIELD_EVIDENCE_TOOLS
+            )
+            if not (source_is_structured or source_is_extraction):
+                continue
+            source_hints = {
+                _normalized_quote_text(str(source.get("source_name_hint") or "")),
+                _normalized_quote_text(str(source.get("table") or "")),
+            }
+            for path in _source_mapping_paths(source):
+                path_tail = path.rsplit("::", 1)[-1].rsplit("/", 1)[-1]
+                source_hints.add(_normalized_quote_text(path_tail.rsplit(".", 1)[0]))
+            if section_key not in source_hints:
+                continue
+            observed_aliases = _field_aliases_from_observed_source(source)
+            if not (observed_aliases & field_aliases):
+                continue
+            observed_field = next(
+                (
+                    field
+                    for field in _field_names_from_observed_source(source)
+                    if _normalized_field_alias(field) in field_aliases
+                ),
+                str(getattr(fact, "field_key", "") or ""),
+            )
+            source_path = str(source.get("path") or "").replace("\\", "/")
+            key = (
+                str(getattr(fact, "fact_id", "") or ""),
+                source_path,
+                _normalized_field_alias(observed_field),
+                "narrative_extraction" if source_is_extraction else "schema_field",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(
+                {
+                    "fact_id": str(getattr(fact, "fact_id", "") or ""),
+                    "section_key": str(getattr(fact, "section_key", "") or ""),
+                    "field_key": str(getattr(fact, "field_key", "") or ""),
+                    "source_path": source_path,
+                    "field": observed_field,
+                    "evidence_type": (
+                        "narrative_extraction"
+                        if source_is_extraction
+                        else "schema_field"
+                    ),
+                    "sample_hash": source.get("sample_hash"),
+                }
+            )
+    return entries
+
+
 def _observed_context_sources_from_state(state: Mapping[str, Any]) -> set[str]:
     sources: set[str] = set()
     for source in _state_observed_sources(state):
@@ -1426,9 +2121,18 @@ def _candidate_prepared_answer(
     *,
     candidate: Any,
     analysis_plan: Any,
+    workspace: Path | None = None,
 ) -> Any | None:
     if not isinstance(candidate, Mapping) or not isinstance(analysis_plan, dict):
         return None
+    if workspace is not None:
+        prepared = _try_candidate_plan_execution(
+            workspace=workspace,
+            analysis_plan=analysis_plan,
+            candidate=candidate,
+        )
+        if prepared is not None:
+            return prepared
     candidate_columns = candidate.get("columns")
     candidate_rows = candidate.get("rows")
     if not isinstance(candidate_columns, list) or not isinstance(candidate_rows, list):
@@ -1452,6 +2156,8 @@ def _candidate_prepared_answer(
 def _promote_answer_candidate_after_plan(
     request: ToolCallRequest,
     result: ToolMessage | Command[Any],
+    *,
+    workspace: Path | None = None,
 ) -> ToolMessage | Command[Any]:
     if not isinstance(result, Command):
         return result
@@ -1462,7 +2168,14 @@ def _promote_answer_candidate_after_plan(
     prepared_answer = _candidate_prepared_answer(
         candidate=request.state.get("answer_candidate"),
         analysis_plan=analysis_plan,
+        workspace=workspace,
     )
+    if prepared_answer is None and workspace is not None:
+        prepared_answer = _try_preserve_source_projection(
+            workspace=workspace,
+            analysis_plan=analysis_plan,
+            allow_bound_scope_requirements=True,
+        )
     if prepared_answer is None:
         return result
     return Command(
@@ -1595,14 +2308,16 @@ def _canonicalize_preserve_output_policy(
         return request
     if output_spec.get("sort_keys"):
         return request
-    if output_spec.get("null_policy") != "preserve":
-        return request
     ordering = str(output_spec.get("ordering") or "")
-    if ordering not in {"", "unspecified"}:
+    null_policy = str(output_spec.get("null_policy") or "")
+    if ordering not in {"", "unspecified"} and null_policy in {"preserve"}:
         return request
 
     updated_output_spec = dict(output_spec)
-    updated_output_spec["ordering"] = "source"
+    if ordering in {"", "unspecified"}:
+        updated_output_spec["ordering"] = "source"
+    if null_policy in {"", "unspecified"}:
+        updated_output_spec["null_policy"] = "preserve"
     return request.override(
         tool_call={
             **request.tool_call,
@@ -1791,12 +2506,22 @@ def _question_requested_output_texts(state: Mapping[str, Any]) -> set[str]:
         return set()
     original_request = str(state.get("original_request") or "")
     texts: set[str] = set()
+    selector_measure_texts = {
+        text
+        for target in question_structure.get("targets") or []
+        if isinstance(target, Mapping)
+        and str(target.get("target_type") or "").strip().casefold()
+        in {"measure", "metric"}
+        and _measure_target_is_selector_only(target, state)
+        for text in _target_texts(target)
+    }
     output = question_structure.get("output")
     if isinstance(output, Mapping):
         texts.update(
             text
             for item in output.get("requested_columns") or []
             if (text := str(item or "").strip()) and text in original_request
+            and not _texts_overlap({text}, selector_measure_texts)
         )
     for target in question_structure.get("targets") or []:
         if not isinstance(target, Mapping):
@@ -1837,6 +2562,86 @@ def _explicit_question_output_column_texts(state: Mapping[str, Any]) -> set[str]
         if quote:
             texts.add(quote)
     return texts
+
+
+def _question_selector_texts(state: Mapping[str, Any]) -> set[str]:
+    question_structure = state.get("question_structure")
+    if not isinstance(question_structure, Mapping):
+        return set()
+    texts: set[str] = set()
+    for item in question_structure.get("target_constraints") or []:
+        if not isinstance(item, Mapping):
+            continue
+        constraint_type = str(item.get("constraint_type") or "").strip().casefold()
+        if constraint_type not in {"ordering", "selector", "limit"}:
+            continue
+        for key in ("quote", "value"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                texts.add(text)
+    conditions = question_structure.get("conditions")
+    if isinstance(conditions, Mapping):
+        for container_name in ("orderings", "limits"):
+            for item in conditions.get(container_name) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                for key in ("quote", "value"):
+                    text = str(item.get(key) or "").strip()
+                    if text:
+                        texts.add(text)
+    for item in question_structure.get("intent_operators") or []:
+        if not isinstance(item, Mapping):
+            continue
+        operator_type = str(item.get("operator_type") or "").strip().casefold()
+        operation = str(item.get("operation") or "").strip().casefold()
+        if operator_type != "selector" and operation not in {"sort", "limit"}:
+            continue
+        for key in ("quote", "value"):
+            text = str(item.get(key) or "").strip()
+            if text:
+                texts.add(text)
+    return texts
+
+
+def _texts_overlap(left: set[str], right: set[str]) -> bool:
+    for left_text in left:
+        normalized_left = _normalized_quote_text(left_text)
+        if not normalized_left:
+            continue
+        for right_text in right:
+            normalized_right = _normalized_quote_text(right_text)
+            if not normalized_right:
+                continue
+            if (
+                normalized_left == normalized_right
+                or normalized_left in normalized_right
+                or normalized_right in normalized_left
+            ):
+                return True
+    return False
+
+
+def _target_texts(target: Mapping[str, Any]) -> set[str]:
+    return {
+        text
+        for key in ("quote", "name", "description")
+        if (text := str(target.get(key) or "").strip())
+    }
+
+
+def _measure_target_is_selector_only(
+    target: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> bool:
+    target_texts = _target_texts(target)
+    if not target_texts:
+        return False
+    explicit_outputs = _explicit_question_output_column_texts(state)
+    if explicit_outputs and _texts_overlap(target_texts, explicit_outputs):
+        return False
+    if _texts_overlap(target_texts, _question_selector_texts(state)):
+        return True
+    return False
 
 
 def _column_texts(column: Mapping[str, Any]) -> set[str]:
@@ -1888,22 +2693,33 @@ def _question_requested_measure_texts(state: Mapping[str, Any]) -> set[str]:
         return set()
     texts: set[str] = set()
     output = question_structure.get("output")
+    requested_columns: set[str] = set()
     if isinstance(output, Mapping):
-        texts.update(
+        requested_columns = {
             text
             for item in output.get("requested_columns") or []
             if (text := str(item or "").strip())
-        )
+        }
+    explicit_outputs = _explicit_question_output_column_texts(state)
     for target in question_structure.get("targets") or []:
         if not isinstance(target, Mapping):
             continue
         target_type = str(target.get("target_type") or "").strip().casefold()
         if target_type not in {"measure", "metric"}:
             continue
-        for key in ("quote", "name", "description"):
-            text = str(target.get(key) or "").strip()
-            if text:
-                texts.add(text)
+        target_texts = _target_texts(target)
+        if _measure_target_is_selector_only(target, state):
+            continue
+        if not requested_columns and not explicit_outputs:
+            texts.update(target_texts)
+            continue
+        if not (
+            _texts_overlap(target_texts, requested_columns)
+            or _texts_overlap(target_texts, explicit_outputs)
+        ):
+            continue
+        texts.update(target_texts)
+    texts.update(explicit_outputs)
     return texts
 
 
@@ -2167,6 +2983,7 @@ def _canonicalize_selector_output_columns(
         if (
             _column_field_aliases(column) & selector_aliases
             and not _column_matches_requested_output(column, requested_texts)
+            and not _column_matches_requested_measure(column, request.state)
         ):
             demoted_columns.append(column)
             continue
@@ -2886,20 +3703,54 @@ def _normalized_quote_tokens(value: str) -> set[str]:
 _CONTRACT_TERM_STOPWORDS = frozenset(
     {
         "and",
+        "all",
+        "absolute",
+        "across",
         "column",
         "data",
         "database",
         "definition",
+        "determined",
+        "entities",
+        "entity",
         "field",
         "fields",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "identifier",
+        "internal",
+        "key",
+        "listed",
+        "most",
+        "name",
+        "natural",
+        "or",
+        "person",
+        "primary",
+        "recent",
+        "recently",
         "record",
         "records",
         "semantic",
         "source",
         "table",
+        "that",
+        "the",
+        "these",
+        "this",
+        "those",
         "unit",
         "value",
         "values",
+        "was",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
         "with",
     }
 )
@@ -2929,6 +3780,96 @@ def _contract_terms(value: Any) -> set[str]:
                 for index in range(0, len(sequence) - size + 1)
             )
     return terms
+
+
+def _question_binding_target_texts(
+    state: Mapping[str, Any],
+    *,
+    value_only: bool,
+) -> set[str]:
+    original_request = str(state.get("original_request") or "").strip()
+    question_structure = state.get("question_structure")
+    if not isinstance(question_structure, Mapping):
+        return {original_request} if original_request else set()
+    texts: set[str] = set()
+    if original_request and not value_only:
+        texts.add(original_request)
+    output = question_structure.get("output")
+    if isinstance(output, Mapping) and (
+        not value_only or not question_structure.get("targets")
+    ):
+        texts.update(
+            str(item or "").strip()
+            for item in output.get("requested_columns") or []
+            if str(item or "").strip()
+        )
+    for target in question_structure.get("targets") or []:
+        if not isinstance(target, Mapping):
+            continue
+        target_type = str(target.get("target_type") or "").strip().casefold()
+        if value_only and target_type not in {"measure", "metric", "value"}:
+            continue
+        if value_only and _measure_target_is_selector_only(target, state):
+            continue
+        texts.update(_target_texts(target))
+    if value_only and not texts and original_request:
+        texts.add(original_request)
+    if not value_only:
+        texts.update(_explicit_question_output_column_texts(state))
+    return {text for text in texts if text}
+
+
+def _knowledge_fact_matches_binding_target(
+    fact: Any,
+    state: Mapping[str, Any],
+    *,
+    value_only: bool,
+) -> bool:
+    target_texts = _question_binding_target_texts(state, value_only=value_only)
+    if not target_texts:
+        return False
+    fact_texts = {
+        str(getattr(fact, "field_key", "") or ""),
+        str(getattr(fact, "quote", "") or ""),
+    }
+    fact_aliases = _knowledge_fact_field_aliases(fact)
+    normalized_targets = {
+        _normalized_field_alias(text)
+        for text in target_texts
+        if _normalized_field_alias(text)
+    }
+    if fact_aliases & normalized_targets:
+        return True
+    target_terms = {
+        term
+        for text in target_texts
+        for term in _contract_terms(text)
+    }
+    fact_terms = {
+        term
+        for text in fact_texts
+        for term in _contract_terms(text)
+    }
+    shared_terms = fact_terms & target_terms
+    if len(shared_terms) >= 2:
+        return True
+    if any(
+        len(term) >= 6
+        and term in fact_aliases
+        for term in shared_terms
+    ):
+        return True
+    normalized_fact_text = _normalized_quote_text(" ".join(fact_texts))
+    for target in target_texts:
+        normalized_target = _normalized_quote_text(target)
+        if not normalized_target:
+            continue
+        if len(normalized_target) >= 6 and (
+            normalized_target in normalized_fact_text
+            or normalized_fact_text in normalized_target
+        ):
+            return True
+    return False
 
 
 def _source_hints_from_knowledge_text(text: Any) -> set[str]:
@@ -3147,6 +4088,541 @@ def _source_hint_has_observed_source(
     return False
 
 
+def _payload_references_source_hint(
+    value: Any,
+    *,
+    source_hint: str,
+    fact_id: str | None = None,
+) -> bool:
+    normalized_hint = _normalized_quote_text(source_hint)
+    normalized_fact_id = str(fact_id or "").strip()
+    if not normalized_hint:
+        return False
+    if isinstance(value, Mapping):
+        if normalized_fact_id and str(value.get("fact_id") or "").strip() == normalized_fact_id:
+            return True
+        for key in (
+            "source_name_hint",
+            "section_key",
+            "table",
+            "table_or_path",
+            "path",
+            "source_path",
+            "base_path",
+        ):
+            text = str(value.get(key) or "").replace("\\", "/").strip()
+            if not text:
+                continue
+            if (
+                _normalized_quote_text(text) == normalized_hint
+                or _source_path_matches_hint(text, source_hint)
+            ):
+                return True
+        for key, item in value.items():
+            key_text = str(key or "").replace("\\", "/").strip()
+            if (
+                key_text
+                and (
+                    _normalized_quote_text(key_text) == normalized_hint
+                    or _source_path_matches_hint(key_text, source_hint)
+                )
+            ):
+                return True
+            if _payload_references_source_hint(
+                item,
+                source_hint=source_hint,
+                fact_id=fact_id,
+            ):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(
+            _payload_references_source_hint(
+                item,
+                source_hint=source_hint,
+                fact_id=fact_id,
+            )
+            for item in value
+        )
+    return False
+
+
+def _source_hint_binding_discovery_attempted(
+    *,
+    state: Mapping[str, Any],
+    source_hint: str,
+    fact_id: str | None = None,
+) -> bool:
+    messages = state.get("messages")
+    if not isinstance(messages, list):
+        return False
+    discovery_tools = {
+        "grep_file",
+        "inspect_sqlite",
+        "query_schema",
+        "read_csv",
+        "read_doc",
+        "read_json",
+    }
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") not in discovery_tools:
+            continue
+        payload = _tool_payload(message)
+        if payload is None:
+            continue
+        if _payload_references_source_hint(
+            payload,
+            source_hint=source_hint,
+            fact_id=fact_id,
+        ):
+            return True
+    return False
+
+
+def _observed_structured_source_conflicts_with_hints(
+    *,
+    state: Mapping[str, Any],
+    source_hints: Iterable[str],
+) -> bool:
+    hints = [str(hint) for hint in source_hints if str(hint or "").strip()]
+    if not hints:
+        return False
+    for source in _state_observed_sources(state):
+        if not _observed_source_is_structured(source):
+            continue
+        source_paths = _source_mapping_paths(source)
+        if not source_paths:
+            continue
+        if any(
+            _source_path_matches_hint(path, hint)
+            for path in source_paths
+            for hint in hints
+        ):
+            return False
+        return True
+    return False
+
+
+def _missing_relevant_source_hint_discovery_groups(
+    *,
+    knowledge_facts: Iterable[Any],
+    state: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    groups = _request_relevant_knowledge_source_hint_groups(
+        knowledge_facts=knowledge_facts,
+        state=state,
+    )
+    missing: list[dict[str, Any]] = []
+    for group in groups:
+        source_hints = [
+            str(hint)
+            for hint in group.get("source_hints") or []
+            if str(hint or "").strip()
+        ]
+        if not source_hints:
+            continue
+        fact_id = str(group.get("fact_id") or "").strip() or None
+        if any(
+            _source_hint_has_observed_source(state=state, source_hint=hint)
+            for hint in source_hints
+        ):
+            continue
+        if not _observed_structured_source_conflicts_with_hints(
+            state=state,
+            source_hints=source_hints,
+        ):
+            continue
+        if any(
+            _source_hint_binding_discovery_attempted(
+                state=state,
+                source_hint=hint,
+                fact_id=fact_id,
+            )
+            for hint in source_hints
+        ):
+            continue
+        missing.append(
+            {
+                "fact_id": group.get("fact_id"),
+                "source_hints": source_hints,
+                "quote": group.get("quote"),
+                "matched_terms": group.get("matched_terms"),
+            }
+        )
+    return missing
+
+
+def _observed_narrative_paths_for_source_hint(
+    *,
+    state: Mapping[str, Any],
+    source_hint: str,
+) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    normalized_hint = _normalized_quote_text(source_hint)
+    if not normalized_hint:
+        return []
+    for source in _state_observed_sources(state):
+        if not _observed_source_is_narrative(source):
+            continue
+        source_paths = _source_mapping_paths(source)
+        source_hints = {
+            _normalized_quote_text(str(source.get("source_name_hint") or "")),
+            _normalized_quote_text(str(source.get("table") or "")),
+        }
+        for source_path in source_paths:
+            path_tail = source_path.rsplit("::", 1)[-1].rsplit("/", 1)[-1]
+            source_hints.add(_normalized_quote_text(path_tail.rsplit(".", 1)[0]))
+        if normalized_hint not in {hint for hint in source_hints if hint} and not any(
+            _source_path_matches_hint(path, source_hint) for path in source_paths
+        ):
+            continue
+        for path in source_paths:
+            normalized_path = path.replace("\\", "/")
+            if normalized_path and normalized_path not in seen:
+                seen.add(normalized_path)
+                paths.append(normalized_path)
+    return paths
+
+
+def _observed_narrative_hint_has_read_window(
+    *,
+    state: Mapping[str, Any],
+    source_hint: str,
+) -> bool:
+    hinted_paths = set(
+        _observed_narrative_paths_for_source_hint(
+            state=state,
+            source_hint=source_hint,
+        )
+    )
+    for source in _state_observed_sources(state):
+        if str(source.get("observed_by") or "") != "read_doc":
+            continue
+        source_paths = _source_mapping_paths(source)
+        if hinted_paths and not (source_paths & hinted_paths):
+            continue
+        if not hinted_paths and not any(
+            _source_path_matches_hint(path, source_hint) for path in source_paths
+        ):
+            continue
+        if source.get("observed_line_start") is not None or source.get("matched_lines"):
+            return True
+    messages = state.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") != "read_doc":
+            continue
+        payload = _tool_payload(message)
+        if payload is None:
+            continue
+        path = str(payload.get("path") or "").replace("\\", "/")
+        if not path:
+            continue
+        if hinted_paths and path not in hinted_paths:
+            continue
+        if not hinted_paths and not _source_path_matches_hint(path, source_hint):
+            continue
+        if payload.get("returned_lines") is not None:
+            return True
+    return False
+
+
+def _pre_plan_relevant_source_hint_needs_discovery(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> bool:
+    if state.get("analysis_plan") is not None:
+        return False
+    if not discovery.knowledge_content.strip():
+        return False
+    return bool(
+        _missing_relevant_source_hint_discovery_groups(
+            knowledge_facts=parse_knowledge_content(discovery.knowledge_content),
+            state=state,
+        )
+    )
+
+
+def _tool_was_attempted(state: Mapping[str, Any], tool: str) -> bool:
+    messages = state.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, ToolMessage)
+        and str(getattr(message, "name", "") or "") == tool
+        for message in messages
+    )
+
+
+def _query_schema_attempted_aliases(state: Mapping[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    messages = state.get("messages")
+    if not isinstance(messages, list):
+        return aliases
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        if str(getattr(message, "name", "") or "") != "query_schema":
+            continue
+        payload = _tool_payload(message)
+        if not isinstance(payload, Mapping):
+            continue
+        field = str(payload.get("field") or "").strip()
+        if field:
+            aliases.add(_normalized_field_alias(field))
+        for query in payload.get("expanded_field_queries") or []:
+            if str(query or "").strip():
+                aliases.add(_normalized_field_alias(query))
+    return {alias for alias in aliases if alias}
+
+
+def _structured_field_alias_observed(
+    state: Mapping[str, Any],
+    aliases: set[str],
+) -> bool:
+    if not aliases:
+        return False
+    for source in _state_observed_sources(state):
+        if not _observed_source_is_structured(source):
+            continue
+        if _field_aliases_from_observed_source(source) & aliases:
+            return True
+    return False
+
+
+def _request_relevant_knowledge_field_facts(
+    *,
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> list[Any]:
+    all_facts = list(parse_knowledge_content(discovery.knowledge_content))
+    hint_groups = _request_relevant_knowledge_source_hint_groups(
+        knowledge_facts=all_facts,
+        state=state,
+    )
+    relevant_source_hints = {
+        _normalized_quote_text(str(hint))
+        for group in hint_groups
+        for hint in group.get("source_hints") or []
+        if str(hint or "").strip()
+    }
+    facts = [
+        fact
+        for fact in all_facts
+        if _knowledge_fact_has_field_key(fact)
+    ]
+    if relevant_source_hints:
+        facts = [
+            fact
+            for fact in facts
+            if _normalized_quote_text(str(getattr(fact, "section_key", "") or ""))
+            in relevant_source_hints
+        ]
+    relevant: list[Any] = []
+    seen: set[str] = set()
+    for fact in facts:
+        if not _knowledge_fact_matches_binding_target(
+            fact,
+            state,
+            value_only=False,
+        ):
+            continue
+        fact_id = str(getattr(fact, "fact_id", "") or "")
+        if fact_id in seen:
+            continue
+        seen.add(fact_id)
+        relevant.append(fact)
+    return relevant
+
+
+def _missing_relevant_schema_field_facts(
+    *,
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> list[Any]:
+    attempted_aliases = _query_schema_attempted_aliases(state)
+    missing: list[Any] = []
+    for fact in _request_relevant_knowledge_field_facts(
+        state=state,
+        discovery=discovery,
+    ):
+        aliases = _knowledge_fact_field_aliases(fact)
+        if not aliases:
+            continue
+        if _structured_field_alias_observed(state, aliases):
+            continue
+        if attempted_aliases & aliases:
+            continue
+        missing.append(fact)
+    return missing
+
+
+def _request_has_selector_authorization(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> bool:
+    original_request = str(state.get("original_request") or "")
+    if _question_structure_user_authorized_operations(
+        state.get("question_structure"),
+        original_request,
+    ) & {"sort", "limit"}:
+        return True
+    knowledge_facts = parse_knowledge_content(discovery.knowledge_content)
+    relevant_groups = _request_relevant_knowledge_source_hint_groups(
+        knowledge_facts=knowledge_facts,
+        state=state,
+    )
+    relevant_fact_ids = {
+        str(group.get("fact_id") or "")
+        for group in relevant_groups
+        if str(group.get("fact_id") or "").strip()
+    }
+    return any(
+        str(getattr(fact, "fact_id", "") or "") in relevant_fact_ids
+        and bool(_knowledge_fact_operation_names(fact) & {"sort", "limit"})
+        for fact in knowledge_facts
+    )
+
+
+def _pre_plan_selector_needs_structured_discovery(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> bool:
+    if state.get("analysis_plan") is not None:
+        return False
+    if _tool_was_attempted(state, "query_schema"):
+        return False
+    if any(_observed_source_is_structured(source) for source in _state_observed_sources(state)):
+        return False
+    return _request_has_selector_authorization(state, discovery)
+
+
+def _pre_plan_relevant_field_needs_schema_discovery(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> bool:
+    if state.get("analysis_plan") is not None:
+        return False
+    return bool(
+        _missing_relevant_schema_field_facts(
+            state=state,
+            discovery=discovery,
+        )
+    )
+
+
+def _canonicalize_query_schema_relevant_field(
+    request: ToolCallRequest,
+    discovery: _DiscoveryState,
+) -> ToolCallRequest:
+    if str(request.tool_call.get("name") or "") != "query_schema":
+        return request
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    missing_facts = _missing_relevant_schema_field_facts(
+        state=request.state,
+        discovery=discovery,
+    )
+    if not missing_facts:
+        return request
+    current_field = str(arguments.get("field") or "").strip()
+    current_alias = _normalized_field_alias(current_field)
+    for fact in missing_facts:
+        if current_alias and current_alias in _knowledge_fact_field_aliases(fact):
+            return request
+    replacement = str(getattr(missing_facts[0], "field_key", "") or "").strip()
+    if not replacement or replacement == current_field:
+        return request
+    updated = dict(arguments)
+    updated["field"] = replacement
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": updated,
+        }
+    )
+
+
+def _pre_plan_observed_narrative_hint_needs_read_window(
+    state: Mapping[str, Any],
+    discovery: _DiscoveryState,
+) -> bool:
+    if state.get("analysis_plan") is not None:
+        return False
+    knowledge_facts = list(parse_knowledge_content(discovery.knowledge_content))
+    hint_groups = _request_relevant_knowledge_source_hint_groups(
+        knowledge_facts=knowledge_facts,
+        state=state,
+    )
+    for group in hint_groups:
+        for hint in group.get("source_hints") or []:
+            source_hint = str(hint or "").strip()
+            if not source_hint:
+                continue
+            if not _observed_narrative_paths_for_source_hint(
+                state=state,
+                source_hint=source_hint,
+            ):
+                continue
+            if not _observed_narrative_hint_has_read_window(
+                state=state,
+                source_hint=source_hint,
+            ):
+                return True
+    return False
+
+
+def _observed_execution_sources_for_hint(
+    *,
+    state: Mapping[str, Any],
+    source_hint: str,
+) -> list[dict[str, Any]]:
+    normalized_hint = _normalized_quote_text(source_hint)
+    if not normalized_hint:
+        return []
+    matches: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for source in _state_observed_sources(state):
+        if not (
+            _observed_source_is_structured(source)
+            or str(source.get("observed_by") or "").strip()
+            in _NARRATIVE_FIELD_EVIDENCE_TOOLS
+        ):
+            continue
+        path = str(source.get("path") or "").replace("\\", "/")
+        if not path:
+            continue
+        source_hints = {
+            _normalized_quote_text(str(source.get("source_name_hint") or "")),
+            _normalized_quote_text(str(source.get("table") or "")),
+        }
+        for source_path in _source_mapping_paths(source):
+            path_tail = source_path.rsplit("::", 1)[-1].rsplit("/", 1)[-1]
+            source_hints.add(_normalized_quote_text(path_tail.rsplit(".", 1)[0]))
+        if normalized_hint not in {hint for hint in source_hints if hint} and not (
+            _source_path_matches_hint(path, source_hint)
+        ):
+            continue
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        entry: dict[str, Any] = {
+            "path": path,
+            "source_type": str(source.get("source_type") or "source"),
+        }
+        if str(source.get("table") or "").strip():
+            entry["table"] = str(source.get("table"))
+        matches.append(entry)
+    return matches
+
+
 def _condition_requirement_type(container_name: str) -> str:
     return {
         "filters": "filter",
@@ -3161,13 +4637,6 @@ def _condition_requirement_type(container_name: str) -> str:
 
 def _constraint_requirement_type(constraint: Mapping[str, Any]) -> str:
     constraint_type = str(constraint.get("constraint_type") or "").strip()
-    selector_text = (
-        f"{constraint.get('quote') or ''} {constraint.get('value') or ''}"
-    )
-    if constraint_type in {"filter", "ordering"} and _SELECTOR_EXPRESSION_PATTERN.search(
-        selector_text
-    ):
-        return "selector"
     return {
         "filter": "filter",
         "equality": "filter",
@@ -3230,8 +4699,6 @@ def _quote_type_pairs_from_question_structure(
         target_type = str(target.get("target_type") or "").strip()
         if quote and target_type:
             pairs.append((quote, _target_requirement_type(target_type)))
-            if _SELECTOR_EXPRESSION_PATTERN.search(quote):
-                pairs.append((quote, "selector"))
     for constraint in question_structure.get("target_constraints") or []:
         if not isinstance(constraint, Mapping):
             continue
@@ -3501,18 +4968,11 @@ def _unresolved_explicit_scope_quotes(
         "未命中",
         "无法直接",
         "粒度",
-        "分省",
-        "省份",
     }
 
     unresolved_quotes: list[str] = []
     for constraint in _question_structure_scope_constraints(question_structure):
         if constraint.get("explicitness") != "explicit":
-            continue
-        selector_text = (
-            f"{constraint.get('quote') or ''} {constraint.get('value') or ''}"
-        )
-        if _SELECTOR_EXPRESSION_PATTERN.search(selector_text):
             continue
         if constraint.get("constraint_type") not in {
             "entity",
@@ -3569,140 +5029,6 @@ def _unresolved_binding_issues(intent: Mapping[str, Any]) -> list[str]:
         if text and any(marker in normalized for marker in markers):
             issues.append(text)
     return issues
-
-
-def _evidence_contract_payload(
-    state: Mapping[str, Any],
-    discovery: _DiscoveryState,
-) -> dict[str, Any]:
-    original_request = str(state.get("original_request") or "")
-    question_structure = state.get("question_structure")
-    authorized_operations: list[dict[str, Any]] = []
-    if isinstance(question_structure, Mapping):
-        for item in question_structure.get("intent_operators") or []:
-            if not isinstance(item, Mapping):
-                continue
-            quote = str(item.get("quote") or "").strip()
-            operation = str(item.get("operation") or "").strip()
-            if quote and quote in original_request and operation:
-                authorized_operations.append(
-                    {
-                        "operation": operation,
-                        "source": "user",
-                        "quote": quote,
-                    }
-                )
-        conditions = question_structure.get("conditions")
-        for quote, operations in _question_structure_authorized_operations_by_quote(
-            question_structure,
-            original_request,
-        ).items():
-            for operation in sorted(operations):
-                authorized_operations.append(
-                    {
-                        "operation": operation,
-                        "source": "user",
-                        "quote": quote,
-                    }
-                )
-
-    seen_operations: set[tuple[str, str, str]] = set()
-    unique_operations: list[dict[str, Any]] = []
-    for item in authorized_operations:
-        key = (
-            str(item.get("operation") or ""),
-            str(item.get("source") or ""),
-            str(item.get("quote") or ""),
-        )
-        if key in seen_operations:
-            continue
-        seen_operations.add(key)
-        unique_operations.append(item)
-
-    observed_evidence: list[dict[str, Any]] = []
-    for source in _state_observed_sources(state):
-        path = str(source.get("path") or "").replace("\\", "/")
-        if not path:
-            continue
-        fields = source.get("fields")
-        matched_lines = source.get("matched_lines")
-        has_extracted_fields = (
-            _observed_source_is_narrative(source)
-            and str(source.get("observed_by") or "").strip()
-            in _NARRATIVE_FIELD_EVIDENCE_TOOLS
-        )
-        observed_evidence.append(
-            {
-                "path": path,
-                "field": (
-                    fields[:8]
-                    if isinstance(fields, list)
-                    and (_observed_source_is_structured(source) or has_extracted_fields)
-                    else None
-                ),
-                "value": None,
-                "evidence_type": (
-                    "narrative_extraction"
-                    if has_extracted_fields
-                    else
-                    "line"
-                    if isinstance(matched_lines, list) and matched_lines
-                    else "schema"
-                ),
-                "line_number": (
-                    matched_lines[0].get("line_number")
-                    if isinstance(matched_lines, list)
-                    and matched_lines
-                    and isinstance(matched_lines[0], Mapping)
-                    else None
-                ),
-                "sample_hash": source.get("sample_hash"),
-            }
-        )
-
-    candidate_answers: list[dict[str, Any]] = []
-    candidate = state.get("answer_candidate")
-    if isinstance(candidate, Mapping):
-        candidate_audit = candidate.get("audit")
-        candidate_source = candidate.get("source")
-        if not candidate_source and isinstance(candidate_audit, Mapping):
-            candidate_source = candidate_audit.get("audit_origin")
-        candidate_answers.append(
-            {
-                "columns": candidate.get("columns"),
-                "rows": candidate.get("rows"),
-                "audit": candidate_audit,
-                "source": candidate_source or "answer_candidate",
-            }
-        )
-    knowledge_source_hints = _request_relevant_knowledge_source_hint_groups(
-        knowledge_facts=parse_knowledge_content(discovery.knowledge_content),
-        state=state,
-    )
-
-    return {
-        "authorized_operations": unique_operations,
-        "scope_constraints": [
-            {
-                "kind": item.get("constraint_type"),
-                "quote": item.get("quote"),
-                "status": "unresolved",
-                "evidence": [],
-            }
-            for item in _question_structure_scope_constraints(question_structure)
-        ],
-        "observed_evidence": [
-            {
-                key: value
-                for key, value in item.items()
-                if value is not None and value != []
-            }
-            for item in observed_evidence[:12]
-        ],
-        "candidate_answers": candidate_answers,
-        "knowledge_source_hints": knowledge_source_hints,
-        "knowledge_available": discovery.knowledge_available,
-    }
 
 
 def _question_structure_preserve_hint(question_structure: Any) -> bool:
@@ -3780,17 +5106,28 @@ def _active_plan_boundary_summary(state: Mapping[str, Any]) -> dict[str, Any] | 
     }
 
 
+def _boundary_answer_candidate_summary(candidate: Any) -> dict[str, Any] | None:
+    if not isinstance(candidate, Mapping):
+        return None
+    rows = candidate.get("rows")
+    row_count = len(rows) if isinstance(rows, list) else None
+    summary = {
+        "columns": candidate.get("columns"),
+        "row_count": row_count,
+        "source": candidate.get("source"),
+    }
+    return {
+        key: value
+        for key, value in summary.items()
+        if value not in ("", [], None)
+    }
+
+
 def _decision_evidence_boundary_payload(
     state: Mapping[str, Any],
     discovery: _DiscoveryState,
 ) -> dict[str, Any]:
-    original_request = str(state.get("original_request") or "")
     question_structure = state.get("question_structure")
-    user_authorized_operations = _question_structure_user_authorized_operations(
-        question_structure,
-        original_request,
-    )
-    forbidden_operations = sorted(_TRANSFORM_OPERATIONS - user_authorized_operations)
     source_summaries = [
         _evidence_boundary_source_summary(source)
         for source in _state_observed_sources(state)
@@ -3798,43 +5135,52 @@ def _decision_evidence_boundary_payload(
     source_summaries = [
         source for source in source_summaries if source.get("path")
     ][:8]
-    preserve_hint = _question_structure_preserve_hint(question_structure)
+    question_hints: dict[str, Any] = {}
+    if isinstance(question_structure, Mapping):
+        output = question_structure.get("output")
+        if isinstance(output, Mapping):
+            question_hints["requested_columns"] = output.get("requested_columns") or []
+            question_hints["row_grain_hint"] = str(
+                output.get("row_grain_hint") or "unspecified"
+            )
+            question_hints["preserve_source_rows"] = str(
+                output.get("preserve_source_rows") or "unknown"
+            )
+        constraints = _question_structure_scope_constraints(question_structure)
+        if constraints:
+            question_hints["scope_constraints"] = constraints
 
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "purpose": (
-            "Runtime authorization and evidence boundary. Use it for every "
-            "decision, including discovery, analyze_plan, revisions, and execution."
+            "Lightweight runtime evidence summary. Use observed data shape, "
+            "knowledge quotes, and answer candidates to decide the next step."
         ),
-        "evidence_contract": _evidence_contract_payload(state, discovery),
         "discovery_ready": discovery.context_ready,
         "observed_sources": source_summaries,
         "active_plan": _active_plan_boundary_summary(state),
-        "user_authorized_operations": sorted(user_authorized_operations),
-        "forbidden_without_user_or_knowledge_authorization": forbidden_operations,
-        "scope_constraints_are_evidence_not_authorization": (
-            _question_structure_scope_constraints(question_structure)
+        "answer_candidate": _boundary_answer_candidate_summary(
+            state.get("answer_candidate")
         ),
-        "preserve_source_rows_hint": preserve_hint,
+        "question_hints": {
+            key: value
+            for key, value in question_hints.items()
+            if value not in ("", [], None)
+        },
         "rules": [
             (
-                "Context/source observations can support evidence.context_sources "
-                "but cannot authorize filter, aggregate, derive, sort, limit, "
-                "deduplicate, or reshape."
+                "Knowledge markdown describes semantics and possible source hints; "
+                "treat physical fields/tables as observed only after data-tool "
+                "evidence reports them."
             ),
             (
-                "A transformation needs an exact user quote detected as an "
-                "operation, or an observed knowledge quote/KnowledgeFact.fact_id."
+                "Filter/sort/aggregate/derive/limit decisions must be justified by "
+                "the user's wording or knowledge rules, then executed against "
+                "observed source shape."
             ),
             (
-                "When source grain or scope is ambiguous, record the conflict in "
-                "evidence or unresolved items; do not invent a transformation."
-            ),
-            (
-                "Knowledge markdown/PDF field definitions are semantic targets "
-                "or source-name hints only. They are not observed physical fields "
-                "unless a structured source lists the field or a narrative "
-                "extraction result reports it."
+                "If a candidate answer already has the requested shape, validate "
+                "and submit instead of revising the plan repeatedly."
             ),
         ],
         "knowledge_available": discovery.knowledge_available,
@@ -3897,17 +5243,20 @@ def _user_quote_authorizes_operation(
     state: Mapping[str, Any],
 ) -> bool:
     operation_name = operation.casefold()
-    if not state.get("question_structure_enforced"):
-        original_request = str(state.get("original_request") or "")
-        return bool(quote and quote in original_request) or operation_name == "join"
+    if operation_name == "join":
+        return True
+    original_request = str(state.get("original_request") or "")
+    if not quote or quote not in original_request:
+        return False
     requirement_types = _requirement_types_for_quote(
         quote=quote,
         arguments=arguments,
         state=state,
     )
-    if requirement_types & _OPERATION_REQUIREMENT_TYPES.get(operation_name, frozenset()):
-        return True
-    return operation_name == "join"
+    return bool(
+        requirement_types
+        & _OPERATION_REQUIREMENT_TYPES.get(operation_name, frozenset())
+    )
 
 
 def _operation_item_is_supported(
@@ -3916,8 +5265,6 @@ def _operation_item_is_supported(
     arguments: Mapping[str, Any],
     state: Mapping[str, Any],
 ) -> bool:
-    if not state.get("question_structure_enforced"):
-        return True
     operation = str(item.get("operation") or "").strip()
     if not operation:
         return True
@@ -4013,6 +5360,14 @@ def _positive_int(value: Any) -> int | None:
     return None
 
 
+def _explicit_limit_count(operation_item: Mapping[str, Any]) -> int | None:
+    for key in ("limit", "count", "n", "value"):
+        count = _positive_int(operation_item.get(key))
+        if count is not None:
+            return count
+    return None
+
+
 def _limit_count_from_question_structure(
     *,
     operation_item: Mapping[str, Any],
@@ -4036,12 +5391,9 @@ def _limit_count_from_question_structure(
         item_quote = str(item.get("quote") or "").strip()
         if quote and item_quote and item_quote != quote:
             continue
-        for key in ("limit", "count", "n", "value"):
-            count = _positive_int(item.get(key))
-            if count is not None:
-                return count
-        if str(item.get("operator_type") or "") == "selector":
-            return 1
+        count = _explicit_limit_count(item)
+        if count is not None:
+            return count
 
     conditions = question_structure.get("conditions")
     if isinstance(conditions, Mapping):
@@ -4051,10 +5403,9 @@ def _limit_count_from_question_structure(
             item_quote = str(item.get("quote") or "").strip()
             if quote and item_quote and item_quote != quote:
                 continue
-            for key in ("limit", "count", "n", "value"):
-                count = _positive_int(item.get(key))
-                if count is not None:
-                    return count
+            count = _explicit_limit_count(item)
+            if count is not None:
+                return count
     return None
 
 
@@ -4065,10 +5416,9 @@ def _expected_row_count_from_limit_operation(
     operation = str(operation_item.get("operation") or "").casefold()
     if operation != "limit":
         return None
-    for key in ("limit", "count", "n"):
-        count = _positive_int(operation_item.get(key))
-        if count is not None:
-            return count
+    count = _explicit_limit_count(operation_item)
+    if count is not None:
+        return count
     return _limit_count_from_question_structure(
         operation_item=operation_item,
         state=state,
@@ -4082,107 +5432,54 @@ def _authorization_quote_for_operation(
     state: Mapping[str, Any],
 ) -> str | None:
     original_request = str(state.get("original_request") or "")
-    question_structure = state.get("question_structure")
-    if state.get("question_structure_enforced"):
-        operations_by_quote = _question_structure_authorized_operations_by_quote(
-            question_structure,
-            original_request,
-        )
-        authorized_quotes = sorted(
-            (
-                quote
-                for quote, operations in operations_by_quote.items()
-                if operation in operations
-            ),
-            key=lambda item: (-len(item), item),
-        )
-        return authorized_quotes[0] if authorized_quotes else None
-
+    candidates: list[str] = []
     intent = arguments.get("intent")
     if isinstance(intent, Mapping):
         for item in intent.get("requirements") or []:
             if not isinstance(item, Mapping):
                 continue
             quote = str(item.get("quote") or "").strip()
-            if not quote:
-                continue
-            requirement_types = _requirement_types_for_quote(
-                quote=quote,
-                arguments=arguments,
-                state=state,
-            )
-            operation_types = _OPERATION_REQUIREMENT_TYPES.get(
-                operation,
-                frozenset(),
-            )
-            if requirement_types & operation_types:
-                return quote
+            if quote and quote in original_request:
+                candidates.append(quote)
 
+    question_structure = state.get("question_structure")
     if not isinstance(question_structure, Mapping):
-        return None
-
-    for item in question_structure.get("intent_operators") or []:
-        if not isinstance(item, Mapping):
-            continue
-        if str(item.get("operation") or "").strip() != operation:
-            continue
-        quote = str(item.get("quote") or "").strip()
-        if quote and quote in original_request:
-            return quote
-
-    condition_operations = {
-        "filter": ("filters", "time_ranges"),
-        "aggregate": ("calculations",),
-        "derive": ("calculations",),
-        "sort": ("orderings",),
-        "limit": ("limits",),
-        "deduplicate": (),
-        "reshape": (),
-    }
-    conditions = question_structure.get("conditions")
-    if not isinstance(conditions, Mapping):
-        return None
-    for container_name in condition_operations.get(operation, ()):
-        for item in conditions.get(container_name) or []:
+        candidates.append(original_request)
+    else:
+        for item in question_structure.get("intent_operators") or []:
             if not isinstance(item, Mapping):
                 continue
             quote = str(item.get("quote") or "").strip()
             if quote and quote in original_request:
-                return quote
-    return None
+                candidates.append(quote)
+        conditions = question_structure.get("conditions")
+        if isinstance(conditions, Mapping):
+            for values in conditions.values():
+                if not isinstance(values, list):
+                    continue
+                for item in values:
+                    if not isinstance(item, Mapping):
+                        continue
+                    quote = str(item.get("quote") or "").strip()
+                    if quote and quote in original_request:
+                        candidates.append(quote)
+        for item in question_structure.get("target_constraints") or []:
+            if not isinstance(item, Mapping):
+                continue
+            quote = str(item.get("quote") or "").strip()
+            if quote and quote in original_request:
+                candidates.append(quote)
+        candidates.append(original_request)
 
-
-def _authorized_operations_from_contract(
-    arguments: Mapping[str, Any],
-    state: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    operations: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for operation in sorted(_TRANSFORM_OPERATIONS):
-        quote = _authorization_quote_for_operation(
+    for quote in sorted(dict.fromkeys(candidates), key=lambda item: (-len(item), item)):
+        if _user_quote_authorizes_operation(
             operation=operation,
+            quote=quote,
             arguments=arguments,
             state=state,
-        )
-        if not quote or operation in seen:
-            continue
-        operation_payload = {
-            "operation": operation,
-            "description": _operation_description(operation, quote),
-            "authorization": {"source": "user", "quote": quote},
-        }
-        if operation == "limit":
-            count = _limit_count_from_question_structure(
-                operation_item=operation_payload,
-                state=state,
-            )
-            if count is not None:
-                operation_payload["limit"] = count
-        operations.append(
-            operation_payload
-        )
-        seen.add(operation)
-    return operations
+        ):
+            return quote
+    return None
 
 
 def _canonicalize_authorized_plan_operations(
@@ -4205,57 +5502,103 @@ def _canonicalize_authorized_plan_operations(
     updated_execution_spec.setdefault("supporting_fields", [])
     updated_execution_spec.setdefault("operations", [])
 
-    transformations = [
-        item
-        for item in updated_output_spec.get("transformations") or []
-        if isinstance(item, Mapping)
-    ]
-    execution_operations = [
-        item
-        for item in updated_execution_spec.get("operations") or []
-        if isinstance(item, Mapping)
-    ]
-    transformation_operations = {
-        str(item.get("operation") or "").casefold()
-        for item in transformations
-        if str(item.get("operation") or "").strip()
-    }
-    mirrored_transformations = [
-        dict(item)
-        for item in execution_operations
-        if str(item.get("operation") or "").casefold() in _TRANSFORM_OPERATIONS
-        and str(item.get("operation") or "").casefold() not in transformation_operations
-    ]
     changed = False
-    if mirrored_transformations:
-        transformations = [*transformations, *mirrored_transformations]
+
+    def normalize_operation_items(
+        items: Any,
+        *,
+        allow_join: bool,
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        if not isinstance(items, list):
+            return normalized
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            operation = str(item.get("operation") or "").strip().casefold()
+            if not operation:
+                continue
+            if operation == "join" and allow_join:
+                normalized.append(dict(item))
+                continue
+            if operation not in _TRANSFORM_OPERATIONS:
+                continue
+            updated_item = dict(item)
+            authorization = updated_item.get("authorization")
+            source = ""
+            quote = ""
+            if isinstance(authorization, Mapping):
+                source = str(authorization.get("source") or "").strip()
+                quote = str(authorization.get("quote") or "").strip()
+            if source == "user" and _user_quote_authorizes_operation(
+                operation=operation,
+                quote=quote,
+                arguments=arguments,
+                state=request.state,
+            ):
+                if operation == "limit" and _explicit_limit_count(updated_item) is None:
+                    limit_count = _limit_count_from_question_structure(
+                        operation_item=updated_item,
+                        state=request.state,
+                    )
+                    if limit_count is not None:
+                        updated_item["limit"] = limit_count
+                normalized.append(updated_item)
+                continue
+            if source == "knowledge":
+                normalized.append(updated_item)
+                continue
+            quote = _authorization_quote_for_operation(
+                operation=operation,
+                arguments=arguments,
+                state=request.state,
+            )
+            if not quote:
+                continue
+            updated_item["authorization"] = {"source": "user", "quote": quote}
+            if not str(updated_item.get("description") or "").strip():
+                updated_item["description"] = _operation_description(operation, quote)
+            if operation == "limit" and _explicit_limit_count(updated_item) is None:
+                limit_count = _limit_count_from_question_structure(
+                    operation_item=updated_item,
+                    state=request.state,
+                )
+                if limit_count is not None:
+                    updated_item["limit"] = limit_count
+            normalized.append(updated_item)
+        return normalized
+
+    raw_transformations = updated_output_spec.get("transformations") or []
+    transformations = normalize_operation_items(
+        raw_transformations,
+        allow_join=False,
+    )
+    if transformations != raw_transformations:
         updated_output_spec["transformations"] = transformations
         changed = True
-
-    declared = {
-        str(item.get("operation") or "").casefold()
-        for item in [*transformations, *execution_operations]
-        if str(item.get("operation") or "").strip()
-    }
-
-    additions = [
-        item
-        for item in _authorized_operations_from_contract(arguments, request.state)
-        if item["operation"] not in declared
-    ]
-    if additions:
-        transformations = [*transformations, *additions]
-        execution_operations = [*execution_operations, *additions]
-        updated_output_spec["transformations"] = transformations
+    raw_execution_operations = updated_execution_spec.get("operations") or []
+    execution_operations = normalize_operation_items(
+        raw_execution_operations,
+        allow_join=True,
+    )
+    if execution_operations != raw_execution_operations:
         updated_execution_spec["operations"] = execution_operations
         changed = True
 
+    # Keep this pass mechanical: normalize only operations that the plan
+    # explicitly declares. Do not infer selector/sort/limit from wording.
+
+    declared_limit_operations = [
+        item
+        for item in [*transformations, *execution_operations]
+        if isinstance(item, Mapping)
+        and str(item.get("operation") or "").strip().casefold() == "limit"
+    ]
     limit_counts = [
         count
         for count in (
             _expected_row_count_from_limit_operation(item, request.state)
-            for item in [*transformations, *execution_operations]
-            if isinstance(item, Mapping)
+            for item in declared_limit_operations
         )
         if count is not None
     ]
@@ -4264,6 +5607,12 @@ def _canonicalize_authorized_plan_operations(
         if updated_output_spec.get("expected_row_count") != expected_row_count:
             updated_output_spec["expected_row_count"] = expected_row_count
             changed = True
+    elif declared_limit_operations and isinstance(
+        updated_output_spec.get("expected_row_count"),
+        int,
+    ):
+        updated_output_spec["expected_row_count"] = None
+        changed = True
 
     if transformations:
         if updated_output_spec.get("row_policy") != "transform":
@@ -4622,10 +5971,11 @@ def _requested_measure_output_count(state: Mapping[str, Any]) -> int:
         target_type = str(target.get("target_type") or "").strip().casefold()
         if target_type not in {"measure", "metric"}:
             continue
+        if _measure_target_is_selector_only(target, state):
+            continue
         target_texts = {
-            _normalized_quote_text(str(target.get(key) or ""))
-            for key in ("quote", "name", "description")
-            if str(target.get(key) or "").strip()
+            _normalized_quote_text(text)
+            for text in _target_texts(target)
         }
         if target_texts & requested_columns:
             count += 1
@@ -4777,6 +6127,55 @@ def _canonicalize_unrequested_measure_output_columns(
         }
     )
 
+
+def _canonicalize_unrequested_count_output_columns(
+    request: ToolCallRequest,
+) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    output_spec = arguments.get("output_spec")
+    if not isinstance(output_spec, Mapping):
+        return request
+    output_columns = output_spec.get("columns")
+    if not isinstance(output_columns, list) or len(output_columns) <= 1:
+        return request
+    if _question_requests_distribution(request.state):
+        return request
+    requested_texts = _question_requested_output_texts(request.state)
+    kept_columns: list[Any] = []
+    demoted_columns: list[Mapping[str, Any]] = []
+    for column in output_columns:
+        if not isinstance(column, Mapping):
+            kept_columns.append(column)
+            continue
+        if not _column_is_count_measure(column):
+            kept_columns.append(column)
+            continue
+        if _column_matches_requested_output(column, requested_texts):
+            kept_columns.append(column)
+            continue
+        if _column_matches_requested_measure(column, request.state):
+            kept_columns.append(column)
+            continue
+        demoted_columns.append(column)
+    if not demoted_columns or not kept_columns:
+        return request
+    updated_arguments = _demote_output_columns(
+        arguments=arguments,
+        output_spec=output_spec,
+        demoted_columns=demoted_columns,
+        kept_columns=kept_columns,
+        purpose="supporting",
+    )
+    if updated_arguments is None:
+        return request
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": updated_arguments,
+        }
+    )
 
 def _canonicalize_missing_intent_requirements(
     request: ToolCallRequest,
@@ -4949,43 +6348,27 @@ def _canonicalize_unsatisfied_authoritative_source_hints(
     if not missing_by_group:
         return request
 
-    observed_missing_hints = sorted(
+    all_missing_hints = sorted(
         {
             str(hint)
             for group in missing_by_group
             for hint in group.get("missing") or []
-            if _source_hint_has_observed_source(
-                state=request.state,
-                source_hint=str(hint),
-            )
+            if str(hint).strip()
         }
     )
-    if not observed_missing_hints:
-        return request
-
-    issue_parts = [
-        str(evidence.get("knowledge_issue") or ""),
-        str(evidence.get("cross_validated_inference") or ""),
-    ]
-    intent = arguments.get("intent")
-    if isinstance(intent, Mapping):
-        issue_parts.extend(str(item or "") for item in intent.get("unresolved") or [])
-    issue_text = _normalized_quote_text(" ".join(issue_parts))
-    if not issue_text:
+    if not all_missing_hints:
         return request
 
     updated_evidence = dict(evidence)
-    updated_evidence["knowledge_status"] = "insufficient"
-    updated_evidence["knowledge_rules"] = []
     if not str(updated_evidence.get("knowledge_issue") or "").strip():
         updated_evidence["knowledge_issue"] = (
-            "Request-relevant knowledge source hints were observed but cannot be "
-            "satisfied by the execution sources; use observed context evidence "
-            "for the remaining bindings."
+            "Request-relevant knowledge source hints cannot be satisfied by the "
+            "execution sources. Treat them as advisory source candidates and use "
+            "observed context evidence for executable bindings."
         )
     updated_evidence["source_hint_issue"] = {
-        "status": "observed_hint_not_satisfied_by_plan_sources",
-        "observed_missing_hints": observed_missing_hints,
+        "status": "advisory_hint_not_satisfied_by_plan_sources",
+        "missing_hints": all_missing_hints,
         "missing_by_group": missing_by_group[:3],
     }
     return request.override(
@@ -4994,6 +6377,74 @@ def _canonicalize_unsatisfied_authoritative_source_hints(
             "args": {
                 **dict(arguments),
                 "evidence": updated_evidence,
+            },
+        }
+    )
+
+
+def _canonicalize_observed_source_hint_execution_sources(
+    request: ToolCallRequest,
+    discovery: _DiscoveryState,
+) -> ToolCallRequest:
+    arguments = request.tool_call.get("args")
+    if not isinstance(arguments, Mapping):
+        return request
+    evidence = arguments.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return request
+    if str(evidence.get("knowledge_status") or "") != "authoritative":
+        return request
+
+    requested_sources = {
+        str(item.get("path") or "").replace("\\", "/")
+        for item in evidence.get("context_sources") or []
+        if isinstance(item, Mapping) and str(item.get("path") or "").strip()
+    }
+    execution_spec = arguments.get("execution_spec")
+    updated_execution_spec = (
+        dict(execution_spec) if isinstance(execution_spec, Mapping) else {}
+    )
+    existing_sources = [
+        item
+        for item in updated_execution_spec.get("sources") or []
+        if isinstance(item, Mapping)
+    ]
+    execution_sources = _source_paths_from_execution_spec(updated_execution_spec)
+    missing_by_group = _missing_relevant_source_hint_groups(
+        knowledge_facts=parse_knowledge_content(discovery.knowledge_content),
+        state=request.state,
+        plan_sources=requested_sources | execution_sources,
+    )
+    if not missing_by_group:
+        return request
+
+    source_paths = {
+        str(item.get("path") or "").replace("\\", "/")
+        for item in existing_sources
+        if str(item.get("path") or "").strip()
+    }
+    additions: list[dict[str, Any]] = []
+    for group in missing_by_group:
+        for hint in group.get("missing") or []:
+            for source in _observed_execution_sources_for_hint(
+                state=request.state,
+                source_hint=str(hint),
+            ):
+                path = str(source.get("path") or "").replace("\\", "/")
+                if not path or path in source_paths:
+                    continue
+                source_paths.add(path)
+                additions.append(source)
+    if not additions:
+        return request
+
+    updated_execution_spec["sources"] = [*existing_sources, *additions]
+    return request.override(
+        tool_call={
+            **request.tool_call,
+            "args": {
+                **dict(arguments),
+                "execution_spec": updated_execution_spec,
             },
         }
     )
@@ -5031,7 +6482,16 @@ def _fact_has_time_terms(fact: Any) -> bool:
 
 def _knowledge_fact_defines_field(fact: Any) -> bool:
     return bool(
-        str(getattr(fact, "section_key", "") or "").strip()
+        str(getattr(fact, "kind", "") or "").casefold() == "field"
+        and str(getattr(fact, "section_key", "") or "").strip()
+        and str(getattr(fact, "field_key", "") or "").strip()
+        and not str(getattr(fact, "operation", "") or "").strip()
+    )
+
+
+def _knowledge_fact_has_field_key(fact: Any) -> bool:
+    return bool(
+        str(getattr(fact, "kind", "") or "").casefold() == "field"
         and str(getattr(fact, "field_key", "") or "").strip()
         and not str(getattr(fact, "operation", "") or "").strip()
     )
@@ -5048,6 +6508,26 @@ def _knowledge_fact_field_aliases(fact: Any) -> set[str]:
     return {alias for alias in aliases if alias}
 
 
+def _equivalent_scoped_field_facts(
+    fact: Any,
+    field_definition_facts: list[Any],
+) -> list[Any]:
+    if _knowledge_fact_defines_field(fact):
+        return []
+    fact_aliases = _knowledge_fact_field_aliases(fact)
+    if not fact_aliases:
+        return []
+    matches: list[Any] = []
+    for candidate in field_definition_facts:
+        if str(getattr(candidate, "fact_id", "") or "") == str(
+            getattr(fact, "fact_id", "") or ""
+        ):
+            continue
+        if fact_aliases & _knowledge_fact_field_aliases(candidate):
+            matches.append(candidate)
+    return matches
+
+
 def _knowledge_fact_operation_names(fact: Any) -> set[str]:
     operation_text = str(getattr(fact, "operation", "") or "")
     operations = {
@@ -5056,8 +6536,17 @@ def _knowledge_fact_operation_names(fact: Any) -> set[str]:
         if item.strip()
     }
     quote = str(getattr(fact, "quote", "") or "")
+    quote_upper = quote.upper()
     if re.search(r"\bJOIN\b", quote, re.IGNORECASE):
         operations.add("join")
+    if re.search(r"\bWHERE\b", quote_upper):
+        operations.add("filter")
+    if re.search(r"\b(GROUP\s+BY|COUNT|SUM|AVG|MIN|MAX)\s*\(?", quote_upper):
+        operations.add("aggregate")
+    if re.search(r"\bORDER\s+BY\b", quote_upper):
+        operations.add("sort")
+    if re.search(r"\bLIMIT\b", quote_upper):
+        operations.add("limit")
     if re.search(
         r"\b[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*\s*=\s*"
         r"[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*\b",
@@ -5332,6 +6821,9 @@ def _canonicalize_plan_quotes(
             normalized_rule.pop("fact_id", None)
             normalized_rule.setdefault("source_path", "/context/knowledge.md")
             changed = True
+        elif fact_id and fact_id not in knowledge_facts_by_id:
+            changed = True
+            continue
         normalized_rules.append(normalized_rule)
 
     operation_knowledge_authorizations: dict[str, dict[str, Any]] = {}
@@ -5654,11 +7146,257 @@ def _plan_error(
     )
 
 
+def _validate_lightweight_plan_contract(
+    request: ToolCallRequest,
+    discovery: _DiscoveryState,
+) -> ToolMessage | None:
+    """Validate only the small contract needed to execute a structured answer."""
+
+    arguments = request.tool_call.get("args") or {}
+    if not isinstance(arguments, Mapping):
+        return _plan_error(request, "tool arguments must be a JSON object.")
+    original_request = str(request.state.get("original_request") or "")
+    if not original_request:
+        return _plan_error(request, "original_request is missing from agent state.")
+
+    intent = arguments.get("intent") or {}
+    if not isinstance(intent, Mapping):
+        return _plan_error(request, "intent must be a JSON object.")
+    requirements = intent.get("requirements") or []
+    if not isinstance(requirements, list) or not requirements:
+        return _plan_error(request, "intent.requirements must be a non-empty list.")
+    bad_quotes = [
+        str(item.get("quote") or "")
+        for item in requirements
+        if isinstance(item, Mapping)
+        and str(item.get("quote") or "").strip()
+        and str(item.get("quote") or "").strip() not in original_request
+    ]
+    if bad_quotes:
+        return _plan_error(
+            request,
+            (
+                "intent requirement quotes must occur verbatim in "
+                f"original_request: {bad_quotes[:3]}."
+            ),
+        )
+
+    evidence = arguments.get("evidence") or {}
+    if not isinstance(evidence, Mapping):
+        return _plan_error(request, "evidence must be a JSON object.")
+    context_sources = evidence.get("context_sources") or []
+    requested_sources = {
+        str(item.get("path") or "").replace("\\", "/")
+        for item in context_sources
+        if isinstance(item, Mapping) and str(item.get("path") or "").strip()
+    }
+    unobserved_sources = requested_sources - discovery.context_sources
+    if discovery.knowledge_present:
+        unobserved_sources.discard("/context/knowledge.md")
+    if unobserved_sources:
+        return _plan_error(
+            request,
+            (
+                "context sources must come from successful discovery calls; "
+                f"unobserved sources: {sorted(unobserved_sources)}."
+            ),
+        )
+    knowledge_status = str(evidence.get("knowledge_status") or "")
+    if knowledge_status == "authoritative" and (
+        not discovery.knowledge_present or not discovery.knowledge_available
+    ):
+        return _plan_error(
+            request,
+            "knowledge cannot be authoritative because knowledge.md was unavailable.",
+        )
+    knowledge_rules = evidence.get("knowledge_rules") or []
+    knowledge_rule_quotes: set[str] = set()
+    for rule in knowledge_rules:
+        if not isinstance(rule, Mapping):
+            continue
+        quote = str(rule.get("quote") or "").strip()
+        if quote:
+            knowledge_rule_quotes.add(quote)
+
+    output_spec = arguments.get("output_spec") or {}
+    if not isinstance(output_spec, Mapping):
+        return _plan_error(request, "output_spec must be a JSON object.")
+    output_columns = output_spec.get("columns") or []
+    if not isinstance(output_columns, list) or not output_columns:
+        return _plan_error(request, "output_spec.columns must be a non-empty list.")
+    transformations = [
+        item
+        for item in output_spec.get("transformations") or []
+        if isinstance(item, Mapping)
+    ]
+    row_policy = str(output_spec.get("row_policy") or "")
+    if transformations and row_policy != "transform":
+        return _plan_error(
+            request,
+            "row_policy must be transform when transformations are present.",
+        )
+    if not transformations:
+        if row_policy != "preserve":
+            return _plan_error(
+                request,
+                "row_policy must be preserve when no transformation is authorized.",
+            )
+        if output_spec.get("ordering") != "source":
+            return _plan_error(request, "preserve plans must keep source ordering.")
+        if output_spec.get("null_policy") != "preserve":
+            return _plan_error(request, "preserve plans must keep source null values.")
+        if output_spec.get("sort_keys"):
+            return _plan_error(request, "preserve plans cannot define sort keys.")
+
+    execution_spec = arguments.get("execution_spec") or {}
+    if execution_spec and not isinstance(execution_spec, Mapping):
+        return _plan_error(request, "execution_spec must be an object when provided.")
+    execution_sources = _source_paths_from_execution_spec(execution_spec)
+    if isinstance(execution_spec, Mapping):
+        unobserved_execution_sources = execution_sources - discovery.context_sources
+        if discovery.knowledge_present:
+            unobserved_execution_sources.discard("/context/knowledge.md")
+        if unobserved_execution_sources:
+            return _plan_error(
+                request,
+                (
+                    "execution_spec.sources must come from successful discovery "
+                    f"calls; unobserved sources: {sorted(unobserved_execution_sources)}."
+                ),
+            )
+
+    def user_authorization_error(operation: str, quote: str) -> str | None:
+        if not quote or quote not in original_request:
+            return "user authorization must cite an exact quote from original_request."
+        if not _user_quote_authorizes_operation(
+            operation=operation,
+            quote=quote,
+            arguments=arguments,
+            state=request.state,
+        ):
+            return (
+                "user authorization quote does not contain a generic signal for "
+                f"operation {operation!r}."
+            )
+        return None
+
+    def knowledge_authorization_error(quote: str) -> str | None:
+        if discovery.knowledge_available and (
+            not quote
+            or quote in knowledge_rule_quotes
+            or quote in discovery.knowledge_content
+        ):
+            return None
+        if quote and quote in knowledge_rule_quotes:
+            return None
+        return "knowledge authorization requires available knowledge context."
+
+    for item in transformations:
+        operation = str(item.get("operation") or "").strip()
+        authorization = item.get("authorization") or {}
+        if not isinstance(authorization, Mapping):
+            continue
+        source = str(authorization.get("source") or "")
+        quote = str(authorization.get("quote") or "").strip()
+        if source == "user":
+            if error_message := user_authorization_error(operation, quote):
+                return _plan_error(request, error_message)
+        elif source == "knowledge":
+            if error_message := knowledge_authorization_error(quote):
+                return _plan_error(request, error_message)
+        elif source:
+            return _plan_error(
+                request,
+                "context evidence cannot authorize a transformation.",
+            )
+
+    if isinstance(execution_spec, Mapping):
+        for index, operation_item in enumerate(execution_spec.get("operations") or []):
+            if not isinstance(operation_item, Mapping):
+                return _plan_error(
+                    request,
+                    f"execution_spec.operations[{index}] must be an object.",
+                )
+            operation = str(operation_item.get("operation") or "").strip()
+            if not operation:
+                return _plan_error(
+                    request,
+                    f"execution_spec.operations[{index}].operation is required.",
+                )
+            if operation == "join":
+                left_source = str(operation_item.get("left_source") or "").replace(
+                    "\\", "/"
+                )
+                right_source = str(operation_item.get("right_source") or "").replace(
+                    "\\", "/"
+                )
+                left_key = str(operation_item.get("left_key") or "").strip()
+                right_key = str(operation_item.get("right_key") or "").strip()
+                if not (left_source and right_source and left_key and right_key):
+                    return _plan_error(
+                        request,
+                        (
+                            "join operations require left_source, right_source, "
+                            "left_key, and right_key."
+                        ),
+                    )
+                undeclared_join_sources = {
+                    source
+                    for source in {left_source, right_source}
+                    if source not in execution_sources
+                }
+                if undeclared_join_sources:
+                    return _plan_error(
+                        request,
+                        (
+                            "join sources must be declared in execution_spec.sources: "
+                            f"{sorted(undeclared_join_sources)}."
+                        ),
+                    )
+                continue
+            authorization = operation_item.get("authorization")
+            if not isinstance(authorization, Mapping):
+                continue
+            source = str(authorization.get("source") or "")
+            quote = str(authorization.get("quote") or "").strip()
+            if source == "user":
+                if error_message := user_authorization_error(operation, quote):
+                    return _plan_error(request, error_message)
+            elif source == "knowledge":
+                if error_message := knowledge_authorization_error(quote):
+                    return _plan_error(request, error_message)
+            elif source:
+                return _plan_error(
+                    request,
+                    "context evidence cannot authorize an execution operation.",
+                )
+
+    revision = arguments.get("revision") or {}
+    if not isinstance(revision, Mapping):
+        return _plan_error(request, "revision must be a JSON object.")
+    version = revision.get("version")
+    if not isinstance(version, int) or version < 1:
+        return _plan_error(request, "revision.version must be a positive integer.")
+    previous_plan = request.state.get("analysis_plan")
+    if previous_plan is None and version != 1:
+        return _plan_error(request, "the initial plan must use revision version 1.")
+    if isinstance(previous_plan, Mapping):
+        previous_version = (previous_plan.get("revision") or {}).get("version")
+        if isinstance(previous_version, int) and version <= previous_version:
+            return _plan_error(
+                request,
+                "a revised plan must increment revision.version.",
+            )
+    return None
+
+
 def _validate_plan_contract(
     request: ToolCallRequest,
     discovery: _DiscoveryState,
 ) -> ToolMessage | None:
     """Validate plans using explicit quotes and observed state only."""
+
+    return _validate_lightweight_plan_contract(request, discovery)
 
     arguments = request.tool_call.get("args") or {}
     if not isinstance(arguments, Mapping):
@@ -5778,6 +7516,7 @@ def _validate_plan_contract(
     knowledge_rules = evidence.get("knowledge_rules") or []
     knowledge_rule_quotes: set[str] = set()
     cited_field_definition_facts: list[Any] = []
+    cited_unscoped_field_facts: list[Any] = []
     for rule in knowledge_rules:
         if not isinstance(rule, dict):
             continue
@@ -5809,6 +7548,8 @@ def _validate_plan_contract(
                 source_path = fact.source_path
                 if _knowledge_fact_defines_field(fact):
                     cited_field_definition_facts.append(fact)
+                elif _knowledge_fact_has_field_key(fact):
+                    cited_unscoped_field_facts.append(fact)
         elif quote:
             cited_field_definition_facts.extend(
                 field_definition_facts_by_quote.get(quote)
@@ -5830,6 +7571,23 @@ def _validate_plan_contract(
                 ),
             )
         knowledge_rule_quotes.add(quote)
+
+    for fact in cited_unscoped_field_facts:
+        if not _knowledge_fact_matches_binding_target(
+            fact,
+            request.state,
+            value_only=False,
+        ):
+            continue
+        for scoped_fact in _equivalent_scoped_field_facts(
+            fact,
+            field_definition_facts,
+        ):
+            if all(
+                str(existing.fact_id) != str(scoped_fact.fact_id)
+                for existing in cited_field_definition_facts
+            ):
+                cited_field_definition_facts.append(scoped_fact)
 
     output_spec = arguments.get("output_spec") or {}
     if not isinstance(output_spec, Mapping):
@@ -5923,48 +7681,46 @@ def _validate_plan_contract(
                 ),
             )
     if knowledge_status == "authoritative":
-        plan_sources_for_hints = requested_sources | execution_sources
-        missing_by_group = _missing_relevant_source_hint_groups(
-            knowledge_facts=knowledge_facts,
-            state=request.state,
-            plan_sources=plan_sources_for_hints,
-        )
-        if missing_by_group:
-            return _plan_error(
-                request,
-                (
-                    "unresolved source/field binding: request-relevant "
-                    "knowledge facts provide exact source hints that the "
-                    "plan sources do not satisfy; collect direct evidence "
-                    "from the hinted sources before using alternative "
-                    f"sources: {missing_by_group[:3]}."
-                ),
-            )
         output_source_fields = {
-            _normalized_field_alias(field)
+            alias
             for column in output_columns
             if isinstance(column, Mapping)
             for field in column.get("source_fields") or []
             if str(field or "").strip()
+            for alias in _normalized_plan_field_aliases(field)
         }
         binding_source_fields = {
-            _normalized_field_alias(binding.get("source_field"))
+            alias
             for binding in execution_spec.get("source_bindings") or []
             if isinstance(binding, Mapping)
             and str(binding.get("source_field") or "").strip()
+            for alias in _normalized_plan_field_aliases(binding.get("source_field"))
         }
         supporting_source_fields = {
-            _normalized_field_alias(field)
+            alias
             for item in execution_spec.get("supporting_fields") or []
             if isinstance(item, Mapping)
             for field in item.get("source_fields") or []
             if str(field or "").strip()
+            for alias in _normalized_plan_field_aliases(field)
         }
+        sort_key_fields = {
+            alias
+            for item in output_spec.get("sort_keys") or []
+            if isinstance(item, Mapping)
+            and str(item.get("field") or "").strip()
+            for alias in _normalized_plan_field_aliases(item.get("field"))
+        }
+        plan_sources = requested_sources | execution_sources
         cited_fact_ids = {str(fact.fact_id) for fact in cited_field_definition_facts}
         explicit_cited_target_facts = [
             fact
             for fact in cited_field_definition_facts
-            if len(cited_field_definition_facts) == 1
+            if _knowledge_fact_matches_binding_target(
+                fact,
+                request.state,
+                value_only=False,
+            )
             or _normalized_field_alias(fact.field_key) in output_source_fields
             or _normalized_field_alias(fact.field_key) in binding_source_fields
         ]
@@ -5975,11 +7731,88 @@ def _validate_plan_contract(
                 continue
             request_target_field_facts.append(fact)
             seen_request_target_fact_ids.add(str(fact.fact_id))
+        plan_observed_sources = _observed_sources_for_paths(
+            request.state,
+            plan_sources,
+        )
+
+        def fact_bound_by_observed_plan_source(fact: Any) -> bool:
+            fact_aliases = _knowledge_fact_field_aliases(fact)
+            if not fact_aliases:
+                return False
+            if not (
+                fact_aliases
+                & (
+                    output_source_fields
+                    | binding_source_fields
+                    | supporting_source_fields
+                    | sort_key_fields
+                )
+            ):
+                return False
+            return any(
+                _field_aliases_from_observed_source(source) & fact_aliases
+                for source in plan_observed_sources
+                if _observed_source_is_structured(source)
+            )
+
+        misbound_target_source_hints: set[str] = set()
+        missing_structured_target_bindings: set[str] = set()
+        for fact in request_target_field_facts:
+            section_key = str(fact.section_key or "").strip()
+            if not section_key or not plan_sources:
+                continue
+            if any(_source_path_matches_hint(path, section_key) for path in plan_sources):
+                continue
+            if fact_bound_by_observed_plan_source(fact):
+                continue
+            fact_aliases = _knowledge_fact_field_aliases(fact)
+            if any(
+                _field_aliases_from_observed_source(source) & fact_aliases
+                for source in plan_observed_sources
+            ):
+                continue
+            if (
+                _knowledge_fact_matches_binding_target(
+                    fact,
+                    request.state,
+                    value_only=True,
+                )
+                and fact_aliases & (output_source_fields | binding_source_fields)
+                and any(_observed_source_is_structured(source) for source in plan_observed_sources)
+            ):
+                missing_structured_target_bindings.add(
+                    f"{fact.section_key}.{fact.field_key}"
+                )
+        if misbound_target_source_hints:
+            return _plan_error(
+                request,
+                (
+                    "request-target knowledge field facts must be bound to "
+                    "execution or evidence sources that match their exact source "
+                    "hints; field-name matches in unrelated sources are only "
+                    "observations, not target bindings. Run physical binding "
+                    "discovery for the cited source hint before planning: "
+                    f"{sorted(misbound_target_source_hints)}."
+                ),
+            )
+        if missing_structured_target_bindings:
+            return _plan_error(
+                request,
+                (
+                    "request-target knowledge field facts require physical "
+                    "binding discovery before planning; structured plan sources "
+                    "must provide observed field evidence for the cited target "
+                    "field or use the exact source hint: "
+                    f"{sorted(missing_structured_target_bindings)}."
+                ),
+            )
         undiscovered_target_fields = sorted(
             {
                 f"{fact.section_key}.{fact.field_key}"
                 for fact in request_target_field_facts
                 if fact.section_key
+                and not fact_bound_by_observed_plan_source(fact)
                 and _fact_has_time_terms(fact)
                 if not observed_sources_by_source_hint.get(
                     _normalized_quote_text(fact.section_key or ""),
@@ -5997,6 +7830,25 @@ def _validate_plan_contract(
                     f"{undiscovered_target_fields}."
                 ),
             )
+        observed_matching_target_field_facts: list[Any] = []
+        seen_observed_matching_fact_ids: set[str] = set()
+        for fact in field_definition_facts:
+            if not _knowledge_fact_matches_binding_target(
+                fact,
+                request.state,
+                value_only=True,
+            ):
+                continue
+            if not observed_sources_by_source_hint.get(
+                _normalized_quote_text(fact.section_key or ""),
+                [],
+            ):
+                continue
+            fact_id = str(fact.fact_id)
+            if fact_id in seen_observed_matching_fact_ids:
+                continue
+            observed_matching_target_field_facts.append(fact)
+            seen_observed_matching_fact_ids.add(fact_id)
         observed_target_field_facts = [
             fact
             for fact in request_target_field_facts
@@ -6008,11 +7860,22 @@ def _validate_plan_contract(
         uncited_target_fields = sorted(
             {
                 f"{fact.section_key}.{fact.field_key}"
-                for fact in observed_target_field_facts
-                if str(fact.fact_id) not in cited_fact_ids
-                and _field_fact_has_observed_physical_field(
-                    fact=fact,
-                    state=request.state,
+                for fact in observed_matching_target_field_facts
+                if (
+                    str(fact.fact_id) not in cited_fact_ids
+                    and not fact_bound_by_observed_plan_source(fact)
+                    and (
+                        _field_fact_has_observed_physical_field(
+                            fact=fact,
+                            state=request.state,
+                        )
+                        or bool(
+                            narrative_sources.get(
+                                _normalized_quote_text(fact.section_key or ""),
+                                [],
+                            )
+                        )
+                    )
                 )
             }
         )
@@ -6030,6 +7893,41 @@ def _validate_plan_contract(
             for fact in observed_target_field_facts
             if str(fact.fact_id) in cited_fact_ids
         ]
+        value_target_field_facts = [
+            fact
+            for fact in target_field_facts
+            if _knowledge_fact_matches_binding_target(
+                fact,
+                request.state,
+                value_only=True,
+            )
+        ]
+        missing_value_output_bindings = sorted(
+            {
+                f"{fact.section_key}.{fact.field_key}"
+                for fact in value_target_field_facts
+                if not (
+                    _knowledge_fact_field_aliases(fact)
+                    & (output_source_fields | binding_source_fields)
+                )
+                and not (
+                    _knowledge_fact_field_aliases(fact)
+                    & supporting_source_fields
+                    & sort_key_fields
+                )
+            }
+        )
+        if missing_value_output_bindings:
+            return _plan_error(
+                request,
+                (
+                    "request-target value field facts cited by knowledge_rules "
+                    "must be bound to final output source_fields or explicit "
+                    "execution_spec.source_bindings; do not cite one field fact "
+                    "and output a semantic-neighbor field: "
+                    f"{missing_value_output_bindings}."
+                ),
+            )
         physical_target_field_facts = [
             fact
             for fact in target_field_facts
@@ -6073,7 +7971,6 @@ def _validate_plan_contract(
                     f"fields: {missing_physical_field_keys}."
                 ),
             )
-        plan_sources = requested_sources | execution_sources
         missing_source_bindings = sorted(
             {
                 f"{fact.section_key}.{fact.field_key}"
@@ -6082,10 +7979,7 @@ def _validate_plan_contract(
                     _normalized_quote_text(fact.section_key or ""),
                     [],
                 )
-                and not _field_fact_has_observed_narrative_extraction(
-                    fact=fact,
-                    state=request.state,
-                )
+                if not fact_bound_by_observed_plan_source(fact)
                 if not (
                     set(
                         narrative_sources.get(
@@ -6102,7 +7996,7 @@ def _validate_plan_contract(
                 request,
                 (
                     "request-target knowledge field facts must be bound to their "
-                    "observed narrative source in evidence.context_sources or "
+                    "observed narrative or extraction source in evidence.context_sources or "
                     f"execution_spec.sources: {missing_source_bindings}."
                 ),
             )
@@ -6248,8 +8142,8 @@ def _validate_plan_contract(
             state=request.state,
         ):
             return (
-                "user authorization quote is not authorized for this operation "
-                "by the question-structure contract."
+                "user authorization quote does not contain a generic signal for "
+                f"operation {operation!r}."
             )
         return None
 
@@ -6509,17 +8403,18 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
     state_schema = BenchmarkDeepAgentState
     tools = [analyze_plan_tool]
 
+    def __init__(self, workspace: Path | None = None) -> None:
+        super().__init__()
+        self.workspace = workspace
+
     def before_model(
         self,
         state: BenchmarkDeepAgentState,
         runtime: Any,
     ) -> dict[str, Any] | None:
         del runtime
-        discovery = _discovery_state(state.get("messages", []), state)
-        contract = _evidence_contract_payload(state, discovery)
-        if state.get("evidence_contract") == contract:
-            return None
-        return {"evidence_contract": contract}
+        del state
+        return None
 
     def wrap_model_call(
         self,
@@ -6530,25 +8425,11 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
         allowed_tools_for_response: set[str] | None = None
         forced_tool_for_response: str | None = None
         if request.state.get("analysis_plan") is None:
-            messages = request.state.get("messages")
-            if isinstance(messages, list) and _last_narrative_extraction_incomplete(
-                messages,
-            ):
-                allowed_tools = {"extract_narrative_records"}
-                tool_choice = "extract_narrative_records"
-            elif _answer_candidate_has_complete_columns(
+            if _answer_candidate_has_complete_columns(
                 request.state.get("answer_candidate"),
             ):
                 allowed_tools = {"analyze_plan"}
                 tool_choice = "analyze_plan"
-            elif _pre_plan_needs_narrative_extraction(
-                request.state,
-            ) or _pre_plan_observed_narrative_hint_needs_extraction(
-                request.state,
-                discovery,
-            ):
-                allowed_tools = {"extract_narrative_records"}
-                tool_choice = "extract_narrative_records"
             elif _pre_plan_execution_gate_active(
                 state=request.state,
                 discovery=discovery,
@@ -6584,17 +8465,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
             allowed_tools_for_response = {"write_todos"}
             forced_tool_for_response = "write_todos"
             request = request.override(tools=todo_tools, tool_choice="write_todos")
-        elif _plan_needs_initial_narrative_extraction(request.state):
-            allowed_tools_for_response = {"extract_narrative_records"}
-            forced_tool_for_response = "extract_narrative_records"
-            request = request.override(
-                tools=[
-                    item
-                    for item in request.tools
-                    if tool_name(item) == "extract_narrative_records"
-                ],
-                tool_choice="extract_narrative_records",
-            )
         request = _inject_decision_evidence_boundary(request, discovery)
         response = handler(request)
         if allowed_tools_for_response is not None:
@@ -6624,6 +8494,7 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
         current_tool_name = str(request.tool_call.get("name") or "")
         if current_tool_name in {"analyze_plan", "extract_narrative_records"}:
             request = _normalize_tool_call_arguments(request)
+        request = _recover_protocol_markup_arguments(request)
         if current_tool_name == "extract_narrative_records":
             request = _strip_extract_narrative_protocol_markup(request)
         if _tool_arguments_contain_protocol_markup(request.tool_call.get("args")):
@@ -6640,11 +8511,32 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
             if plan is None or current_tool_name == "analyze_plan"
             else None
         )
+        if current_tool_name == "query_schema" and plan is None and discovery is not None:
+            request = _canonicalize_query_schema_relevant_field(
+                request,
+                discovery,
+            )
         if current_tool_name == "extract_narrative_records":
             request = _canonicalize_extract_narrative_arguments(
                 request,
                 discovery or _discovery_state(request.state["messages"], request.state),
             )
+            messages = request.state.get("messages")
+            if isinstance(messages, list) and _recent_narrative_no_progress_for_request(
+                messages,
+                request.tool_call.get("args"),
+                threshold=3,
+            ):
+                return _tool_error(
+                    request,
+                    (
+                        "Repeated narrative extraction for the same source and "
+                        "fields has returned the same incomplete evidence. Use "
+                        "grep_file/read_doc to inspect a different slice, query "
+                        "other observed sources, or call analyze_plan with the "
+                        "current evidence instead of repeating this extraction."
+                    ),
+                )
 
         if plan is None and discovery is not None:
             if current_tool_name not in _SOURCE_DISCOVERY_TOOLS | {"analyze_plan"}:
@@ -6657,16 +8549,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                 and _pre_plan_execution_gate_active(
                     state=request.state,
                     discovery=discovery,
-                )
-                and not (
-                    current_tool_name == "extract_narrative_records"
-                    and (
-                        _pre_plan_needs_narrative_extraction(request.state)
-                        or _pre_plan_observed_narrative_hint_needs_extraction(
-                            request.state,
-                            discovery,
-                        )
-                    )
                 )
             ):
                 return _tool_error(
@@ -6685,35 +8567,18 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
                         "Complete discovery before analyze_plan: inspect the minimum "
                         "required independent data sources."
                     ),
-            )
+                )
             request = _canonicalize_plan_quotes(request, discovery)
             request = _canonicalize_empty_authoritative_knowledge(request, discovery)
             request = _canonicalize_missing_intent_requirements(request)
             request = _canonicalize_unsupported_operations(request)
             request = _canonicalize_authorized_plan_operations(request)
-            request = _canonicalize_distribution_output_columns(request)
             request = _canonicalize_direct_source_projection_plan(request)
-            request = _canonicalize_semantic_source_bindings(request, discovery)
-            request = _canonicalize_output_columns_from_valid_field_bindings(
-                request,
-                discovery,
-            )
-            request = _canonicalize_output_columns_from_section_field_facts(
-                request,
-                discovery,
-            )
-            request = _canonicalize_single_preserve_output_from_field_fact(
-                request,
-                discovery,
-            )
             request = _canonicalize_duplicate_output_columns(request)
             request = _canonicalize_unrequested_measure_output_columns(request)
+            request = _canonicalize_unrequested_count_output_columns(request)
             request = _canonicalize_selector_output_columns(request)
             request = _canonicalize_unrequested_key_output_columns(request)
-            request = _canonicalize_unrequested_knowledge_output_columns(
-                request,
-                discovery,
-            )
             request = _canonicalize_preserve_expected_row_count(request)
             request = _canonicalize_transform_output_policy(request)
             request = _canonicalize_preserve_output_policy(request)
@@ -6721,10 +8586,6 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
             request = _canonicalize_sort_null_policy(request)
             request = _canonicalize_plan_steps(request)
             request = _canonicalize_execution_supporting_fields(request)
-            request = _canonicalize_unsatisfied_authoritative_source_hints(
-                request,
-                discovery,
-            )
             request = _canonicalize_revision(request)
             request = _canonicalize_non_authoritative_knowledge(request)
             contract_error = _validate_plan_contract(request, discovery)
@@ -6750,7 +8611,11 @@ class PlanningMiddleware(AgentMiddleware[BenchmarkDeepAgentState, None, Any]):
             )
         result = handler(request)
         if current_tool_name == "analyze_plan":
-            return _promote_answer_candidate_after_plan(request, result)
+            return _promote_answer_candidate_after_plan(
+                request,
+                result,
+                workspace=self.workspace,
+            )
         return result
 
 

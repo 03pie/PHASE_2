@@ -146,6 +146,63 @@ def _split_markdown_row(line: str) -> list[str] | None:
     return [cell.strip().strip("`").strip() for cell in cells]
 
 
+def _is_markdown_separator_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("|") or not stripped.endswith("|"):
+        return False
+    cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+    return bool(cells) and all(
+        re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells
+    )
+
+
+def _header_role_index(header_cells: list[str], role: str) -> int | None:
+    labels = {
+        "section": {
+            "table",
+            "tables",
+            "tablename",
+            "source",
+            "sourcename",
+            "sourcetable",
+            "sourcetables",
+            "sourcehint",
+            "sourcepath",
+            "targettable",
+            "targettables",
+            "path",
+            "file",
+            "filename",
+            "表",
+            "表名",
+            "来源",
+            "数据源",
+            "源",
+            "文件",
+            "文件名",
+            "路径",
+        },
+        "field": {
+            "column",
+            "columnname",
+            "field",
+            "fieldname",
+            "sourcefield",
+            "列",
+            "列名",
+            "字段",
+            "字段名",
+        },
+    }[role]
+    for index, header in enumerate(header_cells):
+        normalized = _normalize_name(header)
+        if not normalized or normalized.startswith("logical"):
+            continue
+        if normalized in labels:
+            return index
+    return None
+
+
 def _infer_heading_table(line: str) -> str | None:
     stripped = line.strip().lstrip("#").strip()
     backticked = re.findall(r"`([^`]+)`", stripped)
@@ -303,7 +360,8 @@ def parse_knowledge_content(
             operation=_operation_from_sql(sql),
         )
 
-    for raw_line in content.splitlines():
+    lines = content.splitlines()
+    for index, raw_line in enumerate(lines):
         line = raw_line.rstrip()
         stripped = line.strip()
         if stripped.startswith("```"):
@@ -332,6 +390,9 @@ def parse_knowledge_content(
                 if ";" in stripped:
                     flush_plain_sql()
                 continue
+        if not stripped:
+            markdown_header = None
+            continue
         if re.match(r"^(?:SELECT|WITH)\b", stripped, flags=re.IGNORECASE):
             plain_sql_lines.append(line)
             if ";" in stripped:
@@ -339,41 +400,42 @@ def parse_knowledge_content(
             continue
         if stripped.startswith("#"):
             current_section = _infer_heading_table(stripped)
+            markdown_header = None
+            continue
+        if _is_markdown_separator_line(stripped):
             continue
 
         row = _split_markdown_row(stripped)
         if row is not None and len(row) >= 2:
-            headerish = {cell.casefold() for cell in row}
-            if {"column", "field", "字段"} & headerish or any(
-                cell.casefold() in {"table", "表名", "单位", "unit"}
-                for cell in row
-            ):
+            next_line = lines[index + 1].strip() if index + 1 < len(lines) else ""
+            if _is_markdown_separator_line(next_line):
                 markdown_header = row
                 continue
 
             section_key = current_section
-            field_key = row[0].strip()
+            field_key: str | None = None
+            physical_field_header = False
             if markdown_header:
-                header_cells = [cell.casefold() for cell in markdown_header]
-
-                def find_header(*needles: str) -> int | None:
-                    for index, header in enumerate(header_cells):
-                        if any(needle in header for needle in needles):
-                            return index
-                    return None
-
-                table_index = find_header("表名", "table")
-                field_index = find_header("字段", "column", "field")
+                table_index = _header_role_index(markdown_header, "section")
+                field_index = _header_role_index(markdown_header, "field")
                 if table_index is not None and table_index < len(row):
                     section_key = row[table_index].strip() or section_key
                 if field_index is not None and field_index < len(row):
                     field_key = row[field_index].strip()
-            if field_key:
+                    physical_field_header = True
+            if field_key and physical_field_header:
                 append_fact(
                     "field",
                     stripped,
                     section_key=section_key,
                     field_key=field_key,
+                )
+            else:
+                append_fact(
+                    "fact",
+                    stripped,
+                    section_key=section_key,
+                    operation=_operation_from_sql(stripped),
                 )
             continue
 
@@ -568,6 +630,35 @@ def _matches_query(binding: PhysicalBinding, query_norm: str) -> bool:
     return False
 
 
+def _matched_fields_for_query(binding: PhysicalBinding, query_norm: str) -> list[str]:
+    if not query_norm:
+        return []
+    matches: list[str] = []
+    for field in binding.fields:
+        normalized = _normalize_name(field)
+        if not normalized:
+            continue
+        if query_norm in normalized or (len(normalized) >= 5 and normalized in query_norm):
+            matches.append(field)
+    return matches
+
+
+def _source_name_matches_query(binding: PhysicalBinding, query_norm: str) -> bool:
+    if not query_norm:
+        return False
+    for name in (
+        binding.source_name_hint,
+        Path(binding.table_or_path).stem,
+        binding.table_or_path,
+    ):
+        normalized = _normalize_name(name)
+        if not normalized:
+            continue
+        if query_norm in normalized or (len(normalized) >= 5 and normalized in query_norm):
+            return True
+    return False
+
+
 def _binding_score(binding: PhysicalBinding, query_norm: str) -> tuple[int, int, str]:
     source_hint_norm = _normalize_name(binding.source_name_hint)
     field_norms = [_normalize_name(item) for item in binding.fields]
@@ -648,11 +739,30 @@ def _binding_payload(
     binding: PhysicalBinding,
     context_root: Path,
     terms: Iterable[str],
+    *,
+    query_norm: str | None = None,
+    match_reasons: Iterable[str] = (),
 ) -> dict[str, Any]:
     payload = asdict(binding)
     evidence = _line_evidence(binding, context_root, terms)
     if evidence:
         payload["line_evidence"] = evidence
+    if query_norm is not None:
+        reasons = sorted({str(item) for item in match_reasons if str(item)})
+        matched_fields = _matched_fields_for_query(binding, query_norm)
+        source_name_match = _source_name_matches_query(binding, query_norm)
+        if matched_fields:
+            query_match_type = "field"
+        elif source_name_match:
+            query_match_type = "source"
+        elif "knowledge_related" in reasons:
+            query_match_type = "knowledge_related"
+        else:
+            query_match_type = "unknown"
+        payload["query_match_type"] = query_match_type
+        payload["field_match"] = bool(matched_fields)
+        payload["matched_fields"] = matched_fields
+        payload["match_reasons"] = reasons
     return payload
 
 
@@ -673,20 +783,27 @@ def query_semantic_context(
     )
     scope_norms = [_normalize_name(item) for item in scope_values if _normalize_name(item)]
     candidate_terms: dict[tuple[str, str], list[str]] = {}
+    candidate_reasons: dict[tuple[str, str], set[str]] = {}
 
-    def add_candidate_terms(binding: PhysicalBinding, terms: Iterable[str]) -> None:
+    def add_candidate_terms(
+        binding: PhysicalBinding,
+        terms: Iterable[str],
+        *,
+        reason: str,
+    ) -> None:
         key = (binding.source_path, binding.table_or_path)
         current = candidate_terms.setdefault(key, [query])
         for term in terms:
             if term and term not in current:
                 current.append(term)
+        candidate_reasons.setdefault(key, set()).add(reason)
 
     candidates = []
     for binding in semantic.bindings:
         if not _matches_query(binding, query_norm):
             continue
         candidates.append(binding)
-        add_candidate_terms(binding, [query])
+        add_candidate_terms(binding, [query], reason="direct_query")
     candidate_keys = {
         (binding.source_path, binding.table_or_path)
         for binding in candidates
@@ -728,7 +845,11 @@ def query_semantic_context(
             if _normalize_name(binding.source_name_hint) != fact_section:
                 continue
             key = (binding.source_path, binding.table_or_path)
-            add_candidate_terms(binding, _knowledge_fact_terms(fact))
+            add_candidate_terms(
+                binding,
+                _knowledge_fact_terms(fact),
+                reason="knowledge_related",
+            )
             if key not in candidate_keys:
                 candidates.append(binding)
                 candidate_keys.add(key)
@@ -796,6 +917,11 @@ def query_semantic_context(
                 binding,
                 context_root,
                 candidate_terms.get((binding.source_path, binding.table_or_path), [query]),
+                query_norm=query_norm,
+                match_reasons=candidate_reasons.get(
+                    (binding.source_path, binding.table_or_path),
+                    set(),
+                ),
             )
             for binding in candidates
         ],

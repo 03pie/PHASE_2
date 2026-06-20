@@ -134,7 +134,6 @@ class BenchmarkDeepAgentState(DeepAgentState):
     prepared_answer: NotRequired[AnswerTable | None]
     answer_candidate: NotRequired[dict[str, Any]]
     analysis_plan: NotRequired[dict[str, Any]]
-    evidence_contract: NotRequired[dict[str, Any]]
     observed_sources: NotRequired[
         Annotated[list[dict[str, Any]], merge_observed_sources_state]
     ]

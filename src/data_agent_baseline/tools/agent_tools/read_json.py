@@ -25,7 +25,11 @@ from data_agent_baseline.tools.observed_sources import (
 _DEFAULT_COLLECTION_KEYS = ("records", "items", "rows", "data", "values")
 _SCHEMA_SAMPLE_LIMIT = 200
 _EXAMPLE_VALUE_LIMIT = 3
+_EXAMPLE_STRING_LIMIT = 80
 _MAX_JSON_ITEMS_PER_READ = 200
+_MESSAGE_BUDGET_RATIO = 0.85
+_COMPACT_ITEM_FIELD_LIMIT = 24
+_COMPACT_STRING_LIMIT = 160
 
 
 def _read_strategy_payload(
@@ -96,6 +100,16 @@ def _type_name(value: Any) -> str:
     return type(value).__name__
 
 
+def _example_value(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > _EXAMPLE_STRING_LIMIT:
+        return {
+            "type": "str",
+            "length": len(value),
+            "preview": value[:_EXAMPLE_STRING_LIMIT],
+        }
+    return value
+
+
 def _json_summary(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         keys = [str(key) for key in value.keys()]
@@ -103,6 +117,114 @@ def _json_summary(value: Any) -> dict[str, Any]:
     if isinstance(value, list):
         return {"type": "list", "length": len(value)}
     return {"type": _type_name(value), "value": value}
+
+
+def _serialized_json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _compact_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        if len(value) <= _COMPACT_STRING_LIMIT:
+            return value
+        return {
+            "type": "str",
+            "length": len(value),
+            "preview": value[:_COMPACT_STRING_LIMIT],
+        }
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        compacted = {
+            str(key): _compact_json_value(item)
+            for key, item in items[:_COMPACT_ITEM_FIELD_LIMIT]
+        }
+        if len(items) > _COMPACT_ITEM_FIELD_LIMIT:
+            compacted["__omitted_fields__"] = len(items) - _COMPACT_ITEM_FIELD_LIMIT
+        return compacted
+    if isinstance(value, list):
+        sample = [_compact_json_value(item) for item in value[:5]]
+        payload: dict[str, Any] = {
+            "type": "list",
+            "length": len(value),
+            "sample": sample,
+        }
+        if len(value) > len(sample):
+            payload["omitted_items"] = len(value) - len(sample)
+        return payload
+    return str(value)
+
+
+def _shrink_schema_examples(payload: dict[str, Any], *, keep: int) -> None:
+    schema = payload.get("schema")
+    if not isinstance(schema, dict):
+        return
+    fields = schema.get("fields")
+    if not isinstance(fields, dict):
+        return
+    for field_payload in fields.values():
+        if not isinstance(field_payload, dict):
+            continue
+        examples = field_payload.get("examples")
+        if isinstance(examples, list):
+            field_payload["examples"] = examples[:keep]
+
+
+def _fit_collection_payload_to_budget(
+    payload: dict[str, Any],
+    *,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return payload
+    budget = max(1_000, int(max_output_bytes * _MESSAGE_BUDGET_RATIO))
+    if _serialized_json_size(payload) <= budget:
+        return payload
+
+    updated = dict(payload)
+    original_returned_items = len(items)
+    compacted_items = [_compact_json_value(item) for item in items]
+    updated["items"] = compacted_items
+    updated["item_payload_truncated"] = True
+
+    if _serialized_json_size(updated) > budget:
+        _shrink_schema_examples(updated, keep=1)
+    if _serialized_json_size(updated) > budget:
+        _shrink_schema_examples(updated, keep=0)
+
+    while (
+        len(updated["items"]) > 1
+        and _serialized_json_size(updated) > budget
+    ):
+        keep = max(1, len(updated["items"]) // 2)
+        updated["items"] = updated["items"][:keep]
+
+    if _serialized_json_size(updated) > budget:
+        updated["items"] = []
+        updated["item_payload_omitted"] = original_returned_items
+
+    returned_items = len(updated["items"])
+    if returned_items != original_returned_items:
+        start_item = int(updated.get("start_item") or 0)
+        total_items = int(updated.get("total_items") or 0)
+        next_start_item = (
+            start_item + returned_items
+            if start_item + returned_items < total_items
+            else None
+        )
+        updated["returned_items"] = returned_items
+        updated["next_start_item"] = next_start_item
+        updated["has_more"] = next_start_item is not None
+        updated["truncated"] = True
+        page_window = updated.get("page_window")
+        if isinstance(page_window, dict):
+            updated["page_window"] = {
+                **page_window,
+                "returned_items": returned_items,
+            }
+    return updated
 
 
 def _parent_metadata(value: Any, collection_key: str | None) -> dict[str, Any]:
@@ -162,10 +284,10 @@ def _field_schema(items: Sequence[Any]) -> dict[str, Any]:
                     field["null_count"] += 1
                 elif (
                     len(field["examples"]) < _EXAMPLE_VALUE_LIMIT
-                    and value not in field["examples"]
+                    and _example_value(value) not in field["examples"]
                     and not isinstance(value, Mapping | list)
                 ):
-                    field["examples"].append(value)
+                    field["examples"].append(_example_value(value))
         return {
             "sample_size": len(sample),
             "fields": {
@@ -317,6 +439,12 @@ def create_read_json_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                         ),
                     }
                 )
+            payload = _fit_collection_payload_to_budget(
+                payload,
+                max_output_bytes=config.max_output_bytes,
+            )
+            if isinstance(payload.get("items"), list):
+                sample_value = payload["items"]
             message = success(
                 name="read_json",
                 tool_call_id=tool_call_id,

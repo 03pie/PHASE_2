@@ -5,7 +5,6 @@ import json
 import multiprocessing
 import os
 import subprocess
-import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -349,39 +348,36 @@ def _run_single_task_with_timeout(
     send_connection.close()
     result: dict[str, Any] | None = None
     timed_out = False
-
-    def expire() -> None:
-        nonlocal timed_out
-        timed_out = True
-        try:
-            receive_connection.close()
-        except OSError:
-            pass
-        _wait_for_prepared_answer_trace(
-            trace_path,
-            timeout_seconds=_TIMEOUT_TRACE_GRACE_SECONDS,
-        )
-        if process.is_alive():
-            _terminate_process_tree(process)
-
-    timer = threading.Timer(timeout_seconds, expire)
-    timer.daemon = True
-    timer.start()
+    deadline = perf_counter() + timeout_seconds
 
     try:
-        received = receive_connection.recv()
-        if isinstance(received, dict):
-            result = received
+        while True:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if receive_connection.poll(min(remaining, 0.25)):
+                received = receive_connection.recv()
+                if isinstance(received, dict):
+                    result = received
+                break
+            if process.exitcode is not None and not process.is_alive():
+                break
     except (BrokenPipeError, EOFError, OSError):
         result = None
     finally:
-        timer.cancel()
         try:
             receive_connection.close()
         except OSError:
             pass
 
     if timed_out and result is None:
+        _wait_for_prepared_answer_trace(
+            trace_path,
+            timeout_seconds=_TIMEOUT_TRACE_GRACE_SECONDS,
+        )
+        if process.is_alive():
+            _terminate_process_tree(process)
         _wait_for_prepared_answer_trace(
             trace_path,
             timeout_seconds=_TIMEOUT_TRACE_GRACE_SECONDS,

@@ -24,6 +24,8 @@ from data_agent_baseline.tools.observed_sources import (
     sample_hash,
 )
 
+_MAX_CONTENT_MATCHES_PER_PAGE = 50
+
 
 def _source_type_for_path(path: str) -> str:
     suffix = Path(path).suffix.lower()
@@ -229,7 +231,12 @@ def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                 ),
             }
         else:
-            limited, applied_limit = apply_head_limit(raw_matches, max_matches, offset)
+            effective_max_matches = min(max_matches, _MAX_CONTENT_MATCHES_PER_PAGE)
+            limited, applied_limit = apply_head_limit(
+                raw_matches,
+                effective_max_matches,
+                offset,
+            )
             total_matches = sum(
                 1 for match in raw_matches if not match.get("is_separator")
             )
@@ -253,6 +260,10 @@ def create_grep_file_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
                     paging_unit="matched_lines",
                 ),
             }
+            if max_matches > effective_max_matches:
+                payload["requested_max_matches"] = max_matches
+                payload["max_matches"] = effective_max_matches
+                payload["match_page_capped"] = True
         read_doc_slices = _read_doc_slices_for_matches(
             raw_matches,
             context_lines=context_lines,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Annotated, Any
@@ -77,6 +78,10 @@ def _semantic_observed_sources(
                     "source_name_hint": candidate.get("source_name_hint"),
                     "semantic_query": field_text,
                     "semantic_confidence": candidate.get("confidence"),
+                    "query_match_type": candidate.get("query_match_type"),
+                    "field_match": bool(candidate.get("field_match")),
+                    "matched_fields": candidate.get("matched_fields") or [],
+                    "match_reasons": candidate.get("match_reasons") or [],
                     "evidence_type": (
                         "line" if matched_lines else "source_candidate"
                     ),
@@ -94,6 +99,17 @@ def _semantic_observed_sources(
                 if source_type == "sqlite" and table_or_path
                 else path
             )
+            query_match_type = str(candidate.get("query_match_type") or "")
+            field_match = bool(candidate.get("field_match"))
+            evidence_type = (
+                "schema_field"
+                if field_match
+                else (
+                    "knowledge_related_source"
+                    if query_match_type == "knowledge_related"
+                    else "schema_source"
+                )
+            )
             sources.append(
                 {
                     "path": observed_path,
@@ -105,17 +121,124 @@ def _semantic_observed_sources(
                     "source_name_hint": candidate.get("source_name_hint"),
                     "semantic_query": field_text,
                     "semantic_confidence": candidate.get("confidence"),
+                    "query_match_type": query_match_type or None,
+                    "field_match": field_match,
+                    "matched_fields": candidate.get("matched_fields") or [],
+                    "match_reasons": candidate.get("match_reasons") or [],
+                    "evidence_type": evidence_type,
                     "fields": list(fields)[:80],
                     "sample_hash": sample_hash(
                         {
                             "path": observed_path,
                             "fields": list(fields)[:80],
                             "confidence": candidate.get("confidence"),
+                            "query_match_type": query_match_type,
+                            "matched_fields": candidate.get("matched_fields") or [],
                         }
                     ),
                     "observed_by": "query_schema",
                 }
             )
+    return sources
+
+
+def _schema_match_key(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(item.get("source_type") or ""),
+        str(item.get("path") or "").replace("\\", "/"),
+        str(item.get("table") or ""),
+        str(item.get("field") or item.get("column") or ""),
+    )
+
+
+def _merge_schema_matches(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            key = _schema_match_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def _knowledge_field_queries(
+    semantic_matches: dict[str, Any],
+    *,
+    original_field: str,
+) -> list[str]:
+    normalized_original = original_field.casefold()
+    queries: list[str] = []
+    for fact in semantic_matches.get("knowledge_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        field_key = str(fact.get("field_key") or "").strip()
+        if not field_key:
+            continue
+        if field_key.casefold() == normalized_original:
+            continue
+        if field_key not in queries:
+            queries.append(field_key)
+    return queries[:8]
+
+
+def _is_simple_schema_query(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"`?[A-Za-z_][A-Za-z0-9_.]*`?",
+            value.strip(),
+        )
+    )
+
+
+def _schema_observed_sources(
+    matches: list[dict[str, Any]],
+    *,
+    field_text: str,
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in matches:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").replace("\\", "/")
+        source_type = str(item.get("source_type") or "")
+        field = str(item.get("field") or item.get("column") or "").strip()
+        if not path or not source_type:
+            continue
+        table = str(item.get("table") or "").strip()
+        observed_path = (
+            f"{path}::{table}"
+            if source_type == "sqlite" and table
+            else path
+        )
+        key = (observed_path, source_type, field)
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(
+            {
+                "path": observed_path,
+                "source_type": (
+                    "sqlite_table" if source_type == "sqlite" else source_type
+                ),
+                "base_path": path if source_type == "sqlite" else None,
+                "table": table if source_type == "sqlite" else None,
+                "semantic_query": field_text,
+                "query_match_type": "schema_field",
+                "field_match": True,
+                "matched_fields": [field] if field else [],
+                "match_reasons": ["schema_match"],
+                "evidence_type": "schema_field",
+                "fields": [field] if field else [],
+                "sample_hash": sample_hash(item),
+                "observed_by": "query_schema",
+            }
+        )
     return sources
 
 
@@ -266,11 +389,6 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
                 max_output_bytes=config.max_output_bytes,
             )
 
-        matches = query_context_schema(
-            context_root,
-            field_text,
-            max_matches=max_matches,
-        )
         scope_terms = [scope.strip()] if isinstance(scope, str) and scope.strip() else []
         if not scope_terms:
             scope_terms = _state_scope_terms(state)
@@ -280,6 +398,29 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
             max_matches=max_matches,
             scope=scope_terms,
         )
+        direct_matches = query_context_schema(
+            context_root,
+            field_text,
+            max_matches=max_matches,
+        )
+        expanded_field_queries = (
+            []
+            if _is_simple_schema_query(field_text)
+            else _knowledge_field_queries(
+                semantic_matches,
+                original_field=field_text,
+            )
+        )
+        expanded_matches: list[dict[str, Any]] = []
+        per_query_limit = max(1, max_matches // max(1, len(expanded_field_queries) or 1))
+        for query in expanded_field_queries:
+            for item in query_context_schema(
+                context_root,
+                query,
+                max_matches=per_query_limit,
+            ):
+                expanded_matches.append({**item, "matched_query": query})
+        matches = _merge_schema_matches(expanded_matches, direct_matches)[:max_matches]
         value_terms = []
         explicit_value = str(value or "").strip()
         if explicit_value:
@@ -315,6 +456,7 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
                 "field": field_text,
                 "value": str(value or "").strip() or None,
                 "value_search_terms": value_terms,
+                "expanded_field_queries": expanded_field_queries,
                 "scope": scope_terms,
                 "matches": matches,
                 "match_count": len(matches),
@@ -331,6 +473,10 @@ def create_query_schema_tool(workspace: Path, config: DeepAgentConfig) -> BaseTo
             semantic_matches,
             field_text=field_text,
         )
+        sources = [
+            *sources,
+            *_schema_observed_sources(matches, field_text=field_text),
+        ]
         for item in value_evidence:
             path = str(item.get("source_path") or "").replace("\\", "/")
             if not path:

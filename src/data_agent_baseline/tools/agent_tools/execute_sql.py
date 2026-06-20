@@ -13,6 +13,7 @@ from data_agent_baseline.agents.deep_state import BenchmarkDeepAgentState
 from data_agent_baseline.agents.deep_state import DeepAgentConfig
 from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools.answer import answer_value_hash, validate_prepared_answer
+from data_agent_baseline.tools.agent_tools.execute_python import _try_candidate_plan_execution
 from data_agent_baseline.tools._helpers import (
     DB_SUFFIXES,
     empty_result_hint,
@@ -41,6 +42,15 @@ def _plan_is_transform(analysis_plan: dict[str, Any]) -> bool:
     )
 
 
+def _plan_has_source_bindings(analysis_plan: dict[str, Any]) -> bool:
+    execution_spec = analysis_plan.get("execution_spec") or {}
+    return (
+        isinstance(execution_spec, dict)
+        and isinstance(execution_spec.get("source_bindings"), list)
+        and bool(execution_spec["source_bindings"])
+    )
+
+
 def _plan_operation_labels(analysis_plan: dict[str, Any]) -> list[Any]:
     execution_spec = analysis_plan.get("execution_spec") or {}
     if isinstance(execution_spec, dict):
@@ -63,21 +73,82 @@ def _sql_result_audit(
     rows: list[list[Any]],
     analysis_plan: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if not _plan_is_transform(analysis_plan):
+    if not (_plan_is_transform(analysis_plan) or _plan_has_source_bindings(analysis_plan)):
         return None
     operations = _plan_operation_labels(analysis_plan)
-    if not operations:
+    if not operations and not _plan_has_source_bindings(analysis_plan):
         return None
     return {
         "source_paths": [source_path],
-        "operations": [
-            *operations,
-            {"operation": "execute_sql", "sql": sql},
-        ],
+        "operations": operations or ["source_bound_projection"],
+        "execution_tool": "execute_sql",
+        "sql": sql,
         "output_row_count": len(rows),
         "output_hash": answer_value_hash(columns, rows),
         "audit_origin": "execute_sql_result",
     }
+
+
+def _column_is_generic_calculation(column: dict[str, Any]) -> bool:
+    role = str(column.get("role") or "").strip().casefold()
+    names = {
+        str(column.get("name") or "").strip().casefold(),
+        *(
+            str(field or "").strip().casefold()
+            for field in column.get("source_fields") or []
+            if str(field or "").strip()
+        ),
+    }
+    aliases = {
+        "count",
+        "count(*)",
+        "frequency",
+        "freq",
+        "percentage",
+        "percent",
+        "pct",
+        "ratio",
+        "sum",
+        "avg",
+        "average",
+        "min",
+        "max",
+    }
+    return role in {"calculation", "metric_value", "aggregate_value"} or bool(
+        names & aliases
+    )
+
+
+def _sql_result_column_matches_expected(
+    result_names: set[str],
+    expected: dict[str, Any],
+) -> bool:
+    aliases = {
+        str(expected.get("name") or "").casefold(),
+        *(
+            str(field or "").casefold()
+            for field in expected.get("source_fields") or []
+            if str(field or "").strip()
+        ),
+    }
+    if result_names & {alias for alias in aliases if alias}:
+        return True
+    if not _column_is_generic_calculation(expected):
+        return False
+    calculation_result_aliases = {
+        "count",
+        "count(*)",
+        "sum",
+        "avg",
+        "average",
+        "min",
+        "max",
+        "percentage",
+        "percent",
+        "pct",
+        "ratio",
+    }
+    return bool(result_names & calculation_result_aliases)
 
 
 def _sql_result_matches_output_spec(
@@ -96,17 +167,34 @@ def _sql_result_matches_output_spec(
     for expected in expected_columns:
         if not isinstance(expected, dict):
             return False
-        aliases = {
-            str(expected.get("name") or "").casefold(),
-            *(
-                str(field or "").casefold()
-                for field in expected.get("source_fields") or []
-                if str(field or "").strip()
-            ),
-        }
-        if not (result_names & {alias for alias in aliases if alias}):
+        if not _sql_result_column_matches_expected(result_names, expected):
             return False
     return True
+
+
+def _sql_result_candidate(
+    *,
+    source_path: str,
+    audit_source_path: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    audit: dict[str, Any] | None,
+    validation_error: str | None = None,
+) -> dict[str, Any]:
+    candidate: dict[str, Any] = {
+        "columns": list(columns),
+        "rows": [list(row) for row in rows],
+        "audit": audit,
+        "column_count": len(columns),
+        "row_count": len(rows),
+        "code_context_paths": list(
+            dict.fromkeys(path for path in (audit_source_path, source_path) if path)
+        ),
+        "source": "execute_sql",
+    }
+    if validation_error is not None:
+        candidate["validation_error"] = validation_error
+    return candidate
 
 
 def _table_names(cursor: sqlite3.Cursor) -> list[str]:
@@ -339,13 +427,55 @@ def create_execute_sql_tool(workspace: Path, config: DeepAgentConfig) -> BaseToo
                         analysis_plan,
                     )
                 ):
+                    audit_source_path = next(
+                        (
+                            str(source.get("path") or "")
+                            for source in observed_sources
+                            if source.get("source_type") == "sqlite_table"
+                            and str(source.get("table") or "") in read_tables
+                            and str(source.get("path") or "").strip()
+                        ),
+                        source_path,
+                    )
                     audit = _sql_result_audit(
-                        source_path=source_path,
+                        source_path=audit_source_path,
                         sql=sql,
                         columns=result_columns,
                         rows=result_rows,
                         analysis_plan=analysis_plan,
                     )
+                    candidate = _sql_result_candidate(
+                        source_path=source_path,
+                        audit_source_path=audit_source_path,
+                        columns=result_columns,
+                        rows=result_rows,
+                        audit=audit,
+                    )
+                    candidate_plan_answer = _try_candidate_plan_execution(
+                        workspace=workspace,
+                        analysis_plan=analysis_plan,
+                        candidate=candidate,
+                    )
+                    if candidate_plan_answer is not None:
+                        payload["prepared_answer"] = {
+                            "column_count": len(candidate_plan_answer.columns),
+                            "row_count": len(candidate_plan_answer.rows),
+                            "source": "candidate_plan_execution",
+                        }
+                        return _sql_command(
+                            state=state,
+                            message=success(
+                                name="execute_sql",
+                                tool_call_id=tool_call_id,
+                                payload=payload,
+                                max_output_bytes=config.max_output_bytes,
+                            ),
+                            sources=observed_sources,
+                            update={
+                                "prepared_answer": candidate_plan_answer,
+                                "answer_candidate": None,
+                            },
+                        )
                     prepared_answer, answer_error = validate_prepared_answer(
                         result_columns,
                         result_rows,
@@ -371,6 +501,30 @@ def create_execute_sql_tool(workspace: Path, config: DeepAgentConfig) -> BaseToo
                                 "answer_candidate": None,
                             },
                         )
+                    payload["answer_candidate"] = {
+                        "column_count": len(candidate["columns"]),
+                        "row_count": len(candidate["rows"]),
+                        "validation_error": answer_error,
+                    }
+                    candidate = _sql_result_candidate(
+                        source_path=source_path,
+                        audit_source_path=audit_source_path,
+                        columns=result_columns,
+                        rows=result_rows,
+                        audit=audit,
+                        validation_error=answer_error,
+                    )
+                    return _sql_command(
+                        state=state,
+                        message=success(
+                            name="execute_sql",
+                            tool_call_id=tool_call_id,
+                            payload=payload,
+                            max_output_bytes=config.max_output_bytes,
+                        ),
+                        sources=observed_sources,
+                        update={"answer_candidate": candidate},
+                    )
                 return _sql_command(
                     state=state,
                     message=success(

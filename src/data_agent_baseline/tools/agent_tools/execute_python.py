@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -21,14 +22,19 @@ from data_agent_baseline.agents.deep_state import (
     BenchmarkDeepAgentState,
     DeepAgentConfig,
 )
+from data_agent_baseline.benchmark.schema import AnswerTable
 from data_agent_baseline.prompts.loader import load_tool_prompt
 from data_agent_baseline.tools.answer import (
     answer_value_hash,
     normalize_answer_columns,
     validate_prepared_answer,
 )
+from data_agent_baseline.tools.observed_sources import merge_observed_sources
 
 _CONTEXT_PATH_RE = re.compile(r"/context/[^\s\"'<>),;\]]+")
+_ANSWER_TABLE_ASSIGNMENT_RE = re.compile(
+    r"(?m)^[ \t]*(columns|rows|result|set_answer_result)\s*(?::[^=\n]+)?="
+)
 
 
 def _build_shell_environment() -> dict[str, str]:
@@ -77,6 +83,16 @@ def _format_process_output(
     return text
 
 
+def _code_declares_answer_candidate_shape(code: str) -> bool:
+    if re.search(r"\bset_answer\s*\(", code):
+        return True
+    assigned = {
+        match.group(1)
+        for match in _ANSWER_TABLE_ASSIGNMENT_RE.finditer(code)
+    }
+    return bool({"columns", "rows"} <= assigned or assigned & {"result", "set_answer_result"})
+
+
 class _VirtualPathRewriter(ast.NodeTransformer):
     """把模型代码中的虚拟路径安全映射到单次任务工作区。"""
 
@@ -118,6 +134,41 @@ def _extract_context_paths(code: str) -> set[str]:
         for path in _CONTEXT_PATH_RE.findall(code)
         if not path.lower().endswith("/knowledge.md")
     }
+
+
+def _source_type_for_context_path(path: str) -> str:
+    suffix = Path(path.rstrip("/").rsplit("::", 1)[0]).suffix.casefold()
+    return {
+        ".csv": "csv",
+        ".json": "json",
+        ".sqlite": "sqlite",
+        ".db": "sqlite",
+        ".pdf": "pdf",
+        ".md": "document",
+        ".markdown": "document",
+        ".txt": "text",
+    }.get(suffix, "directory" if path.rstrip("/").count("/") <= 2 else "file")
+
+
+def _observed_sources_from_context_paths(
+    code_context_paths: set[str],
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in sorted(code_context_paths):
+        path = raw_path.replace("\\", "/").rstrip("/")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        sources.append(
+            {
+                "path": path,
+                "source_type": _source_type_for_context_path(path),
+                "observed_by": "execute_python",
+                "observation_type": "context_path_reference",
+            }
+        )
+    return sources
 
 
 def _write_answer_candidate_artifact(
@@ -422,7 +473,130 @@ def _synthesize_execution_audit(
     }
 
 
+def _iter_json_field_names(data: Any, *, depth: int = 0) -> list[str]:
+    if depth > 8:
+        return []
+    names: list[str] = []
+    if isinstance(data, Mapping):
+        for key, value in data.items():
+            text = str(key)
+            if text:
+                names.append(text)
+            names.extend(_iter_json_field_names(value, depth=depth + 1))
+    elif isinstance(data, list):
+        for item in data[:20]:
+            names.extend(_iter_json_field_names(item, depth=depth + 1))
+    return names
+
+
+@lru_cache(maxsize=64)
+def _context_field_case_map(workspace_path: str) -> dict[str, str]:
+    context_dir = Path(workspace_path) / "context"
+    variants: dict[str, set[str]] = {}
+
+    def add_field(name: Any) -> None:
+        text = str(name or "").strip()
+        alias = _normalized_recovery_alias(text)
+        if text and alias:
+            variants.setdefault(alias, set()).add(text)
+
+    if not context_dir.exists():
+        return {}
+    for path in context_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.casefold()
+        if suffix == ".csv":
+            try:
+                with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+                    for field in next(csv.reader(handle), []):
+                        add_field(field)
+            except (OSError, csv.Error):
+                continue
+        elif suffix == ".json":
+            try:
+                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for field in _iter_json_field_names(data):
+                add_field(field)
+        elif suffix in {".sqlite", ".sqlite3", ".db"}:
+            try:
+                with sqlite3.connect(str(path)) as connection:
+                    cursor = connection.cursor()
+                    cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                    )
+                    for (table_name,) in cursor.fetchall():
+                        table = str(table_name)
+                        cursor.execute(
+                            'PRAGMA table_info("' + table.replace('"', '""') + '")'
+                        )
+                        for row in cursor.fetchall():
+                            add_field(row[1])
+            except sqlite3.Error:
+                continue
+    return {
+        alias: next(iter(values))
+        for alias, values in variants.items()
+        if len(values) == 1
+    }
+
+
+def _canonicalize_prepared_answer_field_casing(
+    prepared_answer: Any,
+    *,
+    workspace: Path,
+    analysis_plan: dict[str, Any] | None,
+) -> Any:
+    if not isinstance(prepared_answer, AnswerTable):
+        return prepared_answer
+    if not isinstance(analysis_plan, dict):
+        return prepared_answer
+    output_spec = analysis_plan.get("output_spec")
+    if not isinstance(output_spec, Mapping):
+        return prepared_answer
+    plan_columns = [
+        column
+        for column in output_spec.get("columns") or []
+        if isinstance(column, Mapping)
+    ]
+    case_map = _context_field_case_map(str(workspace.resolve()))
+    if not case_map:
+        return prepared_answer
+
+    updated_columns = list(prepared_answer.columns)
+    changed = False
+    for index, column in enumerate(updated_columns):
+        if index >= len(plan_columns):
+            continue
+        source_fields = [
+            str(field or "").strip()
+            for field in plan_columns[index].get("source_fields") or []
+            if str(field or "").strip()
+        ]
+        if not source_fields:
+            continue
+        aliases = [column, *source_fields]
+        replacement = next(
+            (
+                case_map[_normalized_recovery_alias(alias)]
+                for alias in aliases
+                if _normalized_recovery_alias(alias) in case_map
+            ),
+            None,
+        )
+        if replacement and replacement != column:
+            updated_columns[index] = replacement
+            changed = True
+    if not changed:
+        return prepared_answer
+    return AnswerTable(columns=updated_columns, rows=prepared_answer.rows)
+
+
 def _load_prepared_answer(
+    *,
+    workspace: Path,
     result_path: Path,
     analysis_plan: dict[str, Any] | None,
     code_context_paths: set[str],
@@ -468,6 +642,21 @@ def _load_prepared_answer(
             rows=normalized_rows,
         )
         candidate["audit"] = audit
+    candidate_plan_answer = _try_candidate_plan_execution(
+        workspace=workspace,
+        analysis_plan=analysis_plan,
+        candidate=candidate,
+    )
+    if candidate_plan_answer is not None:
+        return (
+            _canonicalize_prepared_answer_field_casing(
+                candidate_plan_answer,
+                workspace=workspace,
+                analysis_plan=analysis_plan,
+            ),
+            None,
+            candidate,
+        )
     prepared_answer, answer_error = validate_prepared_answer(
         normalized_columns,
         normalized_rows,
@@ -476,6 +665,12 @@ def _load_prepared_answer(
     )
     if answer_error is not None:
         candidate["validation_error"] = answer_error
+    if prepared_answer is not None:
+        prepared_answer = _canonicalize_prepared_answer_field_casing(
+            prepared_answer,
+            workspace=workspace,
+            analysis_plan=analysis_plan,
+        )
     return prepared_answer, answer_error, candidate
 
 
@@ -515,6 +710,39 @@ def _candidate_from_stdout_literal(
     literal: Any,
     analysis_plan: dict[str, Any] | None,
 ) -> tuple[list[str], list[list[Any]]] | None:
+    if not isinstance(analysis_plan, dict):
+        if isinstance(literal, Mapping):
+            if "columns" in literal and "rows" in literal:
+                columns = literal.get("columns")
+                rows = literal.get("rows")
+                if isinstance(columns, list) and isinstance(rows, list):
+                    return normalize_answer_columns(columns), [
+                        list(row.values()) if isinstance(row, Mapping) else list(row)
+                        for row in rows
+                        if isinstance(row, (list, Mapping))
+                    ]
+            columns = normalize_answer_columns([str(key) for key in literal.keys()])
+            return columns, [[literal.get(key) for key in literal.keys()]]
+        if isinstance(literal, list) and all(
+            isinstance(row, Mapping) for row in literal
+        ):
+            columns = normalize_answer_columns(
+                list(
+                    dict.fromkeys(
+                        str(key)
+                        for row in literal
+                        for key in row.keys()
+                    )
+                )
+            )
+            if not columns:
+                return None
+            return columns, [
+                [row.get(column) for column in columns]
+                for row in literal
+                if isinstance(row, Mapping)
+            ]
+        return None
     if not isinstance(analysis_plan, dict):
         return None
     output_spec = analysis_plan.get("output_spec") or {}
@@ -603,6 +831,8 @@ def _candidate_from_stdout_literal(
 
 
 def _recover_stdout_answer(
+    *,
+    workspace: Path,
     stdout: bytes,
     analysis_plan: dict[str, Any] | None,
     code_context_paths: set[str],
@@ -648,7 +878,15 @@ def _recover_stdout_answer(
         if answer_error is not None:
             candidate["validation_error"] = answer_error
             return None, answer_error, candidate
-        return prepared_answer, None, candidate
+        return (
+            _canonicalize_prepared_answer_field_casing(
+                prepared_answer,
+                workspace=workspace,
+                analysis_plan=analysis_plan,
+            ),
+            None,
+            candidate,
+        )
     return None, None, None
 
 
@@ -661,6 +899,32 @@ def _plan_preserves_source_rows(analysis_plan: dict[str, Any] | None) -> bool:
         and output_spec.get("row_policy") == "preserve"
         and not output_spec.get("transformations")
     )
+
+
+def _plan_has_constraining_requirements(analysis_plan: dict[str, Any]) -> bool:
+    intent = analysis_plan.get("intent")
+    if not isinstance(intent, Mapping):
+        return False
+    constraining_types = {
+        "calculation",
+        "deduplication",
+        "entity",
+        "filter",
+        "grouping",
+        "limit",
+        "ordering",
+        "scope",
+        "selector",
+        "time_range",
+        "value",
+    }
+    for requirement in intent.get("requirements") or []:
+        if not isinstance(requirement, Mapping):
+            continue
+        requirement_type = str(requirement.get("requirement_type") or "").casefold()
+        if requirement_type in constraining_types:
+            return True
+    return False
 
 
 def _plan_output_projection(analysis_plan: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -728,6 +992,16 @@ def _case_get(record: dict[str, Any], field: str) -> Any:
     for key, value in record.items():
         if str(key).casefold() == folded:
             return value
+    return None
+
+
+def _case_key(record: Mapping[str, Any], field: str) -> str | None:
+    if field in record:
+        return field
+    folded = field.casefold()
+    for key in record.keys():
+        if str(key).casefold() == folded:
+            return str(key)
     return None
 
 
@@ -877,6 +1151,36 @@ def _read_sqlite_records_for_source(
         return []
 
 
+def _read_records_for_source(
+    *,
+    workspace: Path,
+    source: str,
+) -> list[dict[str, Any]]:
+    path, table_name = _resolve_virtual_context_path(workspace, source)
+    if path is None or not path.exists():
+        return []
+    suffix = path.suffix.casefold()
+    if table_name and suffix in {".db", ".sqlite", ".sqlite3"}:
+        return _read_sqlite_records_for_source(workspace=workspace, source=source)
+    if suffix == ".csv":
+        for encoding in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                with path.open(newline="", encoding=encoding) as handle:
+                    return [dict(row) for row in csv.DictReader(handle)]
+            except UnicodeDecodeError:
+                continue
+            except (OSError, csv.Error):
+                return []
+        return []
+    if suffix == ".json":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return _json_records(payload)
+    return []
+
+
 def _record_field_by_alias(record: Mapping[str, Any]) -> dict[str, str]:
     return {
         _field_alias(key): str(key)
@@ -952,9 +1256,7 @@ def _apply_candidate_source_completion_joins(
         return records
     candidate_field_aliases = _record_field_by_alias(records[0])
     for source_path in _plan_source_paths(analysis_plan):
-        if candidate_aliases & _source_aliases(source_path):
-            continue
-        other_records = _read_sqlite_records_for_source(
+        other_records = _read_records_for_source(
             workspace=workspace,
             source=source_path,
         )
@@ -967,23 +1269,30 @@ def _apply_candidate_source_completion_joins(
         common_aliases = set(candidate_field_aliases) & set(other_field_aliases)
         if not common_aliases:
             continue
-        join_alias = sorted(
+        join_aliases = sorted(
             common_aliases,
             key=lambda item: (
                 0 if ("id" in item or "code" in item or "key" in item) else 1,
                 item,
             ),
-        )[0]
-        candidate_key = candidate_field_aliases[join_alias]
-        other_key = other_field_aliases[join_alias]
-        other_by_key = {
-            _join_key(_case_get(record, other_key)): record
-            for record in other_records
-            if _case_get(record, other_key) is not None
-        }
+        )
+        candidate_keys = [candidate_field_aliases[alias] for alias in join_aliases]
+        other_keys = [other_field_aliases[alias] for alias in join_aliases]
+        other_by_key: dict[tuple[str, ...], dict[str, Any] | None] = {}
+        for record in other_records:
+            key = tuple(_join_key(_case_get(record, field)) for field in other_keys)
+            if any(not item for item in key):
+                continue
+            if key in other_by_key:
+                other_by_key[key] = None
+            else:
+                other_by_key[key] = record
         merged_records: list[dict[str, Any]] = []
         for record in records:
-            match = other_by_key.get(_join_key(_case_get(record, candidate_key)))
+            key = tuple(_join_key(_case_get(record, field)) for field in candidate_keys)
+            if any(not item for item in key):
+                continue
+            match = other_by_key.get(key)
             if match is None:
                 continue
             merged = dict(record)
@@ -1013,6 +1322,23 @@ def _coerce_float(value: Any) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+        parsed = int(value.strip())
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _explicit_limit_count(operation: Mapping[str, Any]) -> int | None:
+    for key in ("limit", "count", "n", "value"):
+        count = _positive_int(operation.get(key))
+        if count is not None:
+            return count
+    return None
 
 
 def _apply_comparison(value: float, op: str, threshold: float) -> bool:
@@ -1148,6 +1474,115 @@ def _aggregate_candidate_records(
     return columns, rows
 
 
+def _apply_candidate_sort_limit_operations(
+    records: list[dict[str, Any]],
+    analysis_plan: dict[str, Any],
+    operations: list[Any],
+) -> list[dict[str, Any]]:
+    output_spec = analysis_plan.get("output_spec") or {}
+    sorted_records = records
+    sort_keys: list[Mapping[str, Any]] = []
+    if isinstance(output_spec, Mapping):
+        sort_keys = [
+            item
+            for item in output_spec.get("sort_keys") or []
+            if isinstance(item, Mapping) and str(item.get("field") or "").strip()
+        ]
+        for sort_key in reversed(sort_keys):
+            field = str(sort_key.get("field") or "").strip()
+            descending = (
+                str(sort_key.get("direction") or "").strip().casefold()
+                in {"desc", "descending"}
+            )
+            non_null_records = [
+                record
+                for record in sorted_records
+                if _case_get(record, field) is not None
+            ]
+            null_records = [
+                record
+                for record in sorted_records
+                if _case_get(record, field) is None
+            ]
+            sorted_records = [
+                *sorted(
+                    non_null_records,
+                    key=lambda record: _case_get(record, field),
+                    reverse=descending,
+                ),
+                *null_records,
+            ]
+    limit_operations = [
+        operation
+        for operation in operations
+        if isinstance(operation, Mapping)
+        and str(operation.get("operation") or "").strip().casefold() == "limit"
+    ]
+    limit_counts = [
+        count
+        for count in (_explicit_limit_count(operation) for operation in limit_operations)
+        if count is not None
+    ]
+    if limit_counts:
+        return sorted_records[: min(limit_counts)]
+    if limit_operations and sort_keys and sorted_records:
+        primary_field = str(sort_keys[0].get("field") or "").strip()
+        top_value = _case_get(sorted_records[0], primary_field)
+        return [
+            record
+            for record in sorted_records
+            if _case_get(record, primary_field) == top_value
+        ]
+    return sorted_records
+
+
+def _project_candidate_records_to_plan(
+    records: list[dict[str, Any]],
+    analysis_plan: dict[str, Any],
+) -> tuple[list[str], list[list[Any]]] | None:
+    output_spec = analysis_plan.get("output_spec") or {}
+    if not isinstance(output_spec, Mapping):
+        return None
+    plan_columns = [
+        column
+        for column in output_spec.get("columns") or []
+        if isinstance(column, Mapping)
+    ]
+    if not plan_columns:
+        return None
+    projected_columns: list[str] = []
+    source_fields: list[str] = []
+    for column in plan_columns:
+        fields = [
+            str(item or "").strip()
+            for item in column.get("source_fields") or []
+            if str(item or "").strip()
+        ]
+        field = fields[0] if fields else str(column.get("name") or "").strip()
+        if not field:
+            return None
+        actual_key = next(
+            (
+                key
+                for record in records
+                if (key := _case_key(record, field)) is not None
+            ),
+            None,
+        )
+        if actual_key is None:
+            return None
+        source_fields.append(field)
+        projected_columns.append(actual_key)
+    projected_rows = [
+        [_case_get(record, field) for field in source_fields]
+        for record in records
+        if all(_case_get(record, field) is not None for field in source_fields)
+    ]
+    if not projected_rows:
+        return None
+    return projected_columns, projected_rows
+
+
 def _try_candidate_plan_execution(
     *,
     workspace: Path,
@@ -1179,8 +1614,19 @@ def _try_candidate_plan_execution(
         analysis_plan=analysis_plan,
     )
     if aggregated is None:
-        return None
-    columns, rows = aggregated
+        projected = _project_candidate_records_to_plan(
+            _apply_candidate_sort_limit_operations(
+                records,
+                analysis_plan,
+                operations,
+            ),
+            analysis_plan,
+        )
+        if projected is None:
+            return None
+        columns, rows = projected
+    else:
+        columns, rows = aggregated
     source_paths = _plan_source_paths(analysis_plan)
     audit = {
         "source_paths": source_paths,
@@ -1202,7 +1648,11 @@ def _try_candidate_plan_execution(
     )
     if answer_error is not None:
         return None
-    return prepared_answer
+    return _canonicalize_prepared_answer_field_casing(
+        prepared_answer,
+        workspace=workspace,
+        analysis_plan=analysis_plan,
+    )
 
 
 def _candidate_for_update(
@@ -1230,6 +1680,7 @@ def _try_preserve_source_projection(
     *,
     workspace: Path,
     analysis_plan: dict[str, Any] | None,
+    allow_bound_scope_requirements: bool = False,
 ) -> Any | None:
     if not isinstance(analysis_plan, dict):
         return None
@@ -1250,7 +1701,11 @@ def _try_preserve_source_projection(
             rows = _read_projection_from_json(resolved, source_fields)
         if not rows:
             continue
-        if not _plan_allows_source_projection(analysis_plan, len(rows)):
+        if not _plan_allows_source_projection(
+            analysis_plan,
+            len(rows),
+            allow_bound_scope_requirements=allow_bound_scope_requirements,
+        ):
             continue
         audit = {
             "source_paths": [source_path],
@@ -1270,16 +1725,36 @@ def _try_preserve_source_projection(
             audit,
         )
         if prepared_answer is not None and answer_error is None:
-            return prepared_answer
+            return _canonicalize_prepared_answer_field_casing(
+                prepared_answer,
+                workspace=workspace,
+                analysis_plan=analysis_plan,
+            )
     return None
 
 
 def _plan_allows_source_projection(
     analysis_plan: dict[str, Any],
     row_count: int,
+    *,
+    allow_bound_scope_requirements: bool = False,
 ) -> bool:
     if _plan_preserves_source_rows(analysis_plan):
-        return True
+        output_spec = analysis_plan.get("output_spec") or {}
+        expected_row_count = (
+            output_spec.get("expected_row_count")
+            if isinstance(output_spec, dict)
+            else None
+        )
+        row_count_matches = expected_row_count is None or expected_row_count == row_count
+        if allow_bound_scope_requirements:
+            return row_count_matches and not _plan_has_executable_requirements(
+                analysis_plan,
+            )
+        return (
+            not _plan_has_constraining_requirements(analysis_plan)
+            and row_count_matches
+        )
     output_spec = analysis_plan.get("output_spec") or {}
     if not isinstance(output_spec, dict):
         return False
@@ -1294,6 +1769,30 @@ def _plan_allows_source_projection(
         if isinstance(item, dict) and str(item.get("operation") or "").strip()
     }
     return bool(operation_names) and operation_names.issubset({"filter"})
+
+
+def _plan_has_executable_requirements(analysis_plan: dict[str, Any]) -> bool:
+    intent = analysis_plan.get("intent")
+    if not isinstance(intent, Mapping):
+        return False
+    executable_types = {
+        "calculation",
+        "deduplication",
+        "filter",
+        "grouping",
+        "limit",
+        "ordering",
+        "selector",
+        "time_range",
+        "value",
+    }
+    for requirement in intent.get("requirements") or []:
+        if not isinstance(requirement, Mapping):
+            continue
+        requirement_type = str(requirement.get("requirement_type") or "").casefold()
+        if requirement_type in executable_types:
+            return True
+    return False
 
 
 def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> BaseTool:
@@ -1327,14 +1826,31 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                 status="error",
             )
 
-        result_path = workspace / "scratch" / f"prepared-answer-{tool_call_id}.json"
+        scratch_dir = workspace / "scratch"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        result_path = scratch_dir / f"prepared-answer-{tool_call_id}.json"
         candidate_path = _write_answer_candidate_artifact(
             workspace=workspace,
             state=state,
         )
         code_context_paths = _extract_context_paths(code)
-        auto_capture_answer = isinstance(state.get("analysis_plan"), dict) and bool(
-            state.get("todos") or state.get("answer_candidate") is not None
+        observed_sources = _observed_sources_from_context_paths(code_context_paths)
+
+        def with_observed(update: dict[str, Any]) -> dict[str, Any]:
+            if not observed_sources:
+                return update
+            return {
+                "observed_sources": merge_observed_sources(
+                    state.get("observed_sources"),
+                    observed_sources,
+                ),
+                **update,
+            }
+
+        auto_capture_answer = _code_declares_answer_candidate_shape(code) and bool(
+            isinstance(state.get("analysis_plan"), dict)
+            or isinstance(state.get("question_structure"), Mapping)
+            or state.get("answer_candidate") is not None
         )
         capture_suffix = (
             "\n\ntry:\n"
@@ -1408,7 +1924,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                 ensure_ascii=False,
             )
             return Command(
-                update={
+                update=with_observed({
                     "prepared_answer": candidate_plan_answer,
                     "answer_candidate": None,
                     "messages": [
@@ -1419,14 +1935,17 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                             status="success",
                         )
                     ],
-                }
+                })
             )
 
         if completed.returncode == 0:
+            if (command := candidate_plan_command("answer_candidate_priority")) is not None:
+                return command
             prepared_answer, answer_error, answer_candidate = _load_prepared_answer(
-                result_path,
-                state.get("analysis_plan"),
-                code_context_paths,
+                workspace=workspace,
+                result_path=result_path,
+                analysis_plan=state.get("analysis_plan"),
+                code_context_paths=code_context_paths,
             )
             if prepared_answer is None and answer_error is None:
                 if (
@@ -1434,9 +1953,10 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                 ) is not None:
                     return command
                 stdout_answer, stdout_error, stdout_candidate = _recover_stdout_answer(
-                    completed.stdout,
-                    state.get("analysis_plan"),
-                    code_context_paths,
+                    workspace=workspace,
+                    stdout=completed.stdout,
+                    analysis_plan=state.get("analysis_plan"),
+                    code_context_paths=code_context_paths,
                 )
                 if stdout_answer is not None:
                     summary = json.dumps(
@@ -1449,7 +1969,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         ensure_ascii=False,
                     )
                     return Command(
-                        update={
+                        update=with_observed({
                             "prepared_answer": stdout_answer,
                             "answer_candidate": None,
                             "messages": [
@@ -1460,7 +1980,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                     status="success",
                                 )
                             ],
-                        }
+                        })
                     )
                 if stdout_candidate is not None:
                     summary = json.dumps(
@@ -1474,7 +1994,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         ensure_ascii=False,
                     )
                     return Command(
-                        update={
+                        update=with_observed({
                             "answer_candidate": stdout_candidate,
                             "messages": [
                                 ToolMessage(
@@ -1484,7 +2004,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                     status="error",
                                 )
                             ],
-                        }
+                        })
                     )
                 fallback_answer = _try_preserve_source_projection(
                     workspace=workspace,
@@ -1501,7 +2021,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         ensure_ascii=False,
                     )
                     return Command(
-                        update={
+                        update=with_observed({
                             "prepared_answer": fallback_answer,
                             "answer_candidate": None,
                             "messages": [
@@ -1512,7 +2032,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                     status="success",
                                 )
                             ],
-                        }
+                        })
                     )
                 if auto_capture_answer:
                     summary = json.dumps(
@@ -1527,7 +2047,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         ensure_ascii=False,
                     )
                     return Command(
-                        update={
+                        update=with_observed({
                             "messages": [
                                 ToolMessage(
                                     content=(
@@ -1542,7 +2062,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                     status="error",
                                 )
                             ],
-                        }
+                        })
                     )
             if answer_error is not None:
                 if (command := candidate_plan_command(answer_error)) is not None:
@@ -1562,7 +2082,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                         ensure_ascii=False,
                     )
                     return Command(
-                        update={
+                        update=with_observed({
                             "prepared_answer": fallback_answer,
                             "answer_candidate": None,
                             "messages": [
@@ -1573,7 +2093,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                     status="success",
                                 )
                             ],
-                        }
+                        })
                     )
                 candidate_summary = {
                     "status": "candidate_saved",
@@ -1600,7 +2120,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                     analysis_plan=state.get("analysis_plan"),
                 )
                 return Command(
-                    update={
+                    update=with_observed({
                         **(
                             {"answer_candidate": candidate_to_store}
                             if candidate_to_store is not None
@@ -1617,7 +2137,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                 status="error",
                             )
                         ],
-                    }
+                    })
                 )
             if prepared_answer is not None:
                 fallback_answer = _try_preserve_source_projection(
@@ -1639,7 +2159,7 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                     ensure_ascii=False,
                 )
                 return Command(
-                    update={
+                    update=with_observed({
                         "prepared_answer": prepared_answer,
                         "answer_candidate": None,
                         "messages": [
@@ -1650,15 +2170,24 @@ def create_execute_python_tool(workspace: Path, config: DeepAgentConfig) -> Base
                                 status="success",
                             )
                         ],
-                    }
+                    })
                 )
         if (command := candidate_plan_command("python_error")) is not None:
             return command
-        return ToolMessage(
+        message = ToolMessage(
             content=content,
             name="execute_python",
             tool_call_id=tool_call_id,
             status="success" if completed.returncode == 0 else "error",
         )
+        if observed_sources:
+            return Command(
+                update=with_observed(
+                    {
+                        "messages": [message],
+                    }
+                )
+            )
+        return message
 
     return execute_python

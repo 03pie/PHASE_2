@@ -194,19 +194,6 @@ _REQUIREMENT_TYPE_BY_TARGET_CONSTRAINT = {
     "aggregate_count": "calculation",
 }
 
-_SELECTOR_EXPRESSION_PATTERN = re.compile(
-    (
-        r"\b(?:argmax|argmin|max|min)\s*\(|"
-        r"\b(?:maximum|minimum|highest|lowest|first|last|latest|earliest)\b|"
-        r"\bmost[\s_-]+recent\b"
-    ),
-    re.IGNORECASE,
-)
-_DISTRIBUTION_OPERATOR_PATTERN = re.compile(
-    r"\bdistribution\b|\bfrequency\b|\bbreakdown\b|分布|频数|频率|占比|比例分布",
-    re.IGNORECASE,
-)
-
 def _exact_substring(value: Any, question: str) -> str | None:
     text = str(value or "").strip()
     if not text or text not in question:
@@ -262,12 +249,6 @@ def _condition_explicit_quote(item: Mapping[str, Any], question: str) -> str | N
 
 def _constraint_requirement_type(item: Mapping[str, Any]) -> str | None:
     constraint_type = str(item.get("constraint_type") or "")
-    value = str(item.get("value") or "")
-    quote = str(item.get("quote") or "")
-    if constraint_type in {"filter", "ordering"} and _SELECTOR_EXPRESSION_PATTERN.search(
-        f"{quote} {value}"
-    ):
-        return "selector"
     return _REQUIREMENT_TYPE_BY_TARGET_CONSTRAINT.get(constraint_type)
 
 
@@ -311,23 +292,6 @@ def _target_requests_source_records(targets: list[Any], question: str) -> bool:
     return False
 
 
-def _singular_which_target_quote(targets: list[Any], question: str) -> str | None:
-    for target in targets:
-        if not isinstance(target, Mapping):
-            continue
-        quote = str(target.get("quote") or "").strip()
-        if not quote or not _exact_substring(quote, question):
-            continue
-        normalized = quote.casefold()
-        if not normalized.startswith("which "):
-            continue
-        head = normalized.removeprefix("which ").strip().split(maxsplit=1)[0]
-        if not head or head.endswith("s"):
-            continue
-        return quote
-    return None
-
-
 def _ensure_exact_quotes(items: list[Any], question: str) -> list[Any]:
     normalized_items: list[Any] = []
     for item in items:
@@ -340,17 +304,6 @@ def _ensure_exact_quotes(items: list[Any], question: str) -> list[Any]:
             item_dict["quote"] = None
         normalized_items.append(item_dict)
     return normalized_items
-
-
-def _operator_self_authorized(item: Mapping[str, Any], question: str) -> bool:
-    quote = _exact_substring(item.get("quote"), question)
-    if not quote:
-        return False
-    return (
-        str(item.get("operation") or "") == "aggregate"
-        and str(item.get("operator_type") or "") == "distribution"
-        and bool(_DISTRIBUTION_OPERATOR_PATTERN.search(quote))
-    )
 
 
 def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
@@ -401,7 +354,6 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
         and (
             str(item.get("operation") or "")
             in authorized_operations.get(str(item.get("quote") or "").strip(), set())
-            or _operator_self_authorized(item, question)
         )
     ]
     normalized["intent_operators"] = [dict(item) for item in existing_operators]
@@ -434,19 +386,6 @@ def _normalize_structure(raw: dict[str, Any], question: str) -> dict[str, Any]:
     ):
         output["row_grain_hint"] = "source_records"
         output["preserve_source_rows"] = "true"
-    singular_which_quote = _singular_which_target_quote(
-        normalized["targets"],
-        question,
-    )
-    if conditions["orderings"] and not conditions["limits"] and singular_which_quote:
-        conditions["limits"].append(
-            {
-                "quote": singular_which_quote,
-                "value": "1",
-                "condition_type": "limit",
-                "explicitness": "explicit",
-            }
-        )
     return normalized
 
 

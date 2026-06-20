@@ -44,7 +44,11 @@ _RECORD_RE = re.compile(
     re.IGNORECASE,
 )
 _RECORD_KEY_RE = re.compile(
-    r"(?:\u6863\u6848|\u6218\u7565\u5355\u5143|\u6761\u76ee|\u8bb0\u5f55|archive)\s*`?(?P<id>\d+)`?",
+    (
+        r"(?:\u6863\u6848|\u6218\u7565\u5355\u5143|\u6761\u76ee|\u8bb0\u5f55|"
+        r"\u7d22\u5f15(?:\u6761\u76ee|\u4e3a)?|\u5b9e\u4f53\u6863\u6848|archive)"
+        r"\s*[：:]?\s*`?(?P<id>\d+)`?"
+    ),
     re.IGNORECASE,
 )
 _MISSING_RE = re.compile(
@@ -119,6 +123,30 @@ _SHARE_VALUE_RE = re.compile(
 )
 _PERCENT_VALUE_RE = re.compile(
     r"(?P<value>[-+]?\d[\d,]*(?:\.\d+)?)\s*%",
+    re.IGNORECASE,
+)
+_DATE_VALUE_RE = re.compile(
+    (
+        r"(?P<year>\d{4})\s*"
+        r"(?:年|[-/.])\s*"
+        r"(?P<month>\d{1,2})\s*"
+        r"(?:月|[-/.])\s*"
+        r"(?P<day>\d{1,2})\s*(?:日)?"
+    ),
+    re.IGNORECASE,
+)
+_DATE_ANCHOR_RE = re.compile(
+    r"(?:date|establish(?:ed|ment)?|founded|incorporated|"
+    r"成立(?:日期|时间)?|日期|时间|始于|设立)",
+    re.IGNORECASE,
+)
+_PAREN_TEXT_RE = re.compile(r"[（(](?P<value>[^）)]{1,80})[）)]")
+_TEXT_AFTER_ALIAS_RE = re.compile(
+    (
+        r"(?:为|是|:|：|called|named|as)?\s*"
+        r"(?P<value>[\u3400-\u9fffA-Za-z]"
+        r"[\u3400-\u9fffA-Za-z0-9·&.\-（）()]{1,60})"
+    ),
     re.IGNORECASE,
 )
 
@@ -504,7 +532,6 @@ def _default_aliases_for_field(source_field: str) -> list[str]:
         "code": ["code", "\u7f16\u7801", "\u8bc6\u522b\u7801", "\u6807\u8bc6\u7b26"],
         "personal": ["personal", "\u4e2a\u4eba", "\u4eba\u4e8b", "\u5185\u90e8"],
         "total": ["total"],
-        "fund": ["fund"],
         "net": ["net"],
         "value": ["value"],
         "nv": ["nv", "net value", "\u51c0\u503c", "\u8d44\u4ea7\u51c0\u503c"],
@@ -519,8 +546,27 @@ def _default_aliases_for_field(source_field: str) -> list[str]:
         "scale": ["scale", "\u89c4\u6a21"],
         "amount": ["amount", "\u6570\u91cf", "\u91d1\u989d"],
         "quantity": ["quantity", "\u6570\u91cf"],
+        "name": ["name", "\u540d\u79f0", "\u5168\u79f0", "\u7b80\u79f0", "\u522b\u540d"],
+        "abbr": ["abbr", "abbreviation", "\u7b80\u79f0", "\u7f29\u5199"],
+        "title": ["title", "\u540d\u79f0", "\u6807\u9898"],
         "percent": ["percent", "percentage", "%", "\u767e\u5206\u6bd4", "\u6bd4\u4f8b"],
         "pct": ["pct", "%", "\u767e\u5206\u6bd4", "\u6bd4\u4f8b"],
+        "date": [
+            "date",
+            "\u65e5\u671f",
+            "\u65f6\u95f4",
+            "\u6210\u7acb\u65e5\u671f",
+            "\u6210\u7acb\u65f6\u95f4",
+            "\u6210\u7acb\u4e8e",
+            "\u6b63\u5f0f\u6210\u7acb",
+            "\u5ba3\u544a\u6210\u7acb",
+            "\u59cb\u4e8e",
+            "established",
+            "establishment",
+            "founded",
+            "incorporated",
+        ],
+        "time": ["time", "\u65f6\u95f4", "\u6210\u7acb\u65f6\u95f4"],
     }
     token_text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", field)
     tokens = {
@@ -532,7 +578,10 @@ def _default_aliases_for_field(source_field: str) -> list[str]:
     tokens.update(
         token
         for token in token_aliases
-        if len(token) >= 2 and token in compact_field
+        if (
+            (len(token) >= 3 and token in compact_field)
+            or (len(token) == 2 and (compact_field.startswith(token) or compact_field.endswith(token)))
+        )
     )
     specific_aliases: list[str] = []
     if {"personal", "code"} <= tokens:
@@ -618,6 +667,40 @@ def _is_quantity_field(source_field: str, aliases: list[str]) -> bool:
     )
 
 
+def _is_date_field(source_field: str, aliases: list[str]) -> bool:
+    descriptor = _field_descriptor(source_field, aliases)
+    return any(
+        token in descriptor
+        for token in (
+            "date",
+            "time",
+            "establish",
+            "founded",
+            "incorporated",
+            "\u65e5\u671f",
+            "\u65f6\u95f4",
+            "\u6210\u7acb",
+        )
+    )
+
+
+def _is_text_field(source_field: str, aliases: list[str]) -> bool:
+    descriptor = _field_descriptor(source_field, aliases)
+    return any(
+        token in descriptor
+        for token in (
+            "name",
+            "abbr",
+            "title",
+            "label",
+            "\u540d\u79f0",
+            "\u5168\u79f0",
+            "\u7b80\u79f0",
+            "\u522b\u540d",
+        )
+    )
+
+
 def _is_before_field(source_field: str, aliases: list[str]) -> bool:
     descriptor = _field_descriptor(source_field, aliases)
     return any(
@@ -681,6 +764,65 @@ def _extract_generic_near_alias(line: str, aliases: list[str]) -> Any | None:
     return None
 
 
+def _normalize_date_match(match: re.Match[str]) -> str:
+    year = int(match.group("year"))
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _extract_date_value(line: str, aliases: list[str]) -> tuple[str, str] | None:
+    if _MISSING_RE.search(line):
+        return "", ""
+    candidate_matches: list[tuple[int, re.Match[str]]] = []
+    for alias in aliases:
+        alias_match = re.search(re.escape(alias), line, re.IGNORECASE)
+        if alias_match is None:
+            continue
+        window_start = max(0, alias_match.start() - 80)
+        window_end = min(len(line), alias_match.end() + 160)
+        window = line[window_start:window_end]
+        for date_match in _DATE_VALUE_RE.finditer(window):
+            distance = abs((window_start + date_match.start()) - alias_match.start())
+            candidate_matches.append((distance, date_match))
+    if not candidate_matches and _DATE_ANCHOR_RE.search(line):
+        candidate_matches = [
+            (date_match.start(), date_match)
+            for date_match in _DATE_VALUE_RE.finditer(line)
+        ]
+    if not candidate_matches:
+        return None
+    _, match = sorted(candidate_matches, key=lambda item: item[0])[0]
+    raw_value = match.group(0).strip()
+    return raw_value, _normalize_date_match(match)
+
+
+def _clean_text_value(value: str) -> str:
+    cleaned = value.strip().strip("`'\"“”‘’")
+    cleaned = re.split(r"[，,。；;]|(?:\s+(?:and|with|whose|which)\s+)", cleaned, maxsplit=1)[0]
+    return cleaned.strip().strip("`'\"“”‘’")
+
+
+def _extract_text_value(line: str, aliases: list[str]) -> tuple[str, str] | None:
+    for alias in aliases:
+        alias_match = re.search(re.escape(alias), line, re.IGNORECASE)
+        if alias_match is None:
+            continue
+        after_text = line[alias_match.end() : min(len(line), alias_match.end() + 120)]
+        text_match = _TEXT_AFTER_ALIAS_RE.search(after_text)
+        if text_match is None:
+            continue
+        value = _clean_text_value(text_match.group("value"))
+        if value and not _VALUE_NUMBER_RE.fullmatch(value):
+            return value, value
+    paren_match = _PAREN_TEXT_RE.search(line[:180])
+    if paren_match is not None:
+        value = _clean_text_value(paren_match.group("value"))
+        if value and not _VALUE_NUMBER_RE.fullmatch(value):
+            return value, value
+    return None
+
+
 def _extract_multi_field_value(
     line: str,
     *,
@@ -694,6 +836,14 @@ def _extract_multi_field_value(
     )
     if before_after_value is not None:
         return before_after_value
+    if _is_date_field(source_field, aliases):
+        date_value = _extract_date_value(line, aliases)
+        if date_value is not None:
+            return date_value
+    if _is_text_field(source_field, aliases):
+        text_value = _extract_text_value(line, aliases)
+        if text_value is not None:
+            return text_value
     value = _extract_generic_near_alias(line, aliases)
     if value is not None:
         return value, value
