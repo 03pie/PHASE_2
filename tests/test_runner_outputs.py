@@ -8,45 +8,76 @@ from pathlib import Path
 from typing import Any
 
 import data_agent_baseline.run.runner as runner_module
-from langchain_core.callbacks import CallbackManagerForLLMRun
-from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatResult
+from langchain_core.messages import AIMessage
 
 from data_agent_baseline.config import AgentConfig, AppConfig, DatasetConfig, RunConfig
 from data_agent_baseline.run.runner import _run_single_task_with_timeout, run_single_task
-from tests.test_deep_agent import ScriptedChatModel, _answer_response
 
 
-class TraceInspectingModel(ScriptedChatModel):
-    trace_path: Path
-    initial_trace_seen: bool = False
-    incremental_trace: dict[str, Any] | None = None
+class _ScriptedModel:
+    def __init__(self, *responses: dict[str, object]) -> None:
+        self.responses = list(responses)
 
-    def _generate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: CallbackManagerForLLMRun | None = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        if self.call_count == 0:
-            initial_trace = json.loads(self.trace_path.read_text(encoding="utf-8"))
-            self.initial_trace_seen = (
-                initial_trace["status"] == "running" and initial_trace["steps"] == []
+    def bind_tools(self, _tools: object, **_kwargs: object) -> "_ScriptedModel":
+        return self
+
+    def invoke(self, _messages: object) -> AIMessage:
+        if not self.responses:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "blocked",
+                        "args": {"reason": "script exhausted"},
+                        "id": "call_exhausted",
+                    }
+                ],
             )
-        elif self.call_count == 4:
-            self.incremental_trace = json.loads(self.trace_path.read_text(encoding="utf-8"))
-
-        return super()._generate(
-            messages,
-            stop=stop,
-            run_manager=run_manager,
-            **kwargs,
-        )
+        response = self.responses.pop(0)
+        return AIMessage(content="", tool_calls=response["tool_calls"])  # type: ignore[arg-type]
 
 
-def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
-    dataset_root = tmp_path / "dataset"
+def _call(name: str, args: dict[str, object], call_id: str) -> dict[str, object]:
+    return {"tool_calls": [{"name": name, "args": args, "id": call_id}]}
+
+
+def _scripted_csv_model() -> _ScriptedModel:
+    return _ScriptedModel(
+        _call("inspect_source", {"path": "/context/records.csv"}, "call_inspect"),
+        _call(
+            "bind",
+            {
+                "binding_type": "structured_source",
+                "source_ref": "src_0001",
+                "evidence_refs": ["ev_0001"],
+                "allowed_columns": ["name", "amount"],
+                "alignment": "observed CSV",
+            },
+            "call_bind",
+        ),
+        _call("inspect_relation", {"binding_ref": "bind_0001"}, "call_relation"),
+        _call(
+            "run_verified_compute",
+            {"binding_refs": ["bind_0001"], "sql": "SELECT amount FROM rel_0001"},
+            "call_compute",
+        ),
+        _call(
+            "verify_alignment",
+            {
+                "decision": "candidate_answer",
+                "target_kind": "compute_result",
+                "compute_refs": ["comp_0001"],
+                "binding_refs": ["bind_0001"],
+                "evidence_refs": ["ev_0001"],
+                "alignment": "The compute result is the final answer table requested.",
+            },
+            "call_verify_answer",
+        ),
+        _call("submit_final", {"compute_ref": "comp_0001"}, "call_final"),
+    )
+
+
+def _write_task(dataset_root: Path, *, question: str) -> None:
     task_dir = dataset_root / "task_1"
     context_dir = task_dir / "context"
     context_dir.mkdir(parents=True)
@@ -55,35 +86,27 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
             {
                 "task_id": "task_1",
                 "difficulty": "easy",
-                "question": "Return one row.",
+                "question": question,
             }
         ),
         encoding="utf-8",
     )
-    context_dir.joinpath("data.txt").write_text("value\n", encoding="utf-8")
+    context_dir.joinpath("records.csv").write_text(
+        "name,amount\nalpha,3\nbeta,5\n",
+        encoding="utf-8",
+    )
     context_dir.joinpath("knowledge.md").write_text(
-        "Use the source value exactly.\n",
+        "# Records\n\n```sql\nSELECT amount FROM records\n```\n",
         encoding="utf-8",
     )
 
-    model = ScriptedChatModel(
-        request_quote="Return one row.",
-        knowledge_quote="Use the source value exactly.",
-        responses=[
-            _answer_response(
-                columns=["value"],
-                rows=[["one"]],
-                tool_call_id="answer-output",
-            )
-        ]
-    )
+
+def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "dataset"
+    _write_task(dataset_root, question="records amount")
     config = AppConfig(
         dataset=DatasetConfig(root_path=dataset_root),
-        agent=AgentConfig(
-            model="fake",
-            api_base="https://example.invalid/v1",
-            api_key="test",
-        ),
+        agent=AgentConfig(model="unused", api_base="https://example.invalid/v1", api_key="test"),
         run=RunConfig(output_dir=tmp_path / "runs", max_workers=1),
     )
     run_output_dir = tmp_path / "run"
@@ -93,129 +116,42 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
         task_id="task_1",
         config=config,
         run_output_dir=run_output_dir,
-        model=model,
+        model=_scripted_csv_model(),
     )
 
     assert artifact.succeeded
     assert artifact.prediction_csv_path is not None
     with artifact.prediction_csv_path.open(newline="", encoding="utf-8") as handle:
-        assert list(csv.reader(handle)) == [["value"], ["one"]]
+        assert list(csv.reader(handle)) == [["amount"], ["3"], ["5"]]
 
     trace = json.loads(artifact.trace_path.read_text(encoding="utf-8"))
     assert trace["task_id"] == "task_1"
-    assert trace["answer"] == {"columns": ["value"], "rows": [["one"]]}
-    assert [step["action"] for step in trace["steps"][:5]] == [
-        "system_prompt",
-        "user_prompt",
-        "read_doc",
-        "analyze_plan",
-        "write_todos",
+    assert trace["answer"] == {"columns": ["amount"], "rows": [["3"], ["5"]]}
+    actions = [step["action"] for step in trace["steps"]]
+    assert actions[:2] == [
+        "codex_bootstrap_inventory",
+        "codex_bootstrap_knowledge",
     ]
-    tool_calls = [
-        tool_call
+    assert "inspect_source" in actions
+    assert "bind" in actions
+    assert "inspect_relation" in actions
+    assert "run_verified_compute" in actions
+    assert "submit_final" in actions
+    assert actions[-1] == "codex_final_audit"
+    tool_steps = [
+        step
         for step in trace["steps"]
-        for tool_call in step["observation"].get("tool_calls", [])
+        if step["action"] in {"inspect_source", "bind", "inspect_relation", "run_verified_compute"}
     ]
-    assert [tool_call["tool_call_id"] for tool_call in tool_calls] == [
-        "schema-call",
-        "plan-call",
-        "todos-call",
-        "answer-output",
-    ]
+    assert tool_steps
+    assert all(step["tool_call_id"] for step in tool_steps)
+    loop_steps = [step for step in trace["steps"] if step["action"] == "codex_turn"]
+    assert loop_steps
+    assert all("tool_calls" in step["observation"] for step in loop_steps)
+    assert any(step["observation"]["tool_calls"] for step in loop_steps)
     assert trace["succeeded"] is True
     assert trace["status"] == "completed"
     assert "e2e_elapsed_seconds" in trace
-
-
-def test_runner_updates_trace_before_next_model_call(tmp_path: Path) -> None:
-    dataset_root = tmp_path / "dataset"
-    task_dir = dataset_root / "task_1"
-    context_dir = task_dir / "context"
-    context_dir.mkdir(parents=True)
-    task_dir.joinpath("task.json").write_text(
-        json.dumps(
-            {
-                "task_id": "task_1",
-                "difficulty": "easy",
-                "question": "Inspect and return one row.",
-            }
-        ),
-        encoding="utf-8",
-    )
-    context_dir.joinpath("data.txt").write_text("value\n", encoding="utf-8")
-    context_dir.joinpath("knowledge.md").write_text(
-        "Use the source value exactly.\n",
-        encoding="utf-8",
-    )
-
-    run_output_dir = tmp_path / "run"
-    trace_path = run_output_dir / "task_1" / "trace.json"
-    model = TraceInspectingModel(
-        trace_path=trace_path,
-        request_quote="Inspect and return one row.",
-        knowledge_quote="Use the source value exactly.",
-        responses=[
-            AIMessage(
-                content="Inspecting.",
-                tool_calls=[
-                    {
-                        "name": "read_doc",
-                        "args": {"path": "/context/data.txt"},
-                        "id": "read-before-answer",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _answer_response(
-                columns=["value"],
-                rows=[["one"]],
-                tool_call_id="answer-after-read",
-            ),
-        ],
-    )
-    config = AppConfig(
-        dataset=DatasetConfig(root_path=dataset_root),
-        agent=AgentConfig(
-            model="fake",
-            api_base="https://example.invalid/v1",
-            api_key="test",
-        ),
-        run=RunConfig(output_dir=tmp_path / "runs", max_workers=1),
-    )
-
-    artifact = run_single_task(
-        task_id="task_1",
-        config=config,
-        run_output_dir=run_output_dir,
-        model=model,
-    )
-
-    assert artifact.succeeded
-    assert model.initial_trace_seen
-    assert model.incremental_trace is not None
-    assert model.incremental_trace["status"] == "running"
-    incremental_actions = [
-        step["action"] for step in model.incremental_trace["steps"]
-    ]
-    assert incremental_actions[:5] == [
-        "system_prompt",
-        "user_prompt",
-        "read_doc",
-        "analyze_plan",
-        "write_todos",
-    ]
-    incremental_tool_calls = [
-        tool_call
-        for step in model.incremental_trace["steps"]
-        for tool_call in step["observation"].get("tool_calls", [])
-    ]
-    assert [tool_call["name"] for tool_call in incremental_tool_calls] == [
-        "read_doc",
-        "analyze_plan",
-        "write_todos",
-        "read_doc",
-    ]
-    assert incremental_tool_calls[3]["tool_call_id"] == "read-before-answer"
 
 
 def _send_large_subprocess_result(
@@ -281,7 +217,7 @@ def _write_answer_trace_then_sleep(
             {
                 "task_id": task_id,
                 "answer": {"columns": ["value"], "rows": [["one"]]},
-                "steps": [{"action": "execute_python"}],
+                "steps": [{"action": "final_audit"}],
                 "failure_reason": None,
                 "succeeded": False,
                 "status": "running",
@@ -321,9 +257,7 @@ def test_timeout_preserves_prepared_answer_from_trace(
     assert not multiprocessing.active_children()
 
 
-def test_timeout_cleanup_terminates_windows_process_tree(
-    monkeypatch: Any,
-) -> None:
+def test_timeout_cleanup_terminates_windows_process_tree(monkeypatch: Any) -> None:
     calls: list[list[str]] = []
 
     class FakeProcess:

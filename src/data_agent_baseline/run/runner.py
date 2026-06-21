@@ -258,7 +258,6 @@ def _run_single_task_core(
             execute_timeout_seconds=config.agent.execute_timeout_seconds,
             max_output_bytes=config.agent.max_output_bytes,
             model_call_interval_seconds=config.agent.model_call_interval_seconds,
-            question_structure_enabled=config.agent.question_structure_enabled,
         ),
     )
     started_at = perf_counter()

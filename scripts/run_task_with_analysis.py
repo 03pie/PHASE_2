@@ -15,19 +15,14 @@ if str(SRC_ROOT) not in sys.path:
 from data_agent_baseline.config import load_app_config
 
 
-def normalize_cli_args(argv: list[str]) -> list[str]:
-    if argv and not argv[0].startswith("-"):
-        return ["--config", argv[0], *argv[1:]]
-    return argv
-
-
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the benchmark first, then automatically analyze the exact run directory "
+            "Run one task first, then automatically analyze the exact run directory "
             "that was produced in this execution."
         )
     )
+    parser.add_argument("task_id", help="Task ID to run, for example task_19.")
     parser.add_argument(
         "--config",
         dest="config_flag",
@@ -58,7 +53,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Analyze all tasks from the metadata source instead of only attempted tasks.",
     )
-    return parser.parse_known_args(normalize_cli_args(sys.argv[1:]))
+    return parser.parse_known_args(sys.argv[1:])
 
 
 def resolve_config_path(args: argparse.Namespace) -> Path:
@@ -116,7 +111,7 @@ def resolve_dabench_command_prefix() -> list[str]:
 
 
 def main() -> None:
-    args, benchmark_args = parse_args()
+    args, task_args = parse_args()
     config_path = resolve_config_path(args)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -126,22 +121,24 @@ def main() -> None:
     before = snapshot_run_dirs(runs_root)
     started_at = time.time()
 
-    benchmark_command = [
+    run_task_command = [
         *resolve_dabench_command_prefix(),
-        "run-benchmark",
+        "run-task",
+        args.task_id,
         "--config",
         str(config_path),
-        *benchmark_args,
+        *task_args,
     ]
-    print(f"[run_and_analyze] benchmark config: {config_path}", flush=True)
-    benchmark_exit_code = run_command(benchmark_command)
+    print(f"[run_task_with_analysis] benchmark config: {config_path}", flush=True)
+    print(f"[run_task_with_analysis] task id: {args.task_id}", flush=True)
+    run_task_exit_code = run_command(run_task_command)
 
     run_dir = detect_run_dir(runs_root, before, started_at)
     if run_dir is None:
-        if benchmark_exit_code != 0:
-            raise SystemExit(benchmark_exit_code)
+        if run_task_exit_code != 0:
+            raise SystemExit(run_task_exit_code)
         raise RuntimeError(
-            "Benchmark finished but no new run directory was detected. "
+            "Task run finished but no new run directory was detected. "
             "Please rerun with a unique run.output_dir/run_id."
         )
 
@@ -162,11 +159,11 @@ def main() -> None:
     if args.analysis_all_tasks:
         analysis_command.append("--all-tasks")
 
-    print(f"[run_and_analyze] analyzing run: {run_dir}", flush=True)
+    print(f"[run_task_with_analysis] analyzing run: {run_dir}", flush=True)
     analysis_exit_code = run_command(analysis_command)
 
-    if benchmark_exit_code != 0:
-        raise SystemExit(benchmark_exit_code)
+    if run_task_exit_code != 0:
+        raise SystemExit(run_task_exit_code)
     if analysis_exit_code != 0:
         raise SystemExit(analysis_exit_code)
 

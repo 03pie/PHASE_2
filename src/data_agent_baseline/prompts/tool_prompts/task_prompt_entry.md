@@ -1,1 +1,0 @@
-- `task`(description, subagent_type): Launch a short-lived subagent for an isolated subtask. Available subagents: {available_agents}.

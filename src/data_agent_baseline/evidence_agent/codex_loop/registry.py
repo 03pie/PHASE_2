@@ -1,0 +1,1901 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from collections.abc import Callable
+from contextlib import closing
+from pathlib import Path
+from typing import Any
+
+import fitz
+import pandas as pd
+
+from data_agent_baseline.evidence_agent.codex_loop.compute import (
+    load_binding_frame,
+    run_sql_over_bindings,
+)
+from data_agent_baseline.evidence_agent.codex_loop.protocol import (
+    Evidence,
+    LoopState,
+    ModelAction,
+    SourceRef,
+    ToolSpec,
+)
+from data_agent_baseline.evidence_agent.semantic import semantic_score
+
+
+def _normalize(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _terms(value: Any) -> list[str]:
+    return [part for part in re.split(r"[^0-9A-Za-z_]+", str(value).casefold()) if part]
+
+
+def _source_from_args(state: LoopState, arguments: dict[str, Any]) -> SourceRef | None:
+    source_ref = str(arguments.get("source_ref") or arguments.get("source_id") or "").strip()
+    if source_ref and source_ref in state.sources:
+        return state.sources[source_ref]
+    path = str(arguments.get("path") or "").strip()
+    if path:
+        source_id = state.source_by_path.get(path) or state.source_by_path.get(Path(path).as_posix())
+        if source_id:
+            return state.sources[source_id]
+    return None
+
+
+_SQL_RELATION_PATTERN = re.compile(
+    r'\b(?:from|join)\s+("([^"]+)"|[A-Za-z_][\w]*)',
+    re.IGNORECASE,
+)
+
+
+def _binding_refs_from_sql_or_args(
+    state: LoopState,
+    *,
+    sql: str,
+    arguments: dict[str, Any],
+) -> tuple[str, ...]:
+    relation_names: set[str] = set()
+    relation_arg = str(arguments.get("relation_name") or "").strip()
+    if relation_arg:
+        relation_names.add(relation_arg)
+    for match in _SQL_RELATION_PATTERN.finditer(sql):
+        relation_names.add((match.group(2) or match.group(1)).strip('"'))
+    if not relation_names:
+        return ()
+    refs = [
+        binding.id
+        for binding in state.bindings.values()
+        if binding.relation_name in relation_names
+    ]
+    return tuple(dict.fromkeys(refs))
+
+
+def _sample_dataframe(frame: pd.DataFrame, *, limit: int = 5) -> list[dict[str, Any]]:
+    return frame.head(limit).where(pd.notnull(frame), None).to_dict(orient="records")
+
+
+def _json_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        if all(isinstance(item, dict) for item in payload):
+            return list(payload)
+        return [{"value": item} for item in payload]
+    if isinstance(payload, dict):
+        for value in payload.values():
+            if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+                return list(value)
+        return [payload]
+    return [{"value": payload}]
+
+
+def _document_lines(source: SourceRef) -> list[dict[str, Any]]:
+    if source.data_form == "markdown_document":
+        text = source.path.read_text(encoding="utf-8", errors="replace")
+        return [
+            {"line": index + 1, "page": None, "text": line}
+            for index, line in enumerate(text.splitlines())
+        ]
+    if source.data_form == "pdf_document":
+        lines: list[dict[str, Any]] = []
+        with fitz.open(source.path) as document:
+            global_line = 1
+            for page_index, page in enumerate(document, start=1):
+                for line in page.get_text("text").splitlines():
+                    lines.append({"line": global_line, "page": page_index, "text": line})
+                    global_line += 1
+        return lines
+    return []
+
+
+def _recommend(tool_name: str, arguments: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {"tool_name": tool_name, "arguments": arguments, "reason": reason}
+
+
+def _answer_table_from_payload(answer: Any) -> tuple[list[str], list[list[Any]]] | None:
+    if not isinstance(answer, dict) or not answer:
+        return None
+    columns = answer.get("columns")
+    rows = answer.get("rows")
+    if isinstance(columns, list) and isinstance(rows, list):
+        normalized_columns = [str(column) for column in columns]
+        normalized_rows: list[list[Any]] = []
+        for row in rows:
+            if isinstance(row, list):
+                normalized_rows.append(list(row))
+            elif isinstance(row, tuple):
+                normalized_rows.append(list(row))
+            elif isinstance(row, dict):
+                normalized_rows.append([row.get(column) for column in normalized_columns])
+            else:
+                normalized_rows.append([row])
+        return normalized_columns, normalized_rows
+    if "value" in answer:
+        column = str(answer.get("column") or answer.get("name") or "answer")
+        return [column], [[answer.get("value")]]
+    scalar_items = [
+        (str(key), value)
+        for key, value in answer.items()
+        if key not in {"binding_refs", "evidence_refs", "alignment"}
+        and not isinstance(value, (dict, list))
+    ]
+    if scalar_items:
+        return [key for key, _value in scalar_items], [[value for _key, value in scalar_items]]
+    return None
+
+
+def _co_occurring_scalar_values(
+    hits: list[dict[str, Any]],
+    *,
+    original_value: str,
+    limit: int = 40,
+) -> list[dict[str, Any]]:
+    original_norm = _normalize(original_value)
+    candidates: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for hit in hits[:50]:
+        record = hit.get("record")
+        if not isinstance(record, dict):
+            continue
+        source_id = str(hit.get("source_id") or "")
+        path = str(hit.get("path") or "")
+        table = str(hit.get("table") or "")
+        for field, raw_value in record.items():
+            if raw_value is None:
+                continue
+            value = str(raw_value).strip()
+            if not value or value.casefold() in {"nan", "none", "nat"}:
+                continue
+            if len(value) > 80 or _normalize(value) == original_norm:
+                continue
+            key = (source_id, path, table, str(field), value)
+            item = candidates.setdefault(
+                key,
+                {
+                    "source_id": source_id,
+                    "path": path,
+                    "table": table or None,
+                    "field": str(field),
+                    "value": value,
+                    "match_reason": "co_occurring_with_value_hit",
+                    "requires_verification": True,
+                    "support_count": 0,
+                },
+            )
+            item["support_count"] = int(item["support_count"]) + 1
+    return sorted(
+        candidates.values(),
+        key=lambda item: (-int(item["support_count"]), len(str(item["value"])), str(item["field"])),
+    )[:limit]
+
+
+def _source_negative_scope(
+    *,
+    kind: str,
+    source: SourceRef | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    scope = {"kind": kind, **extra}
+    if source is not None:
+        scope.update({"source_id": source.id, "path": source.virtual_path, "data_form": source.data_form})
+    return scope
+
+
+def _string_list(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        cleaned = value.split("</parameter", 1)[0].strip()
+        if not cleaned:
+            return ()
+        if cleaned.startswith("["):
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, list):
+                    return tuple(str(item) for item in parsed if str(item).strip())
+            except json.JSONDecodeError:
+                pass
+        refs = re.findall(r"\b(?:src|ev|bind|comp|req|sec|cand|rel)_\d{4}\b", cleaned)
+        if refs:
+            return tuple(refs)
+        if "," in cleaned:
+            return tuple(part.strip() for part in cleaned.split(",") if part.strip())
+        return (cleaned,)
+    if isinstance(value, list | tuple):
+        items: list[str] = []
+        for item in value:
+            items.extend(_string_list(item))
+        return tuple(dict.fromkeys(items))
+    return ()
+
+
+def _source_evidence_refs(state: LoopState, source_ids: tuple[str, ...]) -> tuple[str, ...]:
+    refs: list[str] = []
+    for evidence in state.evidence.values():
+        if evidence.source_id in source_ids and evidence.ok and evidence.tool_name not in {
+            "verify_alignment",
+            "track_requirements",
+            "bind",
+            "submit_final",
+        }:
+            refs.append(evidence.id)
+    return tuple(dict.fromkeys(refs))
+
+
+class EvidenceActionRegistry:
+    def __init__(self) -> None:
+        self._dispatch: dict[str, Callable[[LoopState, dict[str, Any]], Evidence]] = {
+            "list_inventory": self._list_inventory,
+            "retrieve_knowledge": self._retrieve_knowledge,
+            "locate_sources": self._locate_sources,
+            "inspect_source": self._inspect_source,
+            "sample_records": self._sample_records,
+            "search_values": self._search_values,
+            "read_document_window": self._read_document_window,
+            "profile_document": self._profile_document,
+            "search_document": self._search_document,
+            "extract_records": self._extract_records,
+            "inspect_relation": self._inspect_relation,
+            "track_requirements": self._track_requirements,
+            "verify_alignment": self._verify_alignment,
+            "run_verified_compute": self._run_verified_compute,
+            "submit_final": self._submit_final,
+            "inspect_video": self._inspect_video,
+            "extract_video_observations": self._extract_video_observations,
+        }
+        self._specs = {
+            "list_inventory": ToolSpec("list_inventory", "Return observed context inventory."),
+            "retrieve_knowledge": ToolSpec(
+                "retrieve_knowledge", "Return full document-only knowledge sections."
+            ),
+            "locate_sources": ToolSpec(
+                "locate_sources", "Find source/table/field candidates by lexical evidence."
+            ),
+            "inspect_source": ToolSpec(
+                "inspect_source", "Inspect schema/header/key shape/sample for an observed source."
+            ),
+            "sample_records": ToolSpec(
+                "sample_records", "Read a small bounded sample from an observed structured source."
+            ),
+            "search_values": ToolSpec(
+                "search_values", "Search literal values across observed sources."
+            ),
+            "read_document_window": ToolSpec(
+                "read_document_window", "Read a bounded PDF/MD text window."
+            ),
+            "profile_document": ToolSpec(
+                "profile_document", "Profile PDF/MD document structure without extracting records."
+            ),
+            "search_document": ToolSpec(
+                "search_document", "Search PDF/MD document text and return bounded windows."
+            ),
+            "extract_records": ToolSpec(
+                "extract_records", "Execute a model-provided extraction spec over document windows."
+            ),
+            "inspect_relation": ToolSpec(
+                "inspect_relation", "Inspect verified relation schema/sample before compute or SQL repair."
+            ),
+            "track_requirements": ToolSpec(
+                "track_requirements", "Maintain a generic requirement coverage ledger."
+            ),
+            "verify_alignment": ToolSpec(
+                "verify_alignment", "Record structured verifier decisions over cited evidence."
+            ),
+            "run_verified_compute": ToolSpec(
+                "run_verified_compute", "Run SQL over verified relation bindings."
+            ),
+            "submit_final": ToolSpec("submit_final", "Materialize a final answer from compute output."),
+            "inspect_video": ToolSpec("inspect_video", "Return v1 unsupported video metadata."),
+            "extract_video_observations": ToolSpec(
+                "extract_video_observations", "Video extraction placeholder; unsupported in v1."
+            ),
+        }
+
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(self._dispatch)
+
+    def spec(self, name: str) -> ToolSpec | None:
+        return self._specs.get(name)
+
+    def dispatch(self, state: LoopState, action: ModelAction) -> Evidence:
+        if action.kind == "compute":
+            return self._run_verified_compute(
+                state,
+                {"sql": action.sql, "binding_refs": list(action.binding_refs)},
+            )
+        if action.kind == "final":
+            arguments = dict(action.arguments)
+            if action.compute_ref:
+                arguments["compute_ref"] = action.compute_ref
+            if action.answer is not None:
+                arguments["answer"] = action.answer
+            if action.binding_refs:
+                arguments["binding_refs"] = list(action.binding_refs)
+            if action.evidence_refs:
+                arguments["evidence_refs"] = list(action.evidence_refs)
+            return self._submit_final(state, arguments)
+        if action.tool_name not in self._dispatch:
+            return state.add_evidence(
+                tool_name=str(action.tool_name),
+                ok=False,
+                summary=f"Unknown tool: {action.tool_name}",
+                payload={"error": "unknown_tool"},
+                negative_scope={"kind": "unknown_tool", "tool_name": action.tool_name},
+                allowed_next_tools=self.tool_names,
+            )
+        return self._dispatch[action.tool_name](state, action.arguments)
+
+    def _list_inventory(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        del arguments
+        sources = [source.public_dict() for source in state.sources.values()]
+        return state.add_evidence(
+            tool_name="list_inventory",
+            ok=True,
+            summary=f"Observed {len(sources)} context source(s).",
+            payload={"sources": sources},
+            allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source"),
+        )
+
+    def _retrieve_knowledge(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        query = str(arguments.get("query") or state.question)
+        section_ids = {
+            str(item)
+            for item in arguments.get("section_ids", [])
+            if str(item).strip()
+        }
+        sections = state.knowledge_sections
+        if section_ids:
+            selected = [section for section in sections if section.id in section_ids]
+        else:
+            scored = [
+                (
+                    semantic_score(query, f"{section.heading_path}\n{section.text}"),
+                    section,
+                )
+                for section in sections
+            ]
+            selected = [section for score, section in sorted(scored, key=lambda item: -item[0]) if score > 0][:8]
+            if not selected:
+                selected = state.matched_sections[:8]
+        payload = {
+            "sections": [
+                {
+                    "id": section.id,
+                    "heading_path": section.heading_path,
+                    "line_start": section.line_start,
+                    "line_end": section.line_end,
+                    "text": section.text,
+                    "mentions": list(section.mentions),
+                }
+                for section in selected
+            ]
+        }
+        return state.add_evidence(
+            tool_name="retrieve_knowledge",
+            ok=True,
+            summary=f"Retrieved {len(selected)} knowledge section(s).",
+            payload=payload,
+            allowed_next_tools=("locate_sources", "inspect_source", "profile_document"),
+        )
+
+    def _locate_sources(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        query = str(arguments.get("query") or state.question)
+        tokens = [str(token) for token in arguments.get("tokens", []) if str(token).strip()]
+        if not tokens:
+            tokens = _terms(query)
+        query_norms = {_normalize(token) for token in tokens + [query] if _normalize(token)}
+        candidates = []
+
+        for source in state.sources.values():
+            haystack = " ".join(
+                [source.virtual_path, source.basename, source.stem, *source.tables, *source.columns]
+            )
+            score = semantic_score(query, haystack)
+            source_norms = {_normalize(source.basename), _normalize(source.stem), _normalize(source.virtual_path)}
+            if query_norms & source_norms:
+                score += 4.0
+            if score > 0 or not tokens:
+                candidate = state.add_candidate(
+                    kind="source_candidate",
+                    source_id=source.id,
+                    data_form=source.data_form,
+                    match_reason="lexical_inventory_match" if score > 0 else "inventory_listing",
+                    path=source.virtual_path,
+                )
+                candidates.append(candidate.to_dict())
+
+            for table in source.tables:
+                if _normalize(table) in query_norms or semantic_score(query, table) > 0:
+                    candidate = state.add_candidate(
+                        kind="table_candidate",
+                        source_id=source.id,
+                        data_form="sqlite_database",
+                        match_reason="observed_table_name_match",
+                        path=source.virtual_path,
+                        table=table,
+                    )
+                    candidates.append(candidate.to_dict())
+
+            for column in source.columns:
+                if _normalize(column) in query_norms or semantic_score(query, column) > 0:
+                    candidate = state.add_candidate(
+                        kind="field_candidate",
+                        source_id=source.id,
+                        data_form=source.data_form,
+                        match_reason="observed_field_name_match",
+                        path=source.virtual_path,
+                        field=column,
+                    )
+                    candidates.append(candidate.to_dict())
+
+        return state.add_evidence(
+            tool_name="locate_sources",
+            ok=True,
+            summary=f"Located {len(candidates)} candidate(s). Candidates are not bindings.",
+            payload={"query": query, "tokens": tokens, "candidates": candidates[:80]},
+            negative_scope=(
+                {"kind": "candidate_search_empty", "query": query, "tokens": tokens}
+                if not candidates
+                else None
+            ),
+            allowed_next_tools=("inspect_source", "sample_records", "profile_document", "search_document"),
+        )
+
+    def _inspect_source(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        if source is None:
+            return state.add_evidence(
+                tool_name="inspect_source",
+                ok=False,
+                summary="No observed source matched inspect_source arguments.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "inspect_source", "arguments": arguments},
+                allowed_next_tools=("list_inventory", "locate_sources"),
+                recommended_next_actions=(
+                    _recommend("list_inventory", {}, "Refresh observed source ids and paths."),
+                ),
+            )
+        table = str(arguments.get("table") or "").strip() or None
+        limit = int(arguments.get("limit") or 5)
+
+        if source.data_form == "csv_records":
+            frame = pd.read_csv(source.path, dtype=object, nrows=max(limit, 1))
+            payload = {
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "data_form": source.data_form,
+                "columns": [str(column) for column in frame.columns],
+                "sample": _sample_dataframe(frame, limit=limit),
+            }
+            summary = f"CSV source {source.virtual_path} has {len(frame.columns)} observed column(s)."
+            return state.add_evidence(
+                tool_name="inspect_source",
+                ok=True,
+                summary=summary,
+                payload=payload,
+                source_id=source.id,
+                data_form=source.data_form,
+                allowed_next_tools=("bind", "sample_records", "search_values"),
+            )
+
+        if source.data_form == "json_records":
+            payload_raw = json.loads(source.path.read_text(encoding="utf-8", errors="replace"))
+            frame = pd.json_normalize(_json_records(payload_raw))
+            payload = {
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "data_form": source.data_form,
+                "columns": [str(column) for column in frame.columns],
+                "sample": _sample_dataframe(frame, limit=limit),
+            }
+            return state.add_evidence(
+                tool_name="inspect_source",
+                ok=True,
+                summary=f"JSON source {source.virtual_path} has {len(frame.columns)} observed key path(s).",
+                payload=payload,
+                source_id=source.id,
+                data_form=source.data_form,
+                allowed_next_tools=("bind", "sample_records", "search_values"),
+            )
+
+        if source.data_form == "sqlite_database":
+            uri = f"file:{source.path.resolve().as_posix()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                if table is None and len(source.tables) == 1:
+                    table = source.tables[0]
+                if table is None:
+                    payload = {
+                        "source_id": source.id,
+                        "path": source.virtual_path,
+                        "data_form": source.data_form,
+                        "tables": list(source.tables),
+                    }
+                    return state.add_evidence(
+                        tool_name="inspect_source",
+                        ok=True,
+                        summary=f"SQLite source {source.virtual_path} has {len(source.tables)} table(s).",
+                        payload=payload,
+                        source_id=source.id,
+                        data_form=source.data_form,
+                        allowed_next_tools=("inspect_source", "locate_sources"),
+                    )
+                if table not in source.tables:
+                    return state.add_evidence(
+                        tool_name="inspect_source",
+                        ok=False,
+                        summary=f"SQLite table {table} was not observed in {source.virtual_path}.",
+                        payload={"source_id": source.id, "table": table, "tables": list(source.tables)},
+                        source_id=source.id,
+                        data_form=source.data_form,
+                        negative_scope=_source_negative_scope(
+                            kind="missing_table",
+                            source=source,
+                            table=table,
+                            observed_tables=list(source.tables),
+                        ),
+                        allowed_next_tools=("inspect_source", "locate_sources", "sample_records"),
+                        recommended_next_actions=(
+                            _recommend(
+                                "inspect_source",
+                                {"source_ref": source.id},
+                                "Inspect available tables before choosing a different table.",
+                            ),
+                            _recommend(
+                                "locate_sources",
+                                {"query": table or ""},
+                                "Search other observed sources for the requested logical name.",
+                            ),
+                        ),
+                    )
+                schema_rows = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+                sample_rows = connection.execute(f'SELECT * FROM "{table}" LIMIT ?', (limit,)).fetchall()
+                columns = [str(row[1]) for row in schema_rows]
+                sample = [dict(zip(columns, row, strict=False)) for row in sample_rows]
+            return state.add_evidence(
+                tool_name="inspect_source",
+                ok=True,
+                summary=f"SQLite table {table} has {len(columns)} observed column(s).",
+                payload={
+                    "source_id": source.id,
+                    "path": source.virtual_path,
+                    "data_form": source.data_form,
+                    "table": table,
+                    "columns": columns,
+                    "schema": [
+                        {"name": str(row[1]), "type": str(row[2]), "notnull": bool(row[3])}
+                        for row in schema_rows
+                    ],
+                    "sample": sample,
+                },
+                source_id=source.id,
+                data_form=source.data_form,
+                allowed_next_tools=("bind", "sample_records", "search_values"),
+            )
+
+        if source.data_form in {"pdf_document", "markdown_document"}:
+            return state.add_evidence(
+                tool_name="inspect_source",
+                ok=True,
+                summary=f"{source.data_form} source observed. Use read_document_window for text evidence.",
+                payload={
+                    "source_id": source.id,
+                    "path": source.virtual_path,
+                    "data_form": source.data_form,
+                    "size_bytes": source.size_bytes,
+                },
+                source_id=source.id,
+                data_form=source.data_form,
+                allowed_next_tools=("profile_document", "search_document", "read_document_window"),
+            )
+
+        if source.data_form == "video":
+            return self._inspect_video(state, {"source_ref": source.id})
+
+        return state.add_evidence(
+            tool_name="inspect_source",
+            ok=False,
+            summary=f"Unsupported source data form: {source.data_form}.",
+            payload={"source_id": source.id, "path": source.virtual_path, "data_form": source.data_form},
+            source_id=source.id,
+            data_form=source.data_form,
+            negative_scope=_source_negative_scope(kind="unsupported_data_form", source=source),
+            allowed_next_tools=("locate_sources", "blocked"),
+        )
+
+    def _sample_records(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        arguments = dict(arguments)
+        arguments.setdefault("limit", 10)
+        evidence = self._inspect_source(state, arguments)
+        if evidence.ok and evidence.payload.get("sample") is not None:
+            return state.add_evidence(
+                tool_name="sample_records",
+                ok=True,
+                summary=f"Sampled records from {evidence.payload.get('path')}.",
+                payload=evidence.payload,
+                source_id=evidence.source_id,
+                data_form=evidence.data_form,
+            )
+        return evidence
+
+    def _search_values(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        value = str(
+            arguments.get("value")
+            or arguments.get("query")
+            or arguments.get("search_pattern")
+            or arguments.get("value_pattern")
+            or ""
+        ).strip()
+        if not value:
+            return state.add_evidence(
+                tool_name="search_values",
+                ok=False,
+                summary="search_values requires a literal value/query.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "invalid_tool_arguments", "tool": "search_values", "missing": "value"},
+                allowed_next_tools=("sample_records", "inspect_source", "blocked"),
+            )
+        scoped = _source_from_args(state, arguments)
+        sources = [scoped] if scoped is not None else list(state.sources.values())
+        limit = int(arguments.get("limit") or 20)
+        hits: list[dict[str, Any]] = []
+        needle = value.casefold()
+
+        for source in sources:
+            if len(hits) >= limit:
+                break
+            try:
+                if source.data_form == "csv_records":
+                    frame = pd.read_csv(source.path, dtype=str).fillna("")
+                    mask = frame.apply(lambda column: column.str.casefold().str.contains(needle, regex=False))
+                    for row_index in mask.any(axis=1)[mask.any(axis=1)].index[: limit - len(hits)]:
+                        hits.append(
+                            {
+                                "source_id": source.id,
+                                "path": source.virtual_path,
+                                "row_index": int(row_index),
+                                "record": frame.iloc[row_index].to_dict(),
+                            }
+                        )
+                elif source.data_form == "json_records":
+                    payload = json.loads(source.path.read_text(encoding="utf-8", errors="replace"))
+                    frame = pd.json_normalize(_json_records(payload)).astype(str)
+                    mask = frame.apply(lambda column: column.str.casefold().str.contains(needle, regex=False))
+                    for row_index in mask.any(axis=1)[mask.any(axis=1)].index[: limit - len(hits)]:
+                        hits.append(
+                            {
+                                "source_id": source.id,
+                                "path": source.virtual_path,
+                                "row_index": int(row_index),
+                                "record": frame.iloc[row_index].to_dict(),
+                            }
+                        )
+                elif source.data_form == "sqlite_database":
+                    uri = f"file:{source.path.resolve().as_posix()}?mode=ro"
+                    with closing(sqlite3.connect(uri, uri=True)) as connection:
+                        for table in source.tables:
+                            schema_rows = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+                            columns = [str(row[1]) for row in schema_rows]
+                            for column in columns:
+                                rows = connection.execute(
+                                    f'SELECT * FROM "{table}" WHERE CAST("{column}" AS TEXT) LIKE ? LIMIT ?',
+                                    (f"%{value}%", max(1, limit - len(hits))),
+                                ).fetchall()
+                                for row in rows:
+                                    hits.append(
+                                        {
+                                            "source_id": source.id,
+                                            "path": source.virtual_path,
+                                            "table": table,
+                                            "matched_column": column,
+                                            "record": dict(zip(columns, row, strict=False)),
+                                        }
+                                    )
+                                    if len(hits) >= limit:
+                                        break
+                                if len(hits) >= limit:
+                                    break
+                            if len(hits) >= limit:
+                                break
+                elif source.data_form in {"pdf_document", "markdown_document"}:
+                    for line in _document_lines(source):
+                        if needle in str(line["text"]).casefold():
+                            hits.append(
+                                {
+                                    "source_id": source.id,
+                                    "path": source.virtual_path,
+                                    "page": line["page"],
+                                    "line": line["line"],
+                                    "text": line["text"],
+                                }
+                            )
+                            if len(hits) >= limit:
+                                break
+            except Exception as exc:  # noqa: BLE001 - value search should keep scanning other sources
+                hits.append(
+                    {
+                        "source_id": source.id,
+                        "path": source.virtual_path,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+        related_values = _co_occurring_scalar_values(hits, original_value=value)
+        related_candidates = []
+        for item in related_values[:40]:
+            candidate = state.add_candidate(
+                kind="value_candidate",
+                source_id=str(item.get("source_id") or "") or None,
+                data_form=state.sources[str(item.get("source_id"))].data_form
+                if str(item.get("source_id")) in state.sources
+                else "unknown_file",
+                match_reason="co_occurring_with_value_hit",
+                path=str(item.get("path") or "") or None,
+                table=str(item.get("table") or "") or None,
+                field=str(item.get("field") or "") or None,
+                value=item.get("value"),
+            )
+            related_candidates.append({**candidate.to_dict(), "support_count": item["support_count"]})
+        related_recommendations = tuple(
+            _recommend(
+                "search_values",
+                {"value": str(item["value"]), "limit": 50},
+                "Verify a co-occurring value from an observed hit record in other candidate sources.",
+            )
+            for item in related_values[:5]
+        )
+
+        return state.add_evidence(
+            tool_name="search_values",
+            ok=True,
+            summary=f"Found {len(hits)} value hit(s) for query.",
+            payload={
+                "value": value,
+                "hits": hits,
+                "co_occurring_value_candidates": related_candidates,
+            },
+            negative_scope=(
+                {"kind": "value_not_found", "value": value, "source_id": scoped.id if scoped else None}
+                if not hits
+                else None
+            ),
+            allowed_next_tools=(
+                "inspect_source",
+                "sample_records",
+                "search_values",
+                "verify_alignment",
+                "bind",
+                "locate_sources",
+            ),
+            recommended_next_actions=(
+                _recommend(
+                    "locate_sources",
+                    {"query": value},
+                    "If no value hit was found, search alternative observed sources.",
+                ),
+            )
+            if not hits
+            else related_recommendations,
+        )
+
+    def _read_document_window(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        if source is None:
+            return state.add_evidence(
+                tool_name="read_document_window",
+                ok=False,
+                summary="No observed source matched read_document_window arguments.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "read_document_window", "arguments": arguments},
+                allowed_next_tools=("list_inventory", "locate_sources"),
+            )
+        if source.data_form not in {"pdf_document", "markdown_document"}:
+            return state.add_evidence(
+                tool_name="read_document_window",
+                ok=False,
+                summary=f"{source.data_form} is not a readable document window source.",
+                payload={"source_id": source.id, "data_form": source.data_form},
+                source_id=source.id,
+                data_form=source.data_form,
+                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
+                allowed_next_tools=("inspect_source", "sample_records", "search_values"),
+            )
+        query = str(arguments.get("query") or "").strip()
+        window_lines = max(3, min(int(arguments.get("window_lines") or 12), 80))
+        lines = _document_lines(source)
+        start_line = arguments.get("start_line")
+        end_line = arguments.get("end_line")
+        if isinstance(start_line, int) and start_line > 0:
+            start = max(0, start_line - 1)
+            if isinstance(end_line, int) and end_line >= start_line:
+                end = min(len(lines), end_line)
+            else:
+                end = min(len(lines), start + window_lines)
+        else:
+            query_terms = _terms(query)
+            matched_index = 0
+            if query_terms:
+                for index, line in enumerate(lines):
+                    text = str(line["text"]).casefold()
+                    if any(term in text for term in query_terms):
+                        matched_index = index
+                        break
+            start = max(0, matched_index - window_lines // 2)
+            end = min(len(lines), start + window_lines)
+        window = lines[start:end]
+        text = "\n".join(
+            f"[page={item['page']} line={item['line']}] {item['text']}" for item in window
+        )
+        if len(text) > 12_000:
+            text = text[:11_900] + "\n...[truncated]"
+        return state.add_evidence(
+            tool_name="read_document_window",
+            ok=True,
+            summary=f"Read {len(window)} bounded document line(s) from {source.virtual_path}.",
+            payload={
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "data_form": source.data_form,
+                "query": query,
+                "start_line": window[0]["line"] if window else None,
+                "end_line": window[-1]["line"] if window else None,
+                "window": window,
+                "text": text,
+            },
+            source_id=source.id,
+            data_form=source.data_form,
+            negative_scope=(
+                _source_negative_scope(kind="document_window_empty", source=source, query=query)
+                if not window
+                else None
+            ),
+            allowed_next_tools=("extract_records", "search_document", "profile_document", "blocked"),
+        )
+
+    def _profile_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        if source is None:
+            return state.add_evidence(
+                tool_name="profile_document",
+                ok=False,
+                summary="No observed source matched profile_document arguments.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "profile_document", "arguments": arguments},
+                allowed_next_tools=("list_inventory", "locate_sources"),
+            )
+        if source.data_form not in {"pdf_document", "markdown_document"}:
+            return state.add_evidence(
+                tool_name="profile_document",
+                ok=False,
+                summary=f"{source.data_form} is not a document source.",
+                payload={"source_id": source.id, "data_form": source.data_form},
+                source_id=source.id,
+                data_form=source.data_form,
+                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
+                allowed_next_tools=("inspect_source", "sample_records"),
+            )
+        lines = _document_lines(source)
+        headings: list[dict[str, Any]] = []
+        table_like_blocks: list[dict[str, Any]] = []
+        list_like_blocks: list[dict[str, Any]] = []
+        current_table: list[dict[str, Any]] = []
+        current_list: list[dict[str, Any]] = []
+        for item in lines:
+            text = str(item["text"]).strip()
+            if source.data_form == "markdown_document" and text.startswith("#"):
+                headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
+            elif text and len(text) <= 120 and re.match(r"^(\d+[\.)]\s+|[A-Z][\w\s]{2,}:$)", text):
+                headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
+
+            is_table_line = "|" in text or text.count("\t") >= 2
+            if is_table_line:
+                current_table.append(item)
+            elif current_table:
+                if len(current_table) >= 2:
+                    table_like_blocks.append(
+                        {
+                            "start_line": current_table[0]["line"],
+                            "end_line": current_table[-1]["line"],
+                            "line_count": len(current_table),
+                        }
+                    )
+                current_table = []
+
+            is_list_line = bool(re.match(r"^(\s*[-*]\s+|\s*\d+[\.)]\s+)", text))
+            if is_list_line:
+                current_list.append(item)
+            elif current_list:
+                if len(current_list) >= 2:
+                    list_like_blocks.append(
+                        {
+                            "start_line": current_list[0]["line"],
+                            "end_line": current_list[-1]["line"],
+                            "line_count": len(current_list),
+                        }
+                    )
+                current_list = []
+        if len(current_table) >= 2:
+            table_like_blocks.append(
+                {
+                    "start_line": current_table[0]["line"],
+                    "end_line": current_table[-1]["line"],
+                    "line_count": len(current_table),
+                }
+            )
+        if len(current_list) >= 2:
+            list_like_blocks.append(
+                {
+                    "start_line": current_list[0]["line"],
+                    "end_line": current_list[-1]["line"],
+                    "line_count": len(current_list),
+                }
+            )
+        pages = sorted({item["page"] for item in lines if item["page"] is not None})
+        return state.add_evidence(
+            tool_name="profile_document",
+            ok=True,
+            summary=f"Profiled {source.virtual_path}: {len(lines)} line(s).",
+            payload={
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "data_form": source.data_form,
+                "line_count": len(lines),
+                "page_count": len(pages) if pages else None,
+                "line_start": lines[0]["line"] if lines else None,
+                "line_end": lines[-1]["line"] if lines else None,
+                "headings": headings[:80],
+                "table_like_blocks": table_like_blocks[:40],
+                "list_like_blocks": list_like_blocks[:40],
+            },
+            source_id=source.id,
+            data_form=source.data_form,
+            negative_scope=(
+                _source_negative_scope(kind="empty_document", source=source)
+                if not lines
+                else None
+            ),
+            allowed_next_tools=("search_document", "read_document_window", "extract_records"),
+        )
+
+    def _search_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        query = str(arguments.get("query") or "").strip()
+        if source is None:
+            return state.add_evidence(
+                tool_name="search_document",
+                ok=False,
+                summary="No observed source matched search_document arguments.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "search_document", "arguments": arguments},
+                allowed_next_tools=("list_inventory", "locate_sources"),
+            )
+        if source.data_form not in {"pdf_document", "markdown_document"}:
+            return state.add_evidence(
+                tool_name="search_document",
+                ok=False,
+                summary=f"{source.data_form} is not a document source.",
+                payload={"source_id": source.id, "data_form": source.data_form},
+                source_id=source.id,
+                data_form=source.data_form,
+                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
+                allowed_next_tools=("inspect_source", "sample_records"),
+            )
+        if not query:
+            return state.add_evidence(
+                tool_name="search_document",
+                ok=False,
+                summary="search_document requires a query.",
+                payload={"arguments": arguments},
+                source_id=source.id,
+                data_form=source.data_form,
+                negative_scope=_source_negative_scope(kind="invalid_tool_arguments", source=source, missing="query"),
+                allowed_next_tools=("profile_document", "read_document_window"),
+            )
+        lines = _document_lines(source)
+        terms = _terms(query)
+        limit = max(1, min(int(arguments.get("limit") or 8), 20))
+        window_lines = max(3, min(int(arguments.get("window_lines") or 10), 80))
+        matches: list[dict[str, Any]] = []
+        seen_starts: set[int] = set()
+        for index, line in enumerate(lines):
+            text = str(line["text"]).casefold()
+            if not any(term in text for term in terms):
+                continue
+            start = max(0, index - window_lines // 2)
+            if start in seen_starts:
+                continue
+            seen_starts.add(start)
+            end = min(len(lines), start + window_lines)
+            window = lines[start:end]
+            matches.append(
+                {
+                    "start_line": window[0]["line"] if window else None,
+                    "end_line": window[-1]["line"] if window else None,
+                    "page_start": window[0]["page"] if window else None,
+                    "page_end": window[-1]["page"] if window else None,
+                    "text": "\n".join(
+                        f"[page={item['page']} line={item['line']}] {item['text']}"
+                        for item in window
+                    )[:8_000],
+                }
+            )
+            if len(matches) >= limit:
+                break
+        return state.add_evidence(
+            tool_name="search_document",
+            ok=True,
+            summary=f"Found {len(matches)} document window candidate(s).",
+            payload={
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "query": query,
+                "windows": matches,
+            },
+            source_id=source.id,
+            data_form=source.data_form,
+            negative_scope=(
+                _source_negative_scope(kind="document_query_not_found", source=source, query=query)
+                if not matches
+                else None
+            ),
+            allowed_next_tools=("read_document_window", "extract_records", "profile_document", "locate_sources"),
+        )
+
+    def _extract_records(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        evidence_refs = [
+            str(item) for item in arguments.get("evidence_refs", []) if str(item).strip()
+        ]
+        spec = arguments.get("spec") if isinstance(arguments.get("spec"), dict) else arguments
+        source_text_parts: list[str] = []
+        source_id = None
+        data_form = None
+        for evidence_ref in evidence_refs:
+            evidence = state.evidence.get(evidence_ref)
+            if evidence is None:
+                continue
+            source_id = source_id or evidence.source_id
+            data_form = data_form or evidence.data_form
+            if isinstance(evidence.payload.get("text"), str):
+                source_text_parts.append(str(evidence.payload["text"]))
+            windows = evidence.payload.get("windows")
+            if isinstance(windows, list):
+                source_text_parts.extend(
+                    str(window.get("text") or "")
+                    for window in windows
+                    if isinstance(window, dict)
+                )
+        source_text = "\n".join(part for part in source_text_parts if part)
+        if not evidence_refs or not source_text:
+            return state.add_evidence(
+                tool_name="extract_records",
+                ok=False,
+                summary="extract_records requires cited document window/search evidence with text.",
+                payload={"evidence_refs": evidence_refs, "spec": spec},
+                source_id=source_id,
+                data_form=data_form,
+                negative_scope={
+                    "kind": "missing_document_window_evidence",
+                    "evidence_refs": evidence_refs,
+                },
+                allowed_next_tools=("profile_document", "search_document", "read_document_window"),
+            )
+        records: list[dict[str, Any]] = []
+
+        provided = spec.get("records") if isinstance(spec, dict) else None
+        if isinstance(provided, list):
+            for item in provided:
+                if isinstance(item, dict):
+                    records.append(dict(item))
+
+        regex = spec.get("regex") if isinstance(spec, dict) else None
+        if regex and source_text:
+            flags = re.MULTILINE | re.DOTALL if bool(spec.get("dotall")) else re.MULTILINE
+            try:
+                pattern = re.compile(str(regex), flags)
+            except re.error as exc:
+                return state.add_evidence(
+                    tool_name="extract_records",
+                    ok=False,
+                    summary=f"Invalid extraction regex: {exc}.",
+                    payload={"error": "invalid_regex", "regex": regex},
+                    source_id=source_id,
+                    data_form=data_form,
+                    negative_scope={"kind": "invalid_extraction_spec", "error": str(exc)},
+                    allowed_next_tools=("extract_records", "read_document_window"),
+                )
+            for match in pattern.finditer(source_text):
+                if match.groupdict():
+                    record = dict(match.groupdict())
+                else:
+                    fields = [str(field) for field in spec.get("fields", [])]
+                    values = list(match.groups())
+                    record = dict(zip(fields, values, strict=False)) if fields else {"match": match.group(0)}
+                record.setdefault("provenance", {"evidence_refs": evidence_refs, "span": match.span()})
+                records.append(record)
+
+        normalized_source_text = re.sub(r"\s+", "", source_text.casefold())
+        unsupported_values: list[str] = []
+        for record in records:
+            flat_values = [
+                str(value)
+                for key, value in record.items()
+                if key != "provenance" and value is not None and str(value).strip()
+            ]
+            for value in flat_values:
+                compact = re.sub(r"\s+", "", value.casefold())
+                if compact and source_text and compact not in normalized_source_text:
+                    unsupported_values.append(value)
+        if unsupported_values:
+            return state.add_evidence(
+                tool_name="extract_records",
+                ok=False,
+                summary="Extraction spec produced values not present in cited document evidence.",
+                payload={
+                    "error": "unsupported_extracted_values",
+                    "unsupported_values": unsupported_values[:20],
+                    "evidence_refs": evidence_refs,
+                },
+                source_id=source_id,
+                data_form=data_form,
+                negative_scope={
+                    "kind": "unsupported_extracted_values",
+                    "evidence_refs": evidence_refs,
+                    "unsupported_values": unsupported_values[:20],
+                },
+                allowed_next_tools=("read_document_window", "search_document", "blocked"),
+            )
+
+        if not records:
+            return state.add_evidence(
+                tool_name="extract_records",
+                ok=False,
+                summary="Extraction spec did not produce a record set.",
+                payload={"spec": spec, "evidence_refs": evidence_refs},
+                source_id=source_id,
+                data_form=data_form,
+                negative_scope={
+                    "kind": "document_record_set_not_found",
+                    "evidence_refs": evidence_refs,
+                },
+                allowed_next_tools=("search_document", "read_document_window", "profile_document", "blocked"),
+            )
+        return state.add_evidence(
+            tool_name="extract_records",
+            ok=True,
+            summary=f"Extracted {len(records)} provenance-backed record(s).",
+            payload={"records": records, "evidence_refs": evidence_refs, "spec": spec},
+            source_id=source_id,
+            data_form=data_form,
+            allowed_next_tools=("bind", "read_document_window", "search_document"),
+        )
+
+    def _track_requirements(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        raw_requirements = arguments.get("requirements")
+        if not isinstance(raw_requirements, list) or not raw_requirements:
+            return state.add_evidence(
+                tool_name="track_requirements",
+                ok=False,
+                summary="track_requirements requires at least one requirement item.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "invalid_tool_arguments", "tool": "track_requirements"},
+                allowed_next_tools=("track_requirements", "retrieve_knowledge", "locate_sources"),
+            )
+
+        upserted = []
+        invalid_refs: list[dict[str, Any]] = []
+        valid_statuses = {"pending", "satisfied", "not_applicable", "conflict", "blocked"}
+        for raw in raw_requirements:
+            if not isinstance(raw, dict):
+                invalid_refs.append({"item": raw, "error": "requirement_item_not_object"})
+                continue
+            text = str(raw.get("text") or "").strip()
+            if not text:
+                invalid_refs.append({"item": raw, "error": "missing_text"})
+                continue
+            requirement_id = str(raw.get("id") or "").strip() or None
+            status = str(raw.get("status") or "pending").strip()
+            if status not in valid_statuses:
+                invalid_refs.append({"item": raw, "error": f"invalid_status:{status}"})
+                continue
+            source_refs = _string_list(raw.get("source_refs"))
+            evidence_refs = _string_list(raw.get("evidence_refs"))
+            binding_refs = _string_list(raw.get("binding_refs"))
+            compute_refs = _string_list(raw.get("compute_refs"))
+
+            known_section_ids = {section.id for section in state.knowledge_sections}
+            unknown_sources = [
+                ref for ref in source_refs
+                if (
+                    (ref.startswith("src_") and ref not in state.sources)
+                    or (ref.startswith("sec_") and ref not in known_section_ids)
+                )
+            ]
+            unknown_evidence = [ref for ref in evidence_refs if ref not in state.evidence]
+            unknown_bindings = [ref for ref in binding_refs if ref not in state.bindings]
+            unknown_computes = [ref for ref in compute_refs if ref not in state.compute_results]
+            if unknown_sources or unknown_evidence or unknown_bindings or unknown_computes:
+                invalid_refs.append(
+                    {
+                        "requirement_id": requirement_id,
+                        "text": text,
+                        "unknown_sources": unknown_sources,
+                        "unknown_evidence": unknown_evidence,
+                        "unknown_bindings": unknown_bindings,
+                        "unknown_computes": unknown_computes,
+                    }
+                )
+                continue
+            if status == "satisfied" and not (evidence_refs or binding_refs or compute_refs):
+                invalid_refs.append(
+                    {
+                        "requirement_id": requirement_id,
+                        "text": text,
+                        "error": "satisfied_requirement_needs_lineage",
+                    }
+                )
+                continue
+
+            requirement = state.upsert_requirement(
+                requirement_id=requirement_id,
+                text=text,
+                status=status,
+                source_refs=source_refs,
+                evidence_refs=evidence_refs,
+                binding_refs=binding_refs,
+                compute_refs=compute_refs,
+                note=str(raw.get("note") or ""),
+            )
+            upserted.append(requirement.to_dict())
+
+        if invalid_refs:
+            return state.add_evidence(
+                tool_name="track_requirements",
+                ok=False,
+                summary="track_requirements rejected invalid requirement items or references.",
+                payload={
+                    "updated_requirements": upserted,
+                    "invalid_items": invalid_refs,
+                    "requirements": [item.to_dict() for item in state.requirements.values()],
+                },
+                negative_scope={
+                    "kind": "invalid_requirement_update",
+                    "invalid_count": len(invalid_refs),
+                },
+                allowed_next_tools=("track_requirements", "retrieve_knowledge", "locate_sources"),
+            )
+
+        return state.add_evidence(
+            tool_name="track_requirements",
+            ok=True,
+            summary=f"Updated {len(upserted)} requirement(s).",
+            payload={
+                "updated_requirements": upserted,
+                "requirements": [item.to_dict() for item in state.requirements.values()],
+            },
+            allowed_next_tools=(
+                "retrieve_knowledge",
+                "locate_sources",
+                "inspect_source",
+                "search_document",
+                "verify_alignment",
+                "bind",
+                "run_verified_compute",
+                "submit_final",
+                "blocked",
+            ),
+        )
+
+    def _verify_alignment(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        decision = str(arguments.get("decision") or "").strip()
+        target_kind = str(arguments.get("target_kind") or "").strip()
+        alignment = str(arguments.get("alignment") or "").strip()
+        evidence_refs = _string_list(arguments.get("evidence_refs"))
+        binding_refs = _string_list(arguments.get("binding_refs"))
+        compute_refs = _string_list(arguments.get("compute_refs"))
+        requirement_refs = _string_list(arguments.get("requirement_refs"))
+        knowledge_section_ids = _string_list(arguments.get("knowledge_section_ids"))
+        target_refs = _string_list(arguments.get("target_refs"))
+        limitations = str(arguments.get("limitations") or "").strip()
+        next_actions = arguments.get("next_actions")
+        if not isinstance(next_actions, list):
+            next_actions = []
+
+        evidence_refs = tuple(
+            dict.fromkeys(
+                [
+                    *evidence_refs,
+                    *(ref for ref in target_refs if ref in state.evidence),
+                ]
+            )
+        )
+        binding_refs = tuple(
+            dict.fromkeys(
+                [
+                    *binding_refs,
+                    *(ref for ref in target_refs if ref in state.bindings),
+                ]
+            )
+        )
+        compute_refs = tuple(
+            dict.fromkeys(
+                [
+                    *compute_refs,
+                    *(ref for ref in target_refs if ref in state.compute_results),
+                ]
+            )
+        )
+        requirement_refs = tuple(
+            dict.fromkeys(
+                [
+                    *requirement_refs,
+                    *(ref for ref in target_refs if ref in state.requirements),
+                ]
+            )
+        )
+        knowledge_section_ids = tuple(
+            dict.fromkeys(
+                [
+                    *knowledge_section_ids,
+                    *(
+                        ref
+                        for ref in target_refs
+                        if any(section.id == ref for section in state.knowledge_sections)
+                    ),
+                ]
+            )
+        )
+        if decision in {"bindable", "candidate_answer"} and not evidence_refs:
+            source_refs = tuple(ref for ref in target_refs if ref in state.sources)
+            if source_refs:
+                evidence_refs = _source_evidence_refs(state, source_refs)
+
+        valid_decisions = {
+            "bindable",
+            "candidate_answer",
+            "intermediate",
+            "not_applicable",
+            "needs_more_evidence",
+            "conflict",
+            "blocked_ok",
+        }
+        valid_target_kinds = {
+            "source",
+            "field",
+            "document_window",
+            "document_record_set",
+            "compute_result",
+            "direct_evidence",
+            "alternative_source",
+            "requirement",
+            "blocked",
+            "final_answer",
+        }
+        invalid: list[str] = []
+        if decision not in valid_decisions:
+            invalid.append(f"invalid_decision:{decision}")
+        if target_kind not in valid_target_kinds:
+            invalid.append(f"invalid_target_kind:{target_kind}")
+        if not alignment:
+            invalid.append("missing_alignment")
+
+        unknown_evidence = [ref for ref in evidence_refs if ref not in state.evidence]
+        unknown_bindings = [ref for ref in binding_refs if ref not in state.bindings]
+        unknown_computes = [ref for ref in compute_refs if ref not in state.compute_results]
+        unknown_requirements = [ref for ref in requirement_refs if ref not in state.requirements]
+        unknown_sections = [
+            ref for ref in knowledge_section_ids
+            if not any(section.id == ref for section in state.knowledge_sections)
+        ]
+        if unknown_evidence:
+            invalid.append("unknown_evidence:" + ",".join(unknown_evidence))
+        if unknown_bindings:
+            invalid.append("unknown_bindings:" + ",".join(unknown_bindings))
+        if unknown_computes:
+            invalid.append("unknown_computes:" + ",".join(unknown_computes))
+        if unknown_requirements:
+            invalid.append("unknown_requirements:" + ",".join(unknown_requirements))
+        if unknown_sections:
+            invalid.append("unknown_knowledge_sections:" + ",".join(unknown_sections))
+
+        failed_evidence = [
+            ref for ref in evidence_refs
+            if ref in state.evidence and not state.evidence[ref].ok
+        ]
+        failed_computes = [
+            ref for ref in compute_refs
+            if ref in state.compute_results and not state.compute_results[ref].ok
+        ]
+        if decision in {"bindable", "candidate_answer"}:
+            if not (evidence_refs or binding_refs or compute_refs):
+                invalid.append("positive_verification_needs_lineage")
+            if failed_evidence:
+                invalid.append("positive_verification_cites_failed_evidence:" + ",".join(failed_evidence))
+            if failed_computes:
+                invalid.append("positive_verification_cites_failed_compute:" + ",".join(failed_computes))
+        if decision == "candidate_answer":
+            empty_computes = [
+                ref for ref in compute_refs
+                if ref in state.compute_results and not state.compute_results[ref].rows
+            ]
+            if empty_computes:
+                invalid.append("candidate_answer_cites_empty_compute:" + ",".join(empty_computes))
+        if decision == "blocked_ok" and not (evidence_refs or limitations or state.negative_scopes):
+            invalid.append("blocked_ok_needs_evidence_limitations_or_negative_scope")
+
+        recommended_actions = [
+            action for action in next_actions if isinstance(action, dict)
+        ][:8]
+        if decision == "candidate_answer" and compute_refs:
+            recommended_actions.append(
+                _recommend(
+                    "submit_final",
+                    {"compute_ref": compute_refs[0]},
+                    "Submit this verified compute candidate if it is the final requested answer.",
+                )
+            )
+        elif decision == "candidate_answer" and binding_refs:
+            binding = state.bindings.get(binding_refs[0])
+            recommended_actions.append(
+                _recommend(
+                    "submit_final",
+                    {
+                        "binding_refs": [binding_refs[0]],
+                        "evidence_refs": list(binding.evidence_refs) if binding else list(evidence_refs),
+                        "answer": {},
+                    },
+                    "Submit a direct answer table only if the verified binding fully supports the answer.",
+                )
+            )
+        elif decision == "bindable" and evidence_refs:
+            recommended_actions.append(
+                _recommend(
+                    "bind",
+                    {"evidence_refs": list(evidence_refs), "alignment": alignment},
+                    "Create a binding with the appropriate generic binding_type if this evidence is ready to execute or finalize.",
+                )
+            )
+        elif decision in {"intermediate", "needs_more_evidence"}:
+            if target_kind in {"document_window", "direct_evidence"} and evidence_refs:
+                recommended_actions.append(
+                    _recommend(
+                        "extract_records",
+                        {"evidence_refs": list(evidence_refs), "spec": {}},
+                        "If the cited document windows contain repeated records, provide a generic extraction spec and extract provenance-backed records.",
+                    )
+                )
+            if requirement_refs:
+                recommended_actions.append(
+                    _recommend(
+                        "track_requirements",
+                        {
+                            "requirements": [
+                                {
+                                    "id": ref,
+                                    "text": state.requirements[ref].text,
+                                    "status": "pending",
+                                    "note": limitations or alignment,
+                                }
+                                for ref in requirement_refs
+                                if ref in state.requirements
+                            ]
+                        },
+                        "Keep unresolved requirements explicit before gathering more evidence.",
+                    )
+                )
+            recommended_actions.append(
+                _recommend(
+                    "locate_sources",
+                    {"query": state.question},
+                    "Search for alternative observed sources when current evidence is only intermediate.",
+                )
+            )
+        elif decision == "blocked_ok":
+            recommended_actions.append(
+                _recommend(
+                    "blocked",
+                    {"reason": alignment, "evidence_refs": list(evidence_refs)},
+                    "Stop with cited evidence if no valid evidence path remains.",
+                )
+            )
+        elif decision in {"not_applicable", "conflict"}:
+            recommended_actions.append(
+                _recommend(
+                    "locate_sources",
+                    {"query": state.question},
+                    "Switch to alternative sources or evidence after rejecting this target.",
+                )
+            )
+
+        payload = {
+            "decision": decision,
+            "target_kind": target_kind,
+            "target_refs": list(target_refs),
+            "requirement_refs": list(requirement_refs),
+            "knowledge_section_ids": list(knowledge_section_ids),
+            "evidence_refs": list(evidence_refs),
+            "binding_refs": list(binding_refs),
+            "compute_refs": list(compute_refs),
+            "alignment": alignment,
+            "limitations": limitations,
+            "next_actions": recommended_actions,
+        }
+        if invalid:
+            return state.add_evidence(
+                tool_name="verify_alignment",
+                ok=False,
+                summary="Verifier decision rejected: " + "; ".join(invalid),
+                payload={**payload, "invalid": invalid},
+                negative_scope={
+                    "kind": "invalid_verifier_decision",
+                    "decision": decision,
+                    "target_kind": target_kind,
+                    "invalid": invalid,
+                },
+                allowed_next_tools=("verify_alignment", "track_requirements", "inspect_relation", "blocked"),
+            )
+
+        negative_scope = None
+        if decision in {"not_applicable", "conflict", "blocked_ok"}:
+            negative_scope = {
+                "kind": f"verifier_{decision}",
+                "target_kind": target_kind,
+                "target_refs": list(target_refs),
+                "evidence_refs": list(evidence_refs),
+                "binding_refs": list(binding_refs),
+                "compute_refs": list(compute_refs),
+            }
+        return state.add_evidence(
+            tool_name="verify_alignment",
+            ok=True,
+            summary=f"Verifier marked {target_kind} as {decision}.",
+            payload=payload,
+            negative_scope=negative_scope,
+            allowed_next_tools=(
+                "bind",
+                "track_requirements",
+                "inspect_relation",
+                "run_verified_compute",
+                "submit_final",
+                "locate_sources",
+                "search_document",
+                "blocked",
+            ),
+            recommended_next_actions=tuple(recommended_actions[:8]),
+        )
+
+    def _inspect_relation(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        binding_ref = str(arguments.get("binding_ref") or "").strip()
+        relation_name = str(arguments.get("relation_name") or "").strip()
+        limit = max(1, min(int(arguments.get("limit") or 10), 100))
+        binding = None
+        if binding_ref:
+            binding = state.bindings.get(binding_ref)
+        elif relation_name:
+            binding = next(
+                (
+                    item
+                    for item in state.bindings.values()
+                    if item.relation_name == relation_name
+                ),
+                None,
+            )
+        else:
+            relation_bindings = [
+                item for item in state.bindings.values() if item.relation_name
+            ]
+            if len(relation_bindings) == 1:
+                binding = relation_bindings[0]
+        if binding is not None and not binding.relation_name:
+            return state.add_evidence(
+                tool_name="inspect_relation",
+                ok=False,
+                summary=f"Binding {binding.id} is not a compute relation.",
+                payload={"binding": binding.to_dict()},
+                source_id=binding.source_id,
+                negative_scope={"kind": "binding_not_relation", "binding_ref": binding.id},
+                allowed_next_tools=("submit_final", "bind", "run_verified_compute", "blocked"),
+                recommended_next_actions=(
+                    _recommend(
+                        "submit_final",
+                        {
+                            "binding_refs": [binding.id],
+                            "evidence_refs": list(binding.evidence_refs),
+                            "answer": {},
+                        },
+                        "Use direct final only if this non-relation binding fully supports the answer.",
+                    ),
+                ),
+            )
+        if binding is None:
+            return state.add_evidence(
+                tool_name="inspect_relation",
+                ok=False,
+                summary="No verified relation matched inspect_relation arguments.",
+                payload={
+                    "arguments": arguments,
+                    "available_relations": [
+                        {
+                            "binding_ref": item.id,
+                            "relation_name": item.relation_name,
+                            "columns": list(item.allowed_columns),
+                        }
+                        for item in state.bindings.values()
+                        if item.relation_name
+                    ],
+                },
+                negative_scope={"kind": "unknown_relation", "arguments": arguments},
+                allowed_next_tools=("bind", "inspect_source", "extract_records"),
+            )
+        try:
+            frame = load_binding_frame(state, binding)
+        except Exception as exc:  # noqa: BLE001 - relation inspection failure is evidence
+            return state.add_evidence(
+                tool_name="inspect_relation",
+                ok=False,
+                summary=f"Failed to inspect relation {binding.relation_name}: {type(exc).__name__}: {exc}",
+                payload={
+                    "binding": binding.to_dict(),
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                },
+                source_id=binding.source_id,
+                negative_scope={"kind": "relation_inspection_failed", "binding_ref": binding.id},
+                allowed_next_tools=("bind", "inspect_source", "blocked"),
+            )
+        columns = [str(column) for column in frame.columns]
+        sample = _sample_dataframe(frame, limit=limit)
+        return state.add_evidence(
+            tool_name="inspect_relation",
+            ok=True,
+            summary=f"Relation {binding.relation_name} has {len(columns)} column(s) and {len(frame)} row(s).",
+            payload={
+                "binding_ref": binding.id,
+                "relation_name": binding.relation_name,
+                "binding_type": binding.binding_type,
+                "source_id": binding.source_id,
+                "table": binding.table,
+                "columns": columns,
+                "types": {str(column): str(dtype) for column, dtype in frame.dtypes.items()},
+                "row_count": int(len(frame)),
+                "sample": sample,
+            },
+            source_id=binding.source_id,
+            allowed_next_tools=("run_verified_compute", "bind", "blocked"),
+        )
+
+    def _run_verified_compute(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        sql = str(arguments.get("sql") or "").strip()
+        binding_refs = tuple(
+            str(item) for item in arguments.get("binding_refs", []) if str(item).strip()
+        )
+        if not binding_refs:
+            binding_refs = _binding_refs_from_sql_or_args(state, sql=sql, arguments=arguments)
+        if not binding_refs:
+            binding_refs = tuple(state.bindings)
+        if not sql:
+            return state.add_evidence(
+                tool_name="run_verified_compute",
+                ok=False,
+                summary="run_verified_compute requires SQL.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "invalid_tool_arguments", "tool": "run_verified_compute", "missing": "sql"},
+                allowed_next_tools=("inspect_relation", "blocked"),
+            )
+        try:
+            columns, rows, evidence_refs = run_sql_over_bindings(
+                state,
+                sql=sql,
+                binding_refs=binding_refs,
+            )
+        except Exception as exc:  # noqa: BLE001 - compute failures are observations
+            error_type = type(exc).__name__
+            compute_result = state.add_compute_result(
+                sql=sql,
+                columns=(),
+                rows=(),
+                binding_refs=binding_refs,
+                evidence_refs=(),
+                ok=False,
+                error=f"{error_type}: {exc}",
+            )
+            return state.add_evidence(
+                tool_name="run_verified_compute",
+                ok=False,
+                summary=f"Verified compute failed: {compute_result.error}",
+                payload={
+                    "compute_ref": compute_result.id,
+                    "sql_error": {
+                        "type": error_type,
+                        "message": str(exc),
+                        "sql": sql,
+                        "available_relations": [
+                            {
+                                "binding_ref": item.id,
+                            "relation_name": item.relation_name,
+                            "columns": list(item.allowed_columns),
+                        }
+                        for item in state.bindings.values()
+                        if item.relation_name
+                    ],
+                    },
+                    "sql": sql,
+                },
+                negative_scope={
+                    "kind": "sql_error",
+                    "sql": sql,
+                    "error_type": error_type,
+                    "binding_refs": list(binding_refs),
+                },
+                allowed_next_tools=("inspect_relation", "run_verified_compute", "blocked"),
+                recommended_next_actions=(
+                    _recommend(
+                        "inspect_relation",
+                        {"binding_ref": binding_refs[0]} if binding_refs else {},
+                        "Inspect verified relation columns/types before retrying SQL.",
+                    ),
+                ),
+            )
+        compute_result = state.add_compute_result(
+            sql=sql,
+            columns=columns,
+            rows=rows,
+            binding_refs=binding_refs,
+            evidence_refs=evidence_refs,
+        )
+        return state.add_evidence(
+            tool_name="run_verified_compute",
+            ok=True,
+            summary=f"Verified compute produced {len(rows)} row(s) and {len(columns)} column(s).",
+            payload={"compute_ref": compute_result.id, "columns": columns, "rows": rows[:50], "sql": sql},
+            allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation"),
+        )
+
+    def _submit_final(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        compute_ref = str(arguments.get("compute_ref") or "").strip()
+        if compute_ref:
+            compute_result = state.compute_results.get(compute_ref)
+            if compute_result is None or not compute_result.ok:
+                return state.add_evidence(
+                    tool_name="submit_final",
+                    ok=False,
+                    summary="submit_final requires an existing successful compute_ref.",
+                    payload={"compute_ref": compute_ref},
+                    negative_scope={"kind": "invalid_final_compute_ref", "compute_ref": compute_ref},
+                    allowed_next_tools=("run_verified_compute", "inspect_relation", "blocked"),
+                )
+            if not compute_result.rows:
+                return state.add_evidence(
+                    tool_name="submit_final",
+                    ok=False,
+                    summary="submit_final cannot materialize an empty compute result.",
+                    payload={"compute_ref": compute_ref, "columns": list(compute_result.columns)},
+                    negative_scope={"kind": "empty_final_compute_ref", "compute_ref": compute_ref},
+                    allowed_next_tools=("run_verified_compute", "inspect_relation", "blocked"),
+                )
+            state.final_answer = {
+                "columns": list(compute_result.columns),
+                "rows": [list(row) for row in compute_result.rows],
+                "compute_ref": compute_ref,
+            }
+            return state.add_evidence(
+                tool_name="submit_final",
+                ok=True,
+                summary=f"Final answer materialized from {compute_ref}.",
+                payload=state.final_answer,
+            )
+
+        normalized = _answer_table_from_payload(arguments.get("answer"))
+        binding_refs = [
+            str(item) for item in arguments.get("binding_refs", []) if str(item).strip()
+        ]
+        evidence_refs = [
+            str(item) for item in arguments.get("evidence_refs", []) if str(item).strip()
+        ]
+        if normalized is None or not binding_refs or not evidence_refs:
+            return state.add_evidence(
+                tool_name="submit_final",
+                ok=False,
+                summary="Direct submit_final requires answer, binding_refs, and evidence_refs.",
+                payload={
+                    "arguments": arguments,
+                    "required": ["answer", "binding_refs", "evidence_refs"],
+                },
+                negative_scope={"kind": "invalid_direct_final_arguments"},
+                allowed_next_tools=("bind", "run_verified_compute", "blocked"),
+            )
+        unknown_bindings = [ref for ref in binding_refs if ref not in state.bindings]
+        unknown_evidence = [ref for ref in evidence_refs if ref not in state.evidence]
+        failed_evidence = [
+            ref for ref in evidence_refs if ref in state.evidence and not state.evidence[ref].ok
+        ]
+        if unknown_bindings or unknown_evidence or failed_evidence:
+            return state.add_evidence(
+                tool_name="submit_final",
+                ok=False,
+                summary="Direct submit_final references unknown or failed lineage.",
+                payload={
+                    "unknown_bindings": unknown_bindings,
+                    "unknown_evidence": unknown_evidence,
+                    "failed_evidence": failed_evidence,
+                },
+                negative_scope={"kind": "invalid_direct_final_lineage"},
+                allowed_next_tools=("bind", "search_document", "inspect_relation", "blocked"),
+            )
+        columns, rows = normalized
+        state.final_answer = {
+            "columns": columns,
+            "rows": rows,
+            "binding_refs": binding_refs,
+            "evidence_refs": evidence_refs,
+            "alignment": str(arguments.get("alignment") or ""),
+        }
+        return state.add_evidence(
+            tool_name="submit_final",
+            ok=True,
+            summary="Final answer materialized from direct verified evidence.",
+            payload=state.final_answer,
+        )
+
+    def _inspect_video(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        if source is None:
+            return state.add_evidence(
+                tool_name="inspect_video",
+                ok=False,
+                summary="No observed video source matched arguments.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "inspect_video", "arguments": arguments},
+                allowed_next_tools=("list_inventory", "locate_sources"),
+            )
+        return state.add_evidence(
+            tool_name="inspect_video",
+            ok=False,
+            summary="Video source observed, but the v1 video adapter is unsupported.",
+            payload={
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "data_form": source.data_form,
+                "unsupported": True,
+            },
+            source_id=source.id,
+            data_form=source.data_form,
+            negative_scope=_source_negative_scope(kind="video_unsupported_v1", source=source),
+            allowed_next_tools=("locate_sources", "blocked"),
+        )
+
+    def _extract_video_observations(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        return state.add_evidence(
+            tool_name="extract_video_observations",
+            ok=False,
+            summary="Video extraction is an interface placeholder and unsupported in v1.",
+            payload={
+                "source_id": source.id if source else None,
+                "unsupported": True,
+                "needs_video_adapter": True,
+            },
+            source_id=source.id if source else None,
+            data_form=source.data_form if source else "video",
+            negative_scope={
+                "kind": "video_extraction_unsupported_v1",
+                "source_id": source.id if source else None,
+            },
+            allowed_next_tools=("locate_sources", "blocked"),
+        )

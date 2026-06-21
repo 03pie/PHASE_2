@@ -1,1 +1,0 @@
-Read text or PDF documents as line-numbered plain text. Use grep_file first for large documents/PDFs, then read small slices with start_line/max_lines. grep_file line_number and read_doc content prefixes are 1-based; read_doc start_line is a 0-based argument. A single read is capped to a preview page; follow next_start_line/previous_start_line for adjacent slices.

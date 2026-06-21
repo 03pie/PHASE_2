@@ -83,7 +83,6 @@ class AgentConfig:
     execute_timeout_seconds: int = 30
     max_output_bytes: int = 100_000
     model_call_interval_seconds: float = 0.0
-    question_structure_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,19 +139,6 @@ def _optional_string(value: Any) -> str | None:
     return normalized or None
 
 
-def _bool_value(value: Any, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().casefold()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
-
-
 def load_app_config(config_path: Path) -> AppConfig:
     payload = yaml.safe_load(config_path.read_text()) or {}
     dataset_defaults = DatasetConfig()
@@ -190,13 +176,6 @@ def load_app_config(config_path: Path) -> AppConfig:
                 "model_call_interval_seconds",
                 agent_defaults.model_call_interval_seconds,
             )
-        ),
-        question_structure_enabled=_bool_value(
-            agent_payload.get(
-                "question_structure_enabled",
-                agent_defaults.question_structure_enabled,
-            ),
-            agent_defaults.question_structure_enabled,
         ),
     )
     raw_run_id = run_payload.get("run_id")

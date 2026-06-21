@@ -1,1 +1,0 @@
-Read a JSON file with optional path navigation and pagination. A single read is capped to a preview page. For large arrays, inspect schema and a page, then use next_start_item/previous_start_item for adjacent pages; use json_path to navigate before paging.
