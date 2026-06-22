@@ -156,22 +156,22 @@ def _answer_from_compute(state: LoopState, compute_ref: str) -> AnswerTable | No
 
 def _answer_from_final(state: LoopState) -> AnswerTable | None:
     answer = state.final_answer or {}
+    columns = answer.get("columns")
+    rows = answer.get("rows")
+    if isinstance(columns, list) and isinstance(rows, list):
+        normalized_rows: list[list[Any]] = []
+        for row in rows:
+            if isinstance(row, list):
+                normalized_rows.append(row)
+            elif isinstance(row, tuple):
+                normalized_rows.append(list(row))
+            else:
+                normalized_rows.append([row])
+        return AnswerTable(columns=[str(column) for column in columns], rows=normalized_rows)
     compute_ref = str(answer.get("compute_ref") or "")
     if compute_ref:
         return _answer_from_compute(state, compute_ref)
-    columns = answer.get("columns")
-    rows = answer.get("rows")
-    if not isinstance(columns, list) or not isinstance(rows, list):
-        return None
-    normalized_rows: list[list[Any]] = []
-    for row in rows:
-        if isinstance(row, list):
-            normalized_rows.append(row)
-        elif isinstance(row, tuple):
-            normalized_rows.append(list(row))
-        else:
-            normalized_rows.append([row])
-    return AnswerTable(columns=[str(column) for column in columns], rows=normalized_rows)
+    return None
 
 
 def _canonicalize_sql_relation_names(state: LoopState, sql: str) -> tuple[str, bool]:
@@ -228,6 +228,11 @@ def _audit_binding_refs(
             continue
         if not binding.evidence_refs:
             weak_bindings.append(f"{binding_ref}:missing_evidence_refs")
+        if (
+            binding.binding_type == "document_record_set"
+            and binding.metadata.get("partial_coverage")
+        ):
+            weak_bindings.append(f"{binding_ref}:partial_document_record_set_coverage")
         for evidence_ref in binding.evidence_refs:
             evidence = state.evidence.get(evidence_ref)
             if evidence is None:
@@ -417,7 +422,6 @@ class CodexEvidenceController:
                         "heading_path": section.heading_path,
                         "line_start": section.line_start,
                         "line_end": section.line_end,
-                        "score": section.score,
                         "text": section.text,
                     }
                     for section in state.matched_sections[:8]
@@ -519,12 +523,12 @@ class CodexEvidenceController:
         state: LoopState,
         *,
         attempt: int,
-    ) -> tuple[str | dict[str, Any], tuple[str, ...], RecoveryHint | None]:
+    ) -> tuple[str | dict[str, Any], tuple[str, ...] | None, RecoveryHint | None]:
         del attempt
         hints = recovery_hints(state, limit=1)
         hint = hints[0] if hints else None
         if hint is None:
-            return "required", ("locate_sources", "retrieve_knowledge", "list_inventory", "blocked"), None
+            return "required", None, None
         tool_names = tuple(dict.fromkeys((hint.tool_name, "blocked")))
         tool_choice: str | dict[str, Any]
         if hint.tool_name and hint.tool_name != "blocked":
@@ -561,6 +565,9 @@ class CodexEvidenceController:
                 records = item.payload.get("records")
                 if isinstance(records, list):
                     metadata["records"] = records
+                    metadata["record_count"] = len(records)
+                    metadata["coverage"] = item.payload.get("coverage") or []
+                    metadata["partial_coverage"] = bool(item.payload.get("partial_coverage"))
                     if not allowed_columns and records and isinstance(records[0], dict):
                         allowed_columns = tuple(str(column) for column in records[0] if column != "provenance")
                     break
@@ -591,13 +598,39 @@ class CodexEvidenceController:
         )
         if str(binding_type) in COMPUTABLE_BINDING_TYPES:
             allowed_next_tools = ("inspect_relation", "run_verified_compute", "bind")
-            recommended_next_actions = (
+            recommended_items: list[dict[str, Any]] = [
                 {
                     "tool_name": "inspect_relation",
                     "arguments": {"binding_ref": binding.id},
                     "reason": "Inspect verified relation schema before compute.",
                 },
-            )
+            ]
+            if (
+                action.binding_type == "document_record_set"
+                and metadata.get("partial_coverage")
+            ):
+                allowed_next_tools = (
+                    "search_document",
+                    "read_document_window",
+                    "extract_records",
+                    "bind",
+                    "inspect_relation",
+                )
+                for coverage in metadata.get("coverage") or []:
+                    for window in coverage.get("unreturned_matches") or []:
+                        if isinstance(window, dict) and isinstance(window.get("recommended_window"), dict):
+                            recommended_items.insert(
+                                0,
+                                {
+                                    "tool_name": "read_document_window",
+                                    "arguments": window["recommended_window"],
+                                    "reason": "This document record-set was extracted from partial search coverage; read the next uncovered matching window before treating it as complete.",
+                                },
+                            )
+                            break
+                    if recommended_items[0]["tool_name"] == "read_document_window":
+                        break
+            recommended_next_actions = tuple(recommended_items[:8])
             summary = f"Created verified binding {binding.id} as relation {binding.relation_name}."
         else:
             allowed_next_tools = ("submit_final", "bind", "search_document", "read_document_window")
@@ -658,8 +691,7 @@ class CodexEvidenceController:
             f"cand={len(state.candidates)};"
             f"bind={len(state.bindings)};"
             f"okcomp={sum(1 for item in state.compute_results.values() if item.ok)};"
-            f"final={bool(state.final_answer)};"
-            f"blocked={bool(state.blocked_reason)}"
+            f"final={bool(state.final_answer)}"
         )
 
     def _progress_reason(self, evidence: Evidence, *, progressed: bool) -> str:
@@ -715,7 +747,7 @@ class CodexEvidenceController:
         if remaining_steps <= 3:
             budget_pressure["instruction"] = (
                 "The evidence loop is near its step limit. Submit a verified answer, "
-                "make one targeted evidence move tied to a pending requirement, or call blocked with cited evidence."
+                "make one new evidence-producing tool call, or call blocked with cited evidence."
             )
         return {
             "step_budget": budget_pressure,
@@ -757,11 +789,29 @@ class CodexEvidenceController:
     def _blocked_needs_repair(self, state: LoopState, audit: dict[str, Any]) -> bool:
         if audit["passed"]:
             return False
-        signature = f"blocked_audit:{audit['audit_key']}"
+        signature = self._blocked_repair_signature(audit)
+        if signature is None:
+            return False
         previous = sum(
             1 for item in state.guard_feedback if item.get("signature") == signature
         )
         return previous < 1
+
+    def _blocked_repair_signature(self, audit: dict[str, Any]) -> str | None:
+        for item in audit.get("recovery_hints") or []:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool_name") or "")
+            if not tool_name or tool_name == "blocked":
+                continue
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            return "blocked_audit_repair:" + json.dumps(
+                {"tool_name": tool_name, "arguments": arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        return None
 
     def run(
         self,
@@ -784,7 +834,6 @@ class CodexEvidenceController:
             forced_tool_choice: str | dict[str, Any] | None = None
             forced_tool_names: tuple[str, ...] | None = None
             forced_recovery_attempts = 0
-            frontier_recovery_attempts = 0
             for turn in range(1, self.config.max_steps + 1):
                 state.step_index = turn
                 messages, context_fragment_ids, context_truncated = self._prompt_messages(
@@ -836,7 +885,7 @@ class CodexEvidenceController:
                             "reason": content[:500] or reason,
                             "recovery_hint": hint_dict,
                             "forced_tool_choice_next": forced_tool_choice,
-                            "forced_tool_names_next": list(forced_tool_names),
+                            "forced_tool_names_next": list(forced_tool_names or []),
                         }
                     )
                     state.repeated_no_progress += 1
@@ -850,7 +899,7 @@ class CodexEvidenceController:
                             "recovery_hint": hint_dict,
                             "forced_recovery_attempts": forced_recovery_attempts,
                             "forced_tool_choice_next": forced_tool_choice,
-                            "forced_tool_names_next": list(forced_tool_names),
+                            "forced_tool_names_next": list(forced_tool_names or []),
                         },
                         ok=False,
                     )
@@ -866,9 +915,7 @@ class CodexEvidenceController:
                                 "Your previous response was ignored because it did not contain a native tool call. "
                                 "The next request is forced to use native tool calling. "
                                 "Return exactly one native tool call. Do not answer in text. "
-                                "Use the recovery_hint fragment when applicable, or call blocked with cited evidence_refs. "
-                                "Available forced tools for the next request: "
-                                + ", ".join(forced_tool_names)
+                                "Use observed evidence and compact state, or call blocked with cited evidence_refs."
                             )
                         )
                     )
@@ -1000,18 +1047,18 @@ class CodexEvidenceController:
                                 "audit": audit_now,
                             }
                         )
-                        state.final_answer = None
                         trace.add(
                             action="codex_final_audit_repair",
-                            thought="Final audit failed; feed audit gaps back into the loop for repair.",
+                            thought="Final audit failed; keep the candidate final in state and feed audit gaps back for repair.",
                             observation={"audit": audit_now},
                             ok=False,
                         )
                         transcript.add_repair_message(
                             HumanMessage(
                                 content=(
-                                    "Final audit failed. Continue with native tool calls only. "
-                                    "Repair the missing lineage/requirements or call blocked:\n"
+                                    "Final audit failed, but the candidate final answer remains available in state. "
+                                    "Continue with native tool calls only. Repair projection, lineage, requirements, "
+                                    "or submit a corrected final; call blocked only if no valid repair remains:\n"
                                     + str(_compact(audit_now, limit=20))
                                 )
                             )
@@ -1024,7 +1071,7 @@ class CodexEvidenceController:
                             cited_evidence_refs=action.evidence_refs,
                         )
                         if self._blocked_needs_repair(state, audit_now):
-                            signature = f"blocked_audit:{audit_now['audit_key']}"
+                            signature = self._blocked_repair_signature(audit_now)
                             state.guard_feedback.append(
                                 {
                                     "turn": turn,
@@ -1060,7 +1107,6 @@ class CodexEvidenceController:
 
                 if turn_progressed:
                     state.repeated_no_progress = 0
-                    frontier_recovery_attempts = 0
                 else:
                     state.repeated_no_progress += 1
                 if terminal_action is None:
@@ -1086,17 +1132,17 @@ class CodexEvidenceController:
                                 "reason": "Last native tool turn did not add effective progress.",
                                 "recovery_hint": hint_dict,
                                 "forced_tool_choice_next": forced_tool_choice,
-                                "forced_tool_names_next": list(forced_tool_names),
+                                "forced_tool_names_next": list(forced_tool_names or []),
                             }
                         )
                         trace.add(
                             action="codex_no_progress_repair",
-                            thought="A native tool turn made no effective progress; force the next model turn toward scheduled recovery tools.",
+                            thought="A native tool turn made no effective progress; return a recoverable tool-loop repair to the model.",
                             observation={
                                 "turn": turn,
                                 "recovery_hint": hint_dict,
                                 "forced_tool_choice_next": forced_tool_choice,
-                                "forced_tool_names_next": list(forced_tool_names),
+                                "forced_tool_names_next": list(forced_tool_names or []),
                             },
                             ok=False,
                         )
@@ -1104,53 +1150,11 @@ class CodexEvidenceController:
                             HumanMessage(
                                 content=(
                                     "The previous native tool turn made no effective progress. "
-                                    "Use the recovery_hint fragment and return exactly one native tool call."
+                                    "Return exactly one native tool call that uses new evidence, submits a verified answer, or calls blocked."
                                 )
                             )
                         )
                         last_error = "no_progress_repair"
-                    elif state.repeated_no_progress >= 2:
-                        hints = recovery_hints(state, limit=1)
-                        if hints and hints[0].tool_name != "blocked":
-                            frontier_recovery_attempts += 1
-                            forced_tool_choice, forced_tool_names, recovery_hint = self._forced_recovery_policy(
-                                state,
-                                attempt=frontier_recovery_attempts + 1,
-                            )
-                            hint_dict = recovery_hint.to_dict() if recovery_hint else None
-                            state.repeated_no_progress = 1
-                            state.guard_feedback.append(
-                                {
-                                    "turn": turn,
-                                    "signature": "frontier_recovery",
-                                    "reason": "Effective progress stalled, but source frontier, positive evidence, or compute final remains actionable.",
-                                    "recovery_hint": hint_dict,
-                                    "forced_tool_choice_next": forced_tool_choice,
-                                    "forced_tool_names_next": list(forced_tool_names),
-                                }
-                            )
-                            trace.add(
-                                action="codex_frontier_recovery",
-                                thought="No-progress stop is deferred because actionable evidence frontier remains.",
-                                observation={
-                                    "turn": turn,
-                                    "repeated_no_progress": state.repeated_no_progress,
-                                    "frontier_recovery_attempts": frontier_recovery_attempts,
-                                    "recovery_hint": hint_dict,
-                                    "forced_tool_choice_next": forced_tool_choice,
-                                    "forced_tool_names_next": list(forced_tool_names),
-                                },
-                                ok=False,
-                            )
-                            transcript.add_repair_message(
-                                HumanMessage(
-                                    content=(
-                                        "No-progress stop is deferred because a ledger-backed recovery hint remains. "
-                                        "Use recovery_hint and return exactly one native tool call."
-                                    )
-                                )
-                            )
-                            last_error = "frontier_recovery"
                 self._emit(
                     task_id=task.task_id,
                     trace=trace,
@@ -1171,37 +1175,6 @@ class CodexEvidenceController:
                     failure_reason = state.blocked_reason or "Evidence loop blocked."
                     break
                 if state.repeated_no_progress >= 2:
-                    hints = recovery_hints(state, limit=1)
-                    if hints and hints[0].tool_name != "blocked":
-                        frontier_recovery_attempts += 1
-                        forced_tool_choice, forced_tool_names, recovery_hint = self._forced_recovery_policy(
-                            state,
-                            attempt=frontier_recovery_attempts + 1,
-                        )
-                        hint_dict = recovery_hint.to_dict() if recovery_hint else None
-                        state.repeated_no_progress = 1
-                        trace.add(
-                            action="codex_frontier_recovery",
-                            thought="Two no-progress turns occurred, but actionable frontier remains; force a scheduled native tool instead of stopping.",
-                            observation={
-                                "turn": turn,
-                                "frontier_recovery_attempts": frontier_recovery_attempts,
-                                "recovery_hint": hint_dict,
-                                "forced_tool_choice_next": forced_tool_choice,
-                                "forced_tool_names_next": list(forced_tool_names),
-                            },
-                            ok=False,
-                        )
-                        transcript.add_repair_message(
-                            HumanMessage(
-                                content=(
-                                    "Two no-progress turns occurred, but a recovery hint remains. "
-                                    "Use recovery_hint and return exactly one native tool call."
-                                )
-                            )
-                        )
-                        last_error = "frontier_recovery"
-                        continue
                     failure_reason = "Evidence loop stopped after two no-progress turns."
                     break
             else:

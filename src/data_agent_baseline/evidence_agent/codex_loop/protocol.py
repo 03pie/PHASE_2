@@ -58,7 +58,6 @@ class KnowledgeSection:
     line_end: int | None
     text: str
     mentions: tuple[str, ...] = ()
-    score: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +288,7 @@ class RecoveryHint:
     reason: str
     source: str
     priority: int = 0
+    details: dict[str, Any] = dataclass_field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

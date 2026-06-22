@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from data_agent_baseline.evidence_agent.semantic import semantic_score, semantic_terms
+from data_agent_baseline.evidence_agent.semantic import semantic_terms
 from data_agent_baseline.evidence_agent.codex_loop.protocol import KnowledgeSection
 from data_agent_baseline.evidence_agent.text import code_mentions, normalize_key
 from data_agent_baseline.prompts.loader import build_knowledge_bundle
@@ -62,54 +62,27 @@ def match_knowledge_sections(
 
     if not sections:
         return []
-    query_key = normalize_key(question)
     terms = _query_terms(question)
-    scored: list[KnowledgeSection] = []
+    matched: list[tuple[int, int, KnowledgeSection]] = []
     for section in sections:
         section_text = f"{section.heading_path}\n{section.text}"
-        section_key = normalize_key(section_text)
-        score = semantic_score(question, section_text)
-        if query_key and query_key in section_key:
-            score += 8.0
-        for mention in section.mentions:
-            mention_key = normalize_key(mention)
-            if mention_key and mention_key in query_key:
-                score += 6.0
-            elif mention_key and mention_key in terms:
-                score += 4.0
-        if score <= 0:
+        section_terms = set(semantic_terms(section_text))
+        overlap = len(terms & section_terms)
+        if overlap <= 0:
             continue
-        scored.append(
-            KnowledgeSection(
-                id=section.id,
-                heading_path=section.heading_path,
-                line_start=section.line_start,
-                line_end=section.line_end,
-                text=section.text,
-                mentions=section.mentions,
-                score=score,
+        matched.append(
+            (
+                -overlap,
+                section.line_start or 10**9,
+                KnowledgeSection(
+                    id=section.id,
+                    heading_path=section.heading_path,
+                    line_start=section.line_start,
+                    line_end=section.line_end,
+                    text=section.text,
+                    mentions=section.mentions,
+                ),
             )
         )
-    scored.sort(key=lambda item: (-item.score, item.line_start or 10**9))
-    selected = scored[:limit]
-
-    # Preserve adjacent definition context when a selected heading references
-    # the same code mention.  This is document-context expansion, not binding.
-    selected_ids = {section.id for section in selected}
-    selected_mentions = {
-        normalize_key(mention)
-        for section in selected
-        for mention in section.mentions
-        if normalize_key(mention)
-    }
-    if selected_mentions:
-        for section in sections:
-            if len(selected) >= limit:
-                break
-            if section.id in selected_ids:
-                continue
-            heading_mentions = {normalize_key(mention) for mention in code_mentions(section.heading_path)}
-            if heading_mentions & selected_mentions:
-                selected.append(section)
-                selected_ids.add(section.id)
-    return selected[:limit]
+    matched.sort(key=lambda item: (item[0], item[1]))
+    return [section for _overlap, _line, section in matched[:limit]]

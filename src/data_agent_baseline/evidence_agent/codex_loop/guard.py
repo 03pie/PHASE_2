@@ -52,6 +52,37 @@ def _inspect_relation_recommendation() -> tuple[dict[str, object], ...]:
     )
 
 
+def _compute_has_candidate_answer_verification(state: LoopState, compute_ref: str) -> bool:
+    for evidence in state.evidence.values():
+        if evidence.tool_name != "verify_alignment" or not evidence.ok:
+            continue
+        payload = evidence.payload or {}
+        if payload.get("decision") != "candidate_answer":
+            continue
+        if payload.get("target_kind") not in {"compute_result", "final_answer"}:
+            continue
+        refs = {
+            str(ref)
+            for ref in [
+                *(payload.get("compute_refs") or []),
+                *(payload.get("target_refs") or []),
+            ]
+        }
+        if compute_ref in refs:
+            return True
+    return False
+
+
+def _compute_final_answer_columns(action: ModelAction) -> list[str]:
+    answer = action.answer if isinstance(action.answer, dict) else action.arguments.get("answer")
+    if not isinstance(answer, dict):
+        return []
+    columns = answer.get("columns")
+    if not isinstance(columns, list):
+        return []
+    return [str(column) for column in columns if str(column).strip()]
+
+
 def _payload_table(payload: dict[str, Any]) -> str:
     return str(payload.get("table") or "").strip()
 
@@ -60,35 +91,6 @@ def _action_source_id(state: LoopState, action: ModelAction) -> str:
     path = action.arguments.get("path")
     source_ref = action.arguments.get("source_ref") or action.arguments.get("source_id")
     return str(source_ref or state.source_by_path.get(str(path)) or "").strip()
-
-
-def _scheduled_recommendations(
-    state: LoopState,
-    *,
-    preferred_tools: tuple[str, ...] = (),
-    limit: int = 4,
-) -> tuple[dict[str, object], ...]:
-    from data_agent_baseline.evidence_agent.codex_loop.state_views import recovery_hints  # noqa: PLC0415
-
-    schedule = [hint.to_dict() for hint in recovery_hints(state, limit=limit * 3)]
-    if preferred_tools:
-        preferred = [
-            item for item in schedule
-            if str(item.get("tool_name") or "") in preferred_tools
-        ]
-        others = [
-            item for item in schedule
-            if str(item.get("tool_name") or "") not in preferred_tools
-        ]
-        schedule = preferred + others
-    return tuple(
-        {
-            "tool_name": item.get("tool_name"),
-            "arguments": item.get("arguments") or {},
-            "reason": item.get("reason") or "Use the next ledger-backed action instead of repeating a no-op observation.",
-        }
-        for item in schedule[:limit]
-    )
 
 
 def _successful_observation(
@@ -133,18 +135,15 @@ def _noop_observation_guard(
     preferred_tools: tuple[str, ...] = (),
     fallback_actions: tuple[dict[str, object], ...] = (),
 ) -> GuardDecision:
-    scheduled = _scheduled_recommendations(
-        state,
-        preferred_tools=preferred_tools,
-    )
+    del state
     recommendations = tuple(
         dict.fromkeys(
-            [repr(item) for item in (*fallback_actions, *scheduled)]
+            [repr(item) for item in fallback_actions]
         )
     )
     recommendation_items: list[dict[str, object]] = []
     for item_repr in recommendations:
-        for item in (*fallback_actions, *scheduled):
+        for item in fallback_actions:
             if repr(item) == item_repr:
                 recommendation_items.append(item)
                 break
@@ -424,40 +423,27 @@ def guard_action(
     signature = action.signature()
     repeated = sum(1 for feedback in state.guard_feedback[-6:] if feedback.get("signature") == signature)
     if repeated >= 2:
-        from data_agent_baseline.evidence_agent.codex_loop.state_views import recovery_hints  # noqa: PLC0415
-
-        recovery_actions = [hint.to_dict() for hint in recovery_hints(state, limit=4)]
-        recovery_tools = tuple(
-            dict.fromkeys(
-                str(item.get("tool_name"))
-                for item in recovery_actions
-                if str(item.get("tool_name") or "").strip()
-            )
-        )
         return GuardDecision(
             False,
             "Repeated identical action without effective progress.",
-            allowed_next_tools=tuple(dict.fromkeys((*recovery_tools, "blocked")))
-            or (
+            allowed_next_tools=(
+                "list_inventory",
+                "retrieve_knowledge",
                 "locate_sources",
-                "inspect_relation",
+                "inspect_source",
+                "sample_records",
+                "search_values",
                 "profile_document",
                 "search_document",
+                "read_document_window",
+                "extract_records",
+                "inspect_relation",
+                "discover_join_paths",
+                "run_verified_compute",
+                "submit_final",
                 "blocked",
             ),
-            recommended_next_actions=tuple(recovery_actions)
-            or (
-                {
-                    "tool_name": "locate_sources",
-                    "arguments": {"query": state.question},
-                    "reason": "Switch to alternative observed source candidates.",
-                },
-                {
-                    "tool_name": "blocked",
-                    "arguments": {"reason": "Repeated action failed without new evidence."},
-                    "reason": "Stop instead of repeating the same failed action.",
-                },
-            ),
+            recommended_next_actions=(),
         )
 
     if action.kind == "blocked":
@@ -669,6 +655,27 @@ def guard_action(
                     },
                 ),
             )
+        partial_document_sets = [
+            ref for ref in refs
+            if (
+                state.bindings[ref].binding_type == "document_record_set"
+                and state.bindings[ref].metadata.get("partial_coverage")
+            )
+        ]
+        if partial_document_sets:
+            return GuardDecision(
+                False,
+                "Compute cannot use partial document record-set bindings; read remaining document windows or extract a complete record set first: "
+                + ", ".join(partial_document_sets),
+                allowed_next_tools=("search_document", "read_document_window", "extract_records", "bind", "blocked"),
+                recommended_next_actions=(
+                    {
+                        "tool_name": "search_document",
+                        "arguments": {"query": state.question},
+                        "reason": "Search/read additional bounded document windows before recomputing from document records.",
+                    },
+                ),
+            )
         preflight = _check_sql_preflight(state, action)
         if preflight is not None:
             return preflight
@@ -698,7 +705,64 @@ def guard_action(
                         },
                     ),
                 )
-            return GuardDecision(True, "Final allowed from verified compute result.")
+            if not _compute_has_candidate_answer_verification(state, action.compute_ref):
+                return GuardDecision(
+                    False,
+                    "Compute-backed final requires verify_alignment(decision='candidate_answer', target_kind='compute_result') for this compute_ref before submit_final.",
+                    allowed_next_tools=("verify_alignment", "run_verified_compute", "inspect_relation", "blocked"),
+                    recommended_next_actions=(
+                        {
+                            "tool_name": "verify_alignment",
+                            "arguments": {
+                                "decision": "candidate_answer",
+                                "target_kind": "compute_result",
+                                "compute_refs": [action.compute_ref],
+                                "evidence_refs": list(compute.evidence_refs),
+                                "binding_refs": list(compute.binding_refs),
+                                "alignment": "<explain why this exact compute result satisfies the question and knowledge>",
+                            },
+                            "reason": "Classify the compute result before final submission, or compute a different result.",
+                        },
+                    ),
+                )
+            final_columns = _compute_final_answer_columns(action)
+            if not final_columns:
+                return GuardDecision(
+                    False,
+                    "Compute-backed final requires an explicit answer.columns projection; do not submit all compute columns by default.",
+                    allowed_next_tools=("submit_final", "inspect_relation", "run_verified_compute", "blocked"),
+                    recommended_next_actions=(
+                        {
+                            "tool_name": "submit_final",
+                            "arguments": {
+                                "compute_ref": action.compute_ref,
+                                "answer": {
+                                    "columns": list(compute.columns),
+                                },
+                            },
+                            "reason": "Choose the final output columns explicitly from this compute result, removing helper columns unless they are requested.",
+                        },
+                    ),
+                )
+            unknown_final_columns = [
+                column for column in final_columns
+                if column not in {str(item) for item in compute.columns}
+            ]
+            if unknown_final_columns:
+                return GuardDecision(
+                    False,
+                    "Final answer.columns must be a subset of the compute result columns: "
+                    + ", ".join(unknown_final_columns),
+                    allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation", "blocked"),
+                    recommended_next_actions=(
+                        {
+                            "tool_name": "inspect_relation",
+                            "arguments": {},
+                            "reason": "Inspect verified relation columns before computing or projecting final columns.",
+                        },
+                    ),
+                )
+            return GuardDecision(True, "Final allowed from verified and explicitly projected compute result.")
 
         answer = action.answer or action.arguments.get("answer")
         if not isinstance(answer, dict) or not answer:

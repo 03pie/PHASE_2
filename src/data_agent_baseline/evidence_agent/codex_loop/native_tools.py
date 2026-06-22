@@ -36,7 +36,7 @@ _LIST_FIELDS = {
     "source_refs",
     "allowed_columns",
 }
-_INT_FIELDS = {"limit", "start_line", "end_line", "window_lines"}
+_INT_FIELDS = {"limit", "start_line", "end_line", "window_lines", "sample_limit", "max_pairs"}
 _BINDING_TYPE_ALIASES = {
     "source": "structured_source",
     "data_source": "structured_source",
@@ -274,7 +274,9 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
             "name": "extract_records",
             "description": (
                 "Execute a model-provided extraction spec over cited document-window evidence. "
-                "The spec must be generic and cite evidence_refs."
+                "The spec must be executable: provide a Python regex with named groups or "
+                "fields/dotall, or provide records copied exactly from cited evidence. "
+                "Natural-language rules alone are not executed."
             ),
             "parameters": _object_schema(
                 {
@@ -298,6 +300,23 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
                     "binding_ref": {"type": "string"},
                     "relation_name": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                }
+            ),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discover_join_paths",
+            "description": (
+                "Inspect verified relations for generic join candidates using observed column names "
+                "and sample value overlap. This only returns evidence; it does not bind or execute a join."
+            ),
+            "parameters": _object_schema(
+                {
+                    "binding_refs": {"type": "array", "items": {"type": "string"}},
+                    "sample_limit": {"type": "integer", "minimum": 1, "maximum": 5000},
+                    "max_pairs": {"type": "integer", "minimum": 1, "maximum": 200},
                 }
             ),
         },
@@ -454,8 +473,10 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
         "function": {
             "name": "submit_final",
             "description": (
-                "Submit the final answer. Prefer compute_ref after run_verified_compute. "
-                "For direct document/value evidence, provide answer plus binding_refs and evidence_refs."
+                "Submit the final answer. A compute-backed final requires a prior "
+                "verify_alignment candidate_answer decision for the compute_ref and an explicit answer.columns projection. "
+                "For direct document/value evidence, provide answer plus binding_refs and evidence_refs. "
+                "The answer object may only project or alias values already present in the cited compute result."
             ),
             "parameters": _object_schema(
                 {

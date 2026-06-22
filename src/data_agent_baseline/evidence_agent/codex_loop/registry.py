@@ -22,15 +22,50 @@ from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     SourceRef,
     ToolSpec,
 )
-from data_agent_baseline.evidence_agent.semantic import semantic_score
 
 
 def _normalize(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
 
 
+def _value_keys(value: Any) -> set[str]:
+    text = str(value).strip()
+    keys = {
+        _normalize(text),
+        re.sub(r"\s+", "", text.casefold()),
+    }
+    try:
+        number = float(text.replace(",", ""))
+    except (TypeError, ValueError):
+        return {key for key in keys if key}
+    keys.add(f"num:{number:.12g}")
+    return {key for key in keys if key}
+
+
 def _terms(value: Any) -> list[str]:
-    return [part for part in re.split(r"[^0-9A-Za-z_]+", str(value).casefold()) if part]
+    text = str(value).casefold()
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        term = term.strip()
+        if not term or term in seen:
+            return
+        seen.add(term)
+        terms.append(term)
+
+    for part in re.split(r"[^0-9A-Za-z_]+", text):
+        if part:
+            add(part)
+    for chunk in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]+", text):
+        if len(chunk) >= 2:
+            add(chunk)
+        upper = min(8, len(chunk))
+        for size in range(upper, 1, -1):
+            for start in range(0, len(chunk) - size + 1):
+                add(chunk[start : start + size])
+    terms.sort(key=lambda item: (-len(item), item))
+    return terms
 
 
 def _source_from_args(state: LoopState, arguments: dict[str, Any]) -> SourceRef | None:
@@ -145,48 +180,44 @@ def _answer_table_from_payload(answer: Any) -> tuple[list[str], list[list[Any]]]
     return None
 
 
-def _co_occurring_scalar_values(
-    hits: list[dict[str, Any]],
+def _projection_values_supported(
+    answer_rows: list[list[Any]],
+    compute_rows: tuple[tuple[Any, ...], ...],
+) -> tuple[bool, list[Any]]:
+    observed = set()
+    for row in compute_rows:
+        for cell in row:
+            if cell is not None and str(cell).strip():
+                observed.update(_value_keys(cell))
+    unsupported: list[Any] = []
+    for row in answer_rows:
+        for cell in row:
+            if cell is None or not str(cell).strip():
+                continue
+            if not (_value_keys(cell) & observed):
+                unsupported.append(cell)
+                if len(unsupported) >= 20:
+                    return False, unsupported
+    return not unsupported, unsupported
+
+
+def _project_compute_answer(
+    answer: Any,
     *,
-    original_value: str,
-    limit: int = 40,
-) -> list[dict[str, Any]]:
-    original_norm = _normalize(original_value)
-    candidates: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
-    for hit in hits[:50]:
-        record = hit.get("record")
-        if not isinstance(record, dict):
-            continue
-        source_id = str(hit.get("source_id") or "")
-        path = str(hit.get("path") or "")
-        table = str(hit.get("table") or "")
-        for field, raw_value in record.items():
-            if raw_value is None:
-                continue
-            value = str(raw_value).strip()
-            if not value or value.casefold() in {"nan", "none", "nat"}:
-                continue
-            if len(value) > 80 or _normalize(value) == original_norm:
-                continue
-            key = (source_id, path, table, str(field), value)
-            item = candidates.setdefault(
-                key,
-                {
-                    "source_id": source_id,
-                    "path": path,
-                    "table": table or None,
-                    "field": str(field),
-                    "value": value,
-                    "match_reason": "co_occurring_with_value_hit",
-                    "requires_verification": True,
-                    "support_count": 0,
-                },
-            )
-            item["support_count"] = int(item["support_count"]) + 1
-    return sorted(
-        candidates.values(),
-        key=lambda item: (-int(item["support_count"]), len(str(item["value"])), str(item["field"])),
-    )[:limit]
+    compute_columns: tuple[str, ...],
+    compute_rows: tuple[tuple[Any, ...], ...],
+) -> tuple[list[str], list[list[Any]]] | None:
+    if not isinstance(answer, dict):
+        return None
+    columns = answer.get("columns")
+    if not isinstance(columns, list) or not columns or "rows" in answer:
+        return None
+    requested = [str(column) for column in columns]
+    index_by_name = {str(column): index for index, column in enumerate(compute_columns)}
+    if not all(column in index_by_name for column in requested):
+        return None
+    indexes = [index_by_name[column] for column in requested]
+    return requested, [[row[index] for index in indexes] for row in compute_rows]
 
 
 def _source_negative_scope(
@@ -240,6 +271,27 @@ def _source_evidence_refs(state: LoopState, source_ids: tuple[str, ...]) -> tupl
     return tuple(dict.fromkeys(refs))
 
 
+def _compute_has_candidate_answer_verification(state: LoopState, compute_ref: str) -> bool:
+    for evidence in state.evidence.values():
+        if evidence.tool_name != "verify_alignment" or not evidence.ok:
+            continue
+        payload = evidence.payload or {}
+        if payload.get("decision") != "candidate_answer":
+            continue
+        if payload.get("target_kind") not in {"compute_result", "final_answer"}:
+            continue
+        refs = {
+            str(ref)
+            for ref in [
+                *(payload.get("compute_refs") or []),
+                *(payload.get("target_refs") or []),
+            ]
+        }
+        if compute_ref in refs:
+            return True
+    return False
+
+
 class EvidenceActionRegistry:
     def __init__(self) -> None:
         self._dispatch: dict[str, Callable[[LoopState, dict[str, Any]], Evidence]] = {
@@ -254,6 +306,7 @@ class EvidenceActionRegistry:
             "search_document": self._search_document,
             "extract_records": self._extract_records,
             "inspect_relation": self._inspect_relation,
+            "discover_join_paths": self._discover_join_paths,
             "track_requirements": self._track_requirements,
             "verify_alignment": self._verify_alignment,
             "run_verified_compute": self._run_verified_compute,
@@ -292,6 +345,9 @@ class EvidenceActionRegistry:
             ),
             "inspect_relation": ToolSpec(
                 "inspect_relation", "Inspect verified relation schema/sample before compute or SQL repair."
+            ),
+            "discover_join_paths": ToolSpec(
+                "discover_join_paths", "Inspect verified relations for generic join candidates."
             ),
             "track_requirements": ToolSpec(
                 "track_requirements", "Maintain a generic requirement coverage ledger."
@@ -366,14 +422,20 @@ class EvidenceActionRegistry:
         if section_ids:
             selected = [section for section in sections if section.id in section_ids]
         else:
-            scored = [
+            query_terms = set(_terms(query))
+            matched = [
                 (
-                    semantic_score(query, f"{section.heading_path}\n{section.text}"),
+                    len(query_terms & set(_terms(f"{section.heading_path}\n{section.text}"))),
+                    section.line_start or 10**9,
                     section,
                 )
                 for section in sections
             ]
-            selected = [section for score, section in sorted(scored, key=lambda item: -item[0]) if score > 0][:8]
+            selected = [
+                section
+                for overlap, _line, section in sorted(matched, key=lambda item: (-item[0], item[1]))
+                if overlap > 0
+            ][:8]
             if not selected:
                 selected = state.matched_sections[:8]
         payload = {
@@ -409,22 +471,24 @@ class EvidenceActionRegistry:
             haystack = " ".join(
                 [source.virtual_path, source.basename, source.stem, *source.tables, *source.columns]
             )
-            score = semantic_score(query, haystack)
+            haystack_norm = _normalize(haystack)
             source_norms = {_normalize(source.basename), _normalize(source.stem), _normalize(source.virtual_path)}
-            if query_norms & source_norms:
-                score += 4.0
-            if score > 0 or not tokens:
+            matched_source = bool(query_norms & source_norms) or any(
+                token and token in haystack_norm for token in query_norms
+            )
+            if matched_source or not tokens:
                 candidate = state.add_candidate(
                     kind="source_candidate",
                     source_id=source.id,
                     data_form=source.data_form,
-                    match_reason="lexical_inventory_match" if score > 0 else "inventory_listing",
+                    match_reason="lexical_inventory_match" if matched_source else "inventory_listing",
                     path=source.virtual_path,
                 )
                 candidates.append(candidate.to_dict())
 
             for table in source.tables:
-                if _normalize(table) in query_norms or semantic_score(query, table) > 0:
+                table_norm = _normalize(table)
+                if table_norm in query_norms or any(token and token in table_norm for token in query_norms):
                     candidate = state.add_candidate(
                         kind="table_candidate",
                         source_id=source.id,
@@ -436,7 +500,8 @@ class EvidenceActionRegistry:
                     candidates.append(candidate.to_dict())
 
             for column in source.columns:
-                if _normalize(column) in query_norms or semantic_score(query, column) > 0:
+                column_norm = _normalize(column)
+                if column_norm in query_norms or any(token and token in column_norm for token in query_norms):
                     candidate = state.add_candidate(
                         kind="field_candidate",
                         source_id=source.id,
@@ -738,31 +803,6 @@ class EvidenceActionRegistry:
                     }
                 )
 
-        related_values = _co_occurring_scalar_values(hits, original_value=value)
-        related_candidates = []
-        for item in related_values[:40]:
-            candidate = state.add_candidate(
-                kind="value_candidate",
-                source_id=str(item.get("source_id") or "") or None,
-                data_form=state.sources[str(item.get("source_id"))].data_form
-                if str(item.get("source_id")) in state.sources
-                else "unknown_file",
-                match_reason="co_occurring_with_value_hit",
-                path=str(item.get("path") or "") or None,
-                table=str(item.get("table") or "") or None,
-                field=str(item.get("field") or "") or None,
-                value=item.get("value"),
-            )
-            related_candidates.append({**candidate.to_dict(), "support_count": item["support_count"]})
-        related_recommendations = tuple(
-            _recommend(
-                "search_values",
-                {"value": str(item["value"]), "limit": 50},
-                "Verify a co-occurring value from an observed hit record in other candidate sources.",
-            )
-            for item in related_values[:5]
-        )
-
         return state.add_evidence(
             tool_name="search_values",
             ok=True,
@@ -770,7 +810,6 @@ class EvidenceActionRegistry:
             payload={
                 "value": value,
                 "hits": hits,
-                "co_occurring_value_candidates": related_candidates,
             },
             negative_scope=(
                 {"kind": "value_not_found", "value": value, "source_id": scoped.id if scoped else None}
@@ -785,15 +824,7 @@ class EvidenceActionRegistry:
                 "bind",
                 "locate_sources",
             ),
-            recommended_next_actions=(
-                _recommend(
-                    "locate_sources",
-                    {"query": value},
-                    "If no value hit was found, search alternative observed sources.",
-                ),
-            )
-            if not hits
-            else related_recommendations,
+            recommended_next_actions=(),
         )
 
     def _read_document_window(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1012,12 +1043,14 @@ class EvidenceActionRegistry:
         lines = _document_lines(source)
         terms = _terms(query)
         limit = max(1, min(int(arguments.get("limit") or 8), 20))
-        window_lines = max(3, min(int(arguments.get("window_lines") or 10), 80))
-        matches: list[dict[str, Any]] = []
+        requested_window_lines = int(arguments.get("window_lines") or 50)
+        window_lines = max(40, min(requested_window_lines, 80))
+        matched_windows: list[tuple[int, dict[str, Any]]] = []
         seen_starts: set[int] = set()
         for index, line in enumerate(lines):
             text = str(line["text"]).casefold()
-            if not any(term in text for term in terms):
+            matched_terms = [term for term in terms if term in text]
+            if not matched_terms:
                 continue
             start = max(0, index - window_lines // 2)
             if start in seen_starts:
@@ -1025,29 +1058,97 @@ class EvidenceActionRegistry:
             seen_starts.add(start)
             end = min(len(lines), start + window_lines)
             window = lines[start:end]
-            matches.append(
+            matched_windows.append(
+                (
+                    index,
+                    {
+                        "start_line": window[0]["line"] if window else None,
+                        "end_line": window[-1]["line"] if window else None,
+                        "page_start": window[0]["page"] if window else None,
+                        "page_end": window[-1]["page"] if window else None,
+                        "matched_terms": matched_terms[:12],
+                        "text": "\n".join(
+                            f"[page={item['page']} line={item['line']}] {item['text']}"
+                            for item in window
+                        )[:8_000],
+                    },
+                )
+            )
+        matches = [
+            item
+            for _index, item in sorted(matched_windows, key=lambda row: row[0])[:limit]
+        ]
+        total_matches = len(matched_windows)
+        selected_ranges = [
+            (
+                int(match.get("start_line") or 0),
+                int(match.get("end_line") or 0),
+            )
+            for match in matches
+        ]
+
+        def covered(line_number: int) -> bool:
+            return any(start <= line_number <= end for start, end in selected_ranges)
+
+        unreturned_matches: list[dict[str, Any]] = []
+        for index, item in sorted(matched_windows, key=lambda row: row[0]):
+            line_number = int(lines[index]["line"])
+            if covered(line_number):
+                continue
+            unreturned_matches.append(
                 {
-                    "start_line": window[0]["line"] if window else None,
-                    "end_line": window[-1]["line"] if window else None,
-                    "page_start": window[0]["page"] if window else None,
-                    "page_end": window[-1]["page"] if window else None,
-                    "text": "\n".join(
-                        f"[page={item['page']} line={item['line']}] {item['text']}"
-                        for item in window
-                    )[:8_000],
+                    "line": line_number,
+                    "page": lines[index]["page"],
+                    "matched_terms": item.get("matched_terms") or [],
+                    "preview": str(lines[index]["text"])[:240],
+                    "recommended_window": {
+                        "source_ref": source.id,
+                        "start_line": max(1, line_number - window_lines // 2),
+                        "window_lines": window_lines,
+                    },
                 }
             )
-            if len(matches) >= limit:
+            if len(unreturned_matches) >= 12:
                 break
+        recommended_next_actions: list[dict[str, Any]] = []
+        if matches:
+            recommended_next_actions.append(
+                {
+                    "tool_name": "extract_records",
+                    "arguments": {
+                        "evidence_refs": [],
+                        "spec": {
+                            "regex": "<Python regex over cited window text, preferably with named groups>",
+                            "dotall": True,
+                        },
+                    },
+                    "reason": "If these windows contain repeated records needed for the answer, retry with evidence_refs set to this search evidence id and an executable regex or copied records.",
+                }
+            )
+            if unreturned_matches:
+                recommended_next_actions.append(
+                    {
+                        "tool_name": "read_document_window",
+                        "arguments": unreturned_matches[0]["recommended_window"],
+                        "reason": "Additional matching document text exists outside returned windows; read the next uncovered bounded window before treating a record set as complete.",
+                    }
+                )
         return state.add_evidence(
             tool_name="search_document",
             ok=True,
-            summary=f"Found {len(matches)} document window candidate(s).",
+            summary=(
+                f"Found {len(matches)} document window candidate(s)"
+                + (f" from {total_matches} matching line(s)." if total_matches else ".")
+            ),
             payload={
                 "source_id": source.id,
                 "path": source.virtual_path,
                 "query": query,
+                "total_matches": total_matches,
+                "returned_matches": len(matches),
+                "more_matches_available": total_matches > len(matches),
                 "windows": matches,
+                "unreturned_matches": unreturned_matches,
             },
             source_id=source.id,
             data_form=source.data_form,
@@ -1057,6 +1158,7 @@ class EvidenceActionRegistry:
                 else None
             ),
             allowed_next_tools=("read_document_window", "extract_records", "profile_document", "locate_sources"),
+            recommended_next_actions=tuple(recommended_next_actions),
         )
 
     def _extract_records(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1067,12 +1169,37 @@ class EvidenceActionRegistry:
         source_text_parts: list[str] = []
         source_id = None
         data_form = None
+        coverage: list[dict[str, Any]] = []
         for evidence_ref in evidence_refs:
             evidence = state.evidence.get(evidence_ref)
             if evidence is None:
                 continue
             source_id = source_id or evidence.source_id
             data_form = data_form or evidence.data_form
+            payload = evidence.payload or {}
+            if evidence.tool_name == "search_document":
+                coverage.append(
+                    {
+                        "evidence_ref": evidence_ref,
+                        "source_id": evidence.source_id,
+                        "query": payload.get("query"),
+                        "total_matches": payload.get("total_matches"),
+                        "returned_matches": payload.get("returned_matches"),
+                        "more_matches_available": bool(payload.get("more_matches_available")),
+                        "unreturned_matches": payload.get("unreturned_matches") or [],
+                    }
+                )
+            elif evidence.tool_name == "read_document_window":
+                coverage.append(
+                    {
+                        "evidence_ref": evidence_ref,
+                        "source_id": evidence.source_id,
+                        "query": payload.get("query"),
+                        "start_line": payload.get("start_line"),
+                        "end_line": payload.get("end_line"),
+                        "more_matches_available": False,
+                    }
+                )
             if isinstance(evidence.payload.get("text"), str):
                 source_text_parts.append(str(evidence.payload["text"]))
             windows = evidence.payload.get("windows")
@@ -1108,6 +1235,7 @@ class EvidenceActionRegistry:
         regex = spec.get("regex") if isinstance(spec, dict) else None
         if regex and source_text:
             flags = re.MULTILINE | re.DOTALL if bool(spec.get("dotall")) else re.MULTILINE
+            max_span_chars = max(120, min(int(spec.get("max_span_chars") or 500), 5_000))
             try:
                 pattern = re.compile(str(regex), flags)
             except re.error as exc:
@@ -1121,7 +1249,18 @@ class EvidenceActionRegistry:
                     negative_scope={"kind": "invalid_extraction_spec", "error": str(exc)},
                     allowed_next_tools=("extract_records", "read_document_window"),
                 )
+            wide_matches: list[dict[str, Any]] = []
             for match in pattern.finditer(source_text):
+                span = match.span()
+                if span[1] - span[0] > max_span_chars:
+                    wide_matches.append(
+                        {
+                            "span": span,
+                            "max_span_chars": max_span_chars,
+                            "preview": match.group(0)[:240],
+                        }
+                    )
+                    continue
                 if match.groupdict():
                     record = dict(match.groupdict())
                 else:
@@ -1130,6 +1269,42 @@ class EvidenceActionRegistry:
                     record = dict(zip(fields, values, strict=False)) if fields else {"match": match.group(0)}
                 record.setdefault("provenance", {"evidence_refs": evidence_refs, "span": match.span()})
                 records.append(record)
+            if wide_matches:
+                return state.add_evidence(
+                    tool_name="extract_records",
+                    ok=False,
+                    summary=(
+                        "Extraction regex matched spans that are too wide for reliable record provenance. "
+                        "Tighten the regex to one record boundary or provide copied records."
+                    ),
+                    payload={
+                        "error": "extraction_match_span_too_large",
+                        "wide_matches": wide_matches[:10],
+                        "evidence_refs": evidence_refs,
+                        "spec": spec,
+                    },
+                    source_id=source_id,
+                    data_form=data_form,
+                    negative_scope={
+                        "kind": "extraction_match_span_too_large",
+                        "evidence_refs": evidence_refs,
+                    },
+                    allowed_next_tools=("extract_records", "read_document_window", "search_document"),
+                    recommended_next_actions=(
+                        {
+                            "tool_name": "extract_records",
+                            "arguments": {
+                                "evidence_refs": evidence_refs,
+                                "spec": {
+                                    "regex": "<tighter one-record regex or copied records>",
+                                    "dotall": True,
+                                    "max_span_chars": max_span_chars,
+                                },
+                            },
+                            "reason": "Retry with a tighter record-boundary regex so captured fields come from the same record span.",
+                        },
+                    ),
+                )
 
         normalized_source_text = re.sub(r"\s+", "", source_text.casefold())
         unsupported_values: list[str] = []
@@ -1167,7 +1342,10 @@ class EvidenceActionRegistry:
             return state.add_evidence(
                 tool_name="extract_records",
                 ok=False,
-                summary="Extraction spec did not produce a record set.",
+                summary=(
+                    "Extraction spec did not produce a record set. "
+                    "Use an executable regex with capture groups, or provide records copied exactly from cited evidence."
+                ),
                 payload={"spec": spec, "evidence_refs": evidence_refs},
                 source_id=source_id,
                 data_form=data_form,
@@ -1176,12 +1354,31 @@ class EvidenceActionRegistry:
                     "evidence_refs": evidence_refs,
                 },
                 allowed_next_tools=("search_document", "read_document_window", "profile_document", "blocked"),
+                recommended_next_actions=(
+                    {
+                        "tool_name": "extract_records",
+                        "arguments": {
+                            "evidence_refs": evidence_refs,
+                            "spec": {
+                                "regex": "<Python regex over cited window text, preferably with named groups>",
+                                "dotall": True,
+                            },
+                        },
+                        "reason": "Retry extraction with an executable regex or copied records if the cited window contains the needed record boundaries and values.",
+                    },
+                ),
             )
         return state.add_evidence(
             tool_name="extract_records",
             ok=True,
             summary=f"Extracted {len(records)} provenance-backed record(s).",
-            payload={"records": records, "evidence_refs": evidence_refs, "spec": spec},
+            payload={
+                "records": records,
+                "evidence_refs": evidence_refs,
+                "spec": spec,
+                "coverage": coverage,
+                "partial_coverage": any(item.get("more_matches_available") for item in coverage),
+            },
             source_id=source_id,
             data_form=data_form,
             allowed_next_tools=("bind", "read_document_window", "search_document"),
@@ -1680,6 +1877,178 @@ class EvidenceActionRegistry:
             allowed_next_tools=("run_verified_compute", "bind", "blocked"),
         )
 
+    def _discover_join_paths(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        binding_refs = tuple(
+            str(item) for item in arguments.get("binding_refs", []) if str(item).strip()
+        )
+        if not binding_refs:
+            binding_refs = tuple(
+                binding.id for binding in state.bindings.values()
+                if binding.relation_name
+            )
+        bindings = [state.bindings.get(ref) for ref in binding_refs]
+        bindings = [binding for binding in bindings if binding is not None and binding.relation_name]
+        if len(bindings) < 2:
+            return state.add_evidence(
+                tool_name="discover_join_paths",
+                ok=False,
+                summary="discover_join_paths requires at least two verified relation bindings.",
+                payload={
+                    "binding_refs": list(binding_refs),
+                    "available_relations": [
+                        {
+                            "binding_ref": binding.id,
+                            "relation_name": binding.relation_name,
+                            "columns": list(binding.allowed_columns),
+                        }
+                        for binding in state.bindings.values()
+                        if binding.relation_name
+                    ],
+                },
+                negative_scope={"kind": "insufficient_verified_relations_for_join_discovery"},
+                allowed_next_tools=("bind", "inspect_relation", "run_verified_compute", "blocked"),
+            )
+
+        sample_limit = max(1, min(int(arguments.get("sample_limit") or 2000), 5000))
+        max_pairs = max(1, min(int(arguments.get("max_pairs") or 80), 200))
+        relation_payloads: list[dict[str, Any]] = []
+        frames: dict[str, pd.DataFrame] = {}
+        load_errors: list[dict[str, Any]] = []
+        for binding in bindings:
+            try:
+                frame = load_binding_frame(state, binding)
+            except Exception as exc:  # noqa: BLE001 - failed relation load is evidence
+                load_errors.append(
+                    {
+                        "binding_ref": binding.id,
+                        "relation_name": binding.relation_name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            sample = frame.head(sample_limit).copy()
+            frames[binding.id] = sample
+            relation_payloads.append(
+                {
+                    "binding_ref": binding.id,
+                    "relation_name": binding.relation_name,
+                    "binding_type": binding.binding_type,
+                    "row_count_sampled": int(len(sample)),
+                    "row_count_total": int(len(frame)),
+                    "columns": [str(column) for column in sample.columns],
+                }
+            )
+
+        def values_for(frame: pd.DataFrame, column: str) -> set[str]:
+            values: set[str] = set()
+            if column not in frame.columns:
+                return values
+            for value in frame[column].dropna().head(sample_limit):
+                text = str(value).strip()
+                if text:
+                    values.add(text.casefold())
+                if len(values) >= sample_limit:
+                    break
+            return values
+
+        candidates: list[dict[str, Any]] = []
+        binding_items = [binding for binding in bindings if binding.id in frames]
+        for left_index, left in enumerate(binding_items):
+            left_frame = frames[left.id]
+            left_columns = [str(column) for column in left_frame.columns][:80]
+            for right in binding_items[left_index + 1 :]:
+                right_frame = frames[right.id]
+                right_columns = [str(column) for column in right_frame.columns][:80]
+                right_norm = {_normalize(column): column for column in right_columns}
+                for left_column in left_columns:
+                    normalized = _normalize(left_column)
+                    if normalized and normalized in right_norm:
+                        right_column = right_norm[normalized]
+                        overlap = values_for(left_frame, left_column) & values_for(right_frame, right_column)
+                        candidates.append(
+                            {
+                                "left_binding_ref": left.id,
+                                "left_relation_name": left.relation_name,
+                                "left_column": left_column,
+                                "right_binding_ref": right.id,
+                                "right_relation_name": right.relation_name,
+                                "right_column": right_column,
+                                "match_reason": "same_normalized_column_name",
+                                "overlap_count": len(overlap),
+                                "overlap_values_preview": sorted(overlap)[:10],
+                            }
+                        )
+
+                value_sets_left = {
+                    column: values_for(left_frame, column)
+                    for column in left_columns
+                }
+                value_sets_right = {
+                    column: values_for(right_frame, column)
+                    for column in right_columns
+                }
+                for left_column, left_values in value_sets_left.items():
+                    if not left_values:
+                        continue
+                    for right_column, right_values in value_sets_right.items():
+                        if not right_values:
+                            continue
+                        overlap = left_values & right_values
+                        if not overlap:
+                            continue
+                        if _normalize(left_column) == _normalize(right_column):
+                            continue
+                        candidates.append(
+                            {
+                                "left_binding_ref": left.id,
+                                "left_relation_name": left.relation_name,
+                                "left_column": left_column,
+                                "right_binding_ref": right.id,
+                                "right_relation_name": right.relation_name,
+                                "right_column": right_column,
+                                "match_reason": "sample_value_overlap",
+                                "overlap_count": len(overlap),
+                                "left_unique_sample_values": len(left_values),
+                                "right_unique_sample_values": len(right_values),
+                                "overlap_values_preview": sorted(overlap)[:10],
+                            }
+                        )
+
+        candidates.sort(
+            key=lambda item: (
+                item.get("match_reason") != "same_normalized_column_name",
+                -int(item.get("overlap_count") or 0),
+                str(item.get("left_relation_name") or ""),
+                str(item.get("left_column") or ""),
+            )
+        )
+        candidates = candidates[:max_pairs]
+        return state.add_evidence(
+            tool_name="discover_join_paths",
+            ok=True,
+            summary=f"Discovered {len(candidates)} generic join candidate(s) across verified relations.",
+            payload={
+                "binding_refs": [binding.id for binding in binding_items],
+                "sample_limit": sample_limit,
+                "relations": relation_payloads,
+                "load_errors": load_errors,
+                "join_candidates": candidates,
+            },
+            negative_scope=(
+                {"kind": "join_path_candidates_not_found", "binding_refs": list(binding_refs)}
+                if not candidates
+                else None
+            ),
+            allowed_next_tools=("run_verified_compute", "inspect_relation", "verify_alignment", "blocked"),
+            recommended_next_actions=(
+                _recommend(
+                    "run_verified_compute",
+                    {"binding_refs": [binding.id for binding in binding_items]},
+                    "Use only observed relation names and candidate join columns if they satisfy the question.",
+                ),
+            ) if candidates else (),
+        )
+
     def _run_verified_compute(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
         sql = str(arguments.get("sql") or "").strip()
         binding_refs = tuple(
@@ -1759,12 +2128,40 @@ class EvidenceActionRegistry:
             binding_refs=binding_refs,
             evidence_refs=evidence_refs,
         )
+        recommended_actions: list[dict[str, Any]] = []
+        if len(binding_refs) >= 2 and re.search(r"\bunion(?:\s+all)?\b", sql, re.IGNORECASE):
+            recommended_actions.append(
+                _recommend(
+                    "run_verified_compute",
+                    {"binding_refs": list(binding_refs)},
+                    (
+                        "This multi-relation SQL uses UNION, which stacks rows and keeps column names by position. "
+                        "If the question asks for different fields side by side, retry with a join/alignment on observed shared keys "
+                        "so each requested field remains a distinct output column."
+                    ),
+                )
+            )
+        recommended_actions.append(
+            _recommend(
+                "verify_alignment",
+                {
+                    "decision": "candidate_answer",
+                    "target_kind": "compute_result",
+                    "compute_refs": [compute_result.id],
+                    "evidence_refs": list(evidence_refs),
+                    "binding_refs": list(binding_refs),
+                    "alignment": "<explain why this exact compute result satisfies the question and knowledge>",
+                },
+                "Classify this compute result before submit_final; final submission also requires explicit answer.columns.",
+            )
+        )
         return state.add_evidence(
             tool_name="run_verified_compute",
             ok=True,
             summary=f"Verified compute produced {len(rows)} row(s) and {len(columns)} column(s).",
             payload={"compute_ref": compute_result.id, "columns": columns, "rows": rows[:50], "sql": sql},
-            allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation"),
+            allowed_next_tools=("verify_alignment", "submit_final", "run_verified_compute", "inspect_relation"),
+            recommended_next_actions=tuple(recommended_actions),
         )
 
     def _submit_final(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1789,16 +2186,108 @@ class EvidenceActionRegistry:
                     negative_scope={"kind": "empty_final_compute_ref", "compute_ref": compute_ref},
                     allowed_next_tools=("run_verified_compute", "inspect_relation", "blocked"),
                 )
-            state.final_answer = {
-                "columns": list(compute_result.columns),
-                "rows": [list(row) for row in compute_result.rows],
-                "compute_ref": compute_ref,
-            }
+            if not _compute_has_candidate_answer_verification(state, compute_ref):
+                return state.add_evidence(
+                    tool_name="submit_final",
+                    ok=False,
+                    summary="Compute-backed submit_final requires a candidate_answer verify_alignment decision for this compute_ref.",
+                    payload={
+                        "compute_ref": compute_ref,
+                        "columns": list(compute_result.columns),
+                    },
+                    negative_scope={
+                        "kind": "unverified_compute_final",
+                        "compute_ref": compute_ref,
+                    },
+                    allowed_next_tools=("verify_alignment", "run_verified_compute", "inspect_relation", "blocked"),
+                    recommended_next_actions=(
+                        _recommend(
+                            "verify_alignment",
+                            {
+                                "decision": "candidate_answer",
+                                "target_kind": "compute_result",
+                                "compute_refs": [compute_ref],
+                                "evidence_refs": list(compute_result.evidence_refs),
+                                "binding_refs": list(compute_result.binding_refs),
+                                "alignment": "<explain why this exact compute result satisfies the question and knowledge>",
+                            },
+                            "Classify this compute result before final submission.",
+                        ),
+                    ),
+                )
+            answer_payload = arguments.get("answer")
+            normalized_answer = _project_compute_answer(
+                answer_payload,
+                compute_columns=compute_result.columns,
+                compute_rows=compute_result.rows,
+            )
+            if normalized_answer is None and (
+                isinstance(answer_payload, list)
+                or (
+                    isinstance(answer_payload, dict)
+                    and "columns" in answer_payload
+                    and "rows" in answer_payload
+                )
+            ):
+                normalized_answer = _answer_table_from_payload(answer_payload)
+            if normalized_answer is not None:
+                columns, rows = normalized_answer
+                supported, unsupported_values = _projection_values_supported(
+                    rows,
+                    compute_result.rows,
+                )
+                if not supported:
+                    return state.add_evidence(
+                        tool_name="submit_final",
+                        ok=False,
+                        summary="Compute-backed final answer contains values not present in the cited compute result.",
+                        payload={
+                            "compute_ref": compute_ref,
+                            "unsupported_values": unsupported_values,
+                            "answer": arguments.get("answer"),
+                        },
+                        negative_scope={
+                            "kind": "unsupported_compute_projection_values",
+                            "compute_ref": compute_ref,
+                            "unsupported_values": unsupported_values,
+                        },
+                        allowed_next_tools=("run_verified_compute", "submit_final", "inspect_relation", "blocked"),
+                    )
+                state.final_answer = {
+                    "columns": columns,
+                    "rows": rows,
+                    "compute_ref": compute_ref,
+                    "binding_refs": list(compute_result.binding_refs),
+                    "evidence_refs": list(compute_result.evidence_refs),
+                    "alignment": str(arguments.get("alignment") or ""),
+                }
+                return state.add_evidence(
+                    tool_name="submit_final",
+                    ok=True,
+                    summary=f"Final answer materialized as a compute-backed projection from {compute_ref}.",
+                    payload=state.final_answer,
+                )
             return state.add_evidence(
                 tool_name="submit_final",
-                ok=True,
-                summary=f"Final answer materialized from {compute_ref}.",
-                payload=state.final_answer,
+                ok=False,
+                summary="Compute-backed submit_final requires an explicit answer.columns projection.",
+                payload={
+                    "compute_ref": compute_ref,
+                    "available_columns": list(compute_result.columns),
+                    "answer": answer_payload,
+                },
+                negative_scope={
+                    "kind": "missing_final_projection",
+                    "compute_ref": compute_ref,
+                },
+                allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation", "blocked"),
+                recommended_next_actions=(
+                    _recommend(
+                        "submit_final",
+                        {"compute_ref": compute_ref, "answer": {"columns": list(compute_result.columns)}},
+                        "Choose the final output columns explicitly from the compute result.",
+                    ),
+                ),
             )
 
         normalized = _answer_table_from_payload(arguments.get("answer"))

@@ -43,7 +43,10 @@ Allowed flow:
 - observe the real environment through tools such as inspect_source, sample_records, search_values, read_document_window.
 - call bind only after successful evidence proves a usable source/field/value/record set.
 - call run_verified_compute only over verified relation names from bindings.
-- call submit_final with either a successful compute_ref or a direct answer backed by verified value/document/operation bindings and evidence_refs.
+- after a successful compute, call verify_alignment(decision="candidate_answer", target_kind="compute_result") before relying on it as final.
+- call submit_final with compute_ref only after candidate_answer verification and with an explicit answer.columns projection.
+- submit_final may project or alias values already present in the compute result, but it must not add new values.
+- call submit_final(answer=..., binding_refs=..., evidence_refs=...) only for direct answers backed by verified value/document/operation bindings and evidence_refs.
 - call blocked when evidence is insufficient, conflicting, or no valid action remains; cite evidence_refs when possible.
 - use track_requirements to maintain a generic coverage checklist when the task has multiple required sources, filters, joins, metrics, units, or output constraints.
 - use verify_alignment to classify semantic alternatives, document evidence, compute results, final candidates, and blocked/conflict decisions before relying on them.
@@ -53,22 +56,30 @@ Rules:
 - knowledge.md is an authority for semantics, not a physical schema.
 - Candidate sources, filenames, document windows, and semantic similarities are not bindings.
 - PDF/MD/video are not structured tables. Documents require window evidence and either extracted record-set evidence before compute or direct document-window/value bindings before direct final.
+- extract_records only executes an explicit spec: either `{"regex": "...", "fields": [...], "dotall": true}` / named capture groups, or `{"records": [...]}` copied from cited windows. Natural-language extraction rules are not executable evidence.
 - Video is unsupported in v1. It can be inspected for metadata but cannot support final evidence.
 - Every physical field/table/path used for compute must come from observed evidence and verified bindings.
 - Verifier decisions and requirement tracking are audit evidence, not physical data. They cannot replace real observations.
+- A requested answer may require multiple verified sources. If different requested fields are observed in different relations, bind each relation and join or align them using observed shared keys instead of requiring one source to contain every field.
+- Use discover_join_paths when multiple verified relations may need joining and the shared key is uncertain.
+- Any transformed value, row reduction, aggregation, ordering, join, or direct extraction must be justified by observed evidence, knowledge text, or a verifier decision.
+- Do not turn unobserved tokens into physical fields, filters, tables, files, or values.
 """
 
 
 TOOL_GUIDE = {
     "tool_protocol": "Use native tool calls. Text-only answers are not accepted.",
-    "final_protocol": "Use submit_final(compute_ref=...) after run_verified_compute succeeds, or submit_final(answer=..., binding_refs=..., evidence_refs=...) for direct verified document/value evidence.",
+    "final_protocol": "For compute-backed final answers, first verify_alignment(candidate_answer, target_kind=compute_result), then submit_final(compute_ref=..., answer={columns:[...]}) with explicit final columns. For direct document/value evidence, provide answer plus binding_refs and evidence_refs.",
     "binding_protocol": "Use bind(...) with evidence_refs before compute.",
     "requirement_protocol": "Use track_requirements(...) to declare/update generic required answer conditions when the answer depends on multiple constraints.",
     "verifier_protocol": "Use verify_alignment(...) to mark observed evidence/compute as bindable, candidate_answer, intermediate, not_applicable, needs_more_evidence, conflict, or blocked_ok.",
     "relation_protocol": "Use generated relation_name values such as rel_0001 in SQL.",
+    "multi_source_protocol": "Requested fields may be assembled from multiple verified relations when observed shared keys support a join/alignment.",
+    "join_discovery_protocol": "Use discover_join_paths over verified relations to observe generic same-column or sample-overlap join candidates before uncertain joins.",
+    "evidence_protocol": "Use observed evidence, knowledge text, or verifier decisions to justify transformations, filters, joins, aggregation, ordering, and direct extraction.",
     "failure_protocol": "When a tool returns negative_scope or a repeated failure, switch tools or call blocked.",
     "blocked_protocol": "When calling blocked, cite evidence_refs that support the absence/conflict/exhaustion claim whenever possible.",
-    "document_protocol": "For PDF/MD use profile_document or search_document before extract_records.",
+    "document_protocol": "For PDF/MD use profile_document or search_document before extract_records. extract_records requires executable regex or copied records, not natural-language rules.",
     "sql_protocol": "Use inspect_relation after bind and before repairing failed SQL.",
 }
 
@@ -94,7 +105,6 @@ def build_context_fragments(
         {
             "id": section.id,
             "heading_path": section.heading_path,
-            "score": section.score,
             "line_start": section.line_start,
             "line_end": section.line_end,
             "text": section.text,

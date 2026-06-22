@@ -73,7 +73,7 @@ def _scripted_csv_model() -> _ScriptedModel:
             },
             "call_verify_answer",
         ),
-        _call("submit_final", {"compute_ref": "comp_0001"}, "call_final"),
+        _call("submit_final", {"compute_ref": "comp_0001", "answer": {"columns": ["amount"]}}, "call_final"),
     )
 
 
