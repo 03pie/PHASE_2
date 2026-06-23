@@ -147,6 +147,62 @@ def _trace_action_name(action: ModelAction, evidence: Evidence, *, guard_allowed
     return str(action.kind)
 
 
+def _model_turn_trace_action(tool_calls: list[dict[str, Any]]) -> str:
+    tool_names = [
+        str(call.get("name") or "").strip()
+        for call in tool_calls
+        if str(call.get("name") or "").strip()
+    ]
+    if not tool_names:
+        return "llm_response"
+    return "+".join(tool_names)
+
+
+def _model_turn_action_input(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    if not tool_calls:
+        return {}
+    compact_calls = [
+        {
+            "tool_name": str(call.get("name") or ""),
+            "tool_call_id": call.get("id"),
+            "arguments": _compact(call.get("args") or {}),
+        }
+        for call in tool_calls
+    ]
+    if len(compact_calls) == 1:
+        call = compact_calls[0]
+        return {
+            "tool_name": call["tool_name"],
+            "tool_call_id": call["tool_call_id"],
+            "arguments": call["arguments"],
+        }
+    return {"tool_calls": compact_calls}
+
+
+def _model_response_thought(response: Any) -> str:
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+                    continue
+                parts.append(json.dumps(item, ensure_ascii=False, default=str))
+                continue
+            parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
 def _answer_from_compute(state: LoopState, compute_ref: str) -> AnswerTable | None:
     compute = state.compute_results.get(compute_ref)
     if compute is None or not compute.ok:
@@ -851,8 +907,9 @@ class CodexEvidenceController:
                 raw["context_fragment_ids"] = context_fragment_ids
                 raw["context_truncated"] = context_truncated
                 trace.add(
-                    action="codex_turn",
-                    thought="Model sampling returned native tool calls.",
+                    action=_model_turn_trace_action(tool_calls),
+                    action_input=_model_turn_action_input(tool_calls),
+                    thought=_model_response_thought(response),
                     raw_response=raw,
                     observation={
                         "turn": turn,

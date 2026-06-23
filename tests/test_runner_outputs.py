@@ -11,7 +11,7 @@ import data_agent_baseline.run.runner as runner_module
 from langchain_core.messages import AIMessage
 
 from data_agent_baseline.config import AgentConfig, AppConfig, DatasetConfig, RunConfig
-from data_agent_baseline.run.runner import _run_single_task_with_timeout, run_single_task
+from data_agent_baseline.run.runner import _run_single_task_with_timeout, _write_json, run_single_task
 
 
 class _ScriptedModel:
@@ -34,16 +34,33 @@ class _ScriptedModel:
                 ],
             )
         response = self.responses.pop(0)
-        return AIMessage(content="", tool_calls=response["tool_calls"])  # type: ignore[arg-type]
+        return AIMessage(
+            content=str(response.get("content") or ""),
+            tool_calls=response["tool_calls"],  # type: ignore[arg-type]
+        )
 
 
-def _call(name: str, args: dict[str, object], call_id: str) -> dict[str, object]:
-    return {"tool_calls": [{"name": name, "args": args, "id": call_id}]}
+def _call(
+    name: str,
+    args: dict[str, object],
+    call_id: str,
+    *,
+    content: str = "",
+) -> dict[str, object]:
+    return {
+        "content": content,
+        "tool_calls": [{"name": name, "args": args, "id": call_id}],
+    }
 
 
 def _scripted_csv_model() -> _ScriptedModel:
     return _ScriptedModel(
-        _call("inspect_source", {"path": "/context/records.csv"}, "call_inspect"),
+        _call(
+            "inspect_source",
+            {"path": "/context/records.csv"},
+            "call_inspect",
+            content="I will inspect the records source.",
+        ),
         _call(
             "bind",
             {
@@ -141,17 +158,47 @@ def test_runner_preserves_prediction_and_trace_contract(tmp_path: Path) -> None:
     tool_steps = [
         step
         for step in trace["steps"]
-        if step["action"] in {"inspect_source", "bind", "inspect_relation", "run_verified_compute"}
+        if step["tool_call_id"]
+        and step["action"] in {"inspect_source", "bind", "inspect_relation", "run_verified_compute"}
     ]
     assert tool_steps
     assert all(step["tool_call_id"] for step in tool_steps)
-    loop_steps = [step for step in trace["steps"] if step["action"] == "codex_turn"]
+    assert "codex_turn" not in actions
+    loop_steps = [
+        step
+        for step in trace["steps"]
+        if not step["tool_call_id"] and "tool_calls" in step["observation"]
+    ]
     assert loop_steps
     assert all("tool_calls" in step["observation"] for step in loop_steps)
     assert any(step["observation"]["tool_calls"] for step in loop_steps)
+    assert loop_steps[0]["action"] == "inspect_source"
+    assert loop_steps[0]["action_input"] == {
+        "tool_name": "inspect_source",
+        "tool_call_id": "call_inspect",
+        "arguments": {"path": "/context/records.csv"},
+    }
+    assert loop_steps[0]["thought"] == "I will inspect the records source."
     assert trace["succeeded"] is True
     assert trace["status"] == "completed"
     assert "e2e_elapsed_seconds" in trace
+
+
+def test_write_json_converts_non_finite_numbers_to_null(tmp_path: Path) -> None:
+    path = tmp_path / "trace.json"
+
+    _write_json(
+        path,
+        {
+            "value": float("nan"),
+            "nested": [float("inf"), -float("inf"), 1.5],
+        },
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    assert json.loads(text) == {"value": None, "nested": [None, None, 1.5]}
 
 
 def _send_large_subprocess_result(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import multiprocessing
 import os
 import subprocess
@@ -130,9 +131,27 @@ def _write_text_file(path: Path, content: str, *, fallback_direct: bool) -> None
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     _write_text_file(
         path,
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(_strict_json_value(payload), ensure_ascii=False, indent=2, allow_nan=False)
+        + "\n",
         fallback_direct=True,
     )
+
+
+def _strict_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _strict_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_json_value(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return _strict_json_value(value.item())
+        except (TypeError, ValueError):
+            pass
+    return value
 
 
 def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
