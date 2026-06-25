@@ -61,6 +61,15 @@ class KnowledgeSection:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeLookupEntry:
+    token: str
+    section_refs: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    status: str = "document_mention_only"
+    must_verify: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class SourceRef:
     id: str
     path: Path
@@ -332,12 +341,14 @@ class LoopState:
     sources: dict[str, SourceRef] = dataclass_field(default_factory=dict)
     source_by_path: dict[str, str] = dataclass_field(default_factory=dict)
     knowledge_sections: list[KnowledgeSection] = dataclass_field(default_factory=list)
+    knowledge_lookup: dict[str, KnowledgeLookupEntry] = dataclass_field(default_factory=dict)
     matched_sections: list[KnowledgeSection] = dataclass_field(default_factory=list)
     candidates: dict[str, CandidateRef] = dataclass_field(default_factory=dict)
     evidence: dict[str, Evidence] = dataclass_field(default_factory=dict)
     bindings: dict[str, Binding] = dataclass_field(default_factory=dict)
     requirements: dict[str, Requirement] = dataclass_field(default_factory=dict)
     compute_results: dict[str, ComputeResult] = dataclass_field(default_factory=dict)
+    document_slice_lines: dict[str, int] = dataclass_field(default_factory=dict)
     guard_feedback: list[dict[str, Any]] = dataclass_field(default_factory=list)
     negative_scopes: list[dict[str, Any]] = dataclass_field(default_factory=list)
     _negative_scope_keys: set[str] = dataclass_field(default_factory=set)

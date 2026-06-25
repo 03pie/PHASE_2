@@ -40,7 +40,7 @@ SYSTEM_PROMPT = """You are a Codex-style evidence agent for data tasks.
 Use native tool calls only. Do not put tool requests in assistant text.
 
 Allowed flow:
-- observe the real environment through tools such as inspect_source, sample_records, search_values, read_document_window.
+- observe the real environment through tools such as inspect_source, sample_records, search_values, preview_document, search_document, read_document_slice.
 - call bind only after successful evidence proves a usable source/field/value/record set.
 - call run_verified_compute only over verified relation names from bindings.
 - after a successful compute, call verify_alignment(decision="candidate_answer", target_kind="compute_result") before relying on it as final.
@@ -54,9 +54,9 @@ Allowed flow:
 Rules:
 - Do not assume a business domain. Use only the user question, knowledge document text, and observations.
 - knowledge.md is an authority for semantics, not a physical schema.
-- Candidate sources, filenames, document windows, and semantic similarities are not bindings.
-- PDF/MD/video are not structured tables. Documents require window evidence and either extracted record-set evidence before compute or direct document-window/value bindings before direct final.
-- extract_records only executes an explicit spec: either `{"regex": "...", "fields": [...], "dotall": true}` / named capture groups, or `{"records": [...]}` copied from cited windows. Natural-language extraction rules are not executable evidence.
+- Candidate sources, filenames, document search hits, and semantic similarities are not bindings.
+- PDF/MD/video are not structured tables. Documents require slice evidence and either extracted record-set evidence before compute or direct document/value bindings before direct final.
+- extract_records only executes an explicit spec: either `{"regex": "...", "fields": [...], "dotall": true}` / named capture groups, or `{"records": [...]}` copied from cited document slices. Natural-language extraction rules are not executable evidence.
 - Video is unsupported in v1. It can be inspected for metadata but cannot support final evidence.
 - Every physical field/table/path used for compute must come from observed evidence and verified bindings.
 - Verifier decisions and requirement tracking are audit evidence, not physical data. They cannot replace real observations.
@@ -77,11 +77,19 @@ TOOL_GUIDE = {
     "multi_source_protocol": "Requested fields may be assembled from multiple verified relations when observed shared keys support a join/alignment.",
     "join_discovery_protocol": "Use discover_join_paths over verified relations to observe generic same-column or sample-overlap join candidates before uncertain joins.",
     "evidence_protocol": "Use observed evidence, knowledge text, or verifier decisions to justify transformations, filters, joins, aggregation, ordering, and direct extraction.",
+    "knowledge_protocol": "Start from the knowledge catalog. Use retrieve_knowledge(mode='catalog') to inspect the catalog, mode='token' to resolve mentions to sections, and mode='section' with section_ids to read complete slices before using knowledge semantics.",
     "failure_protocol": "When a tool returns negative_scope or a repeated failure, switch tools or call blocked.",
     "blocked_protocol": "When calling blocked, cite evidence_refs that support the absence/conflict/exhaustion claim whenever possible.",
-    "document_protocol": "For PDF/MD use profile_document or search_document before extract_records. extract_records requires executable regex or copied records, not natural-language rules.",
+    "document_protocol": "For PDF/MD use preview_document to see start/end and a slice catalog, search_document only to locate relevant lines/slices, and read_document_slice to read complete evidence text. slice_lines is the model's reading intent: if set for a source, later document tools for that source reuse it unless explicitly changed. Use center_line/context_lines when you need a focused expansion. extract_records must cite read_document_slice evidence and requires executable regex or copied records.",
     "sql_protocol": "Use inspect_relation after bind and before repairing failed SQL.",
 }
+
+
+def _preview(text: str, *, limit: int = 120) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
 
 
 def build_context_fragments(
@@ -101,13 +109,36 @@ def build_context_fragments(
         }
         for source in state.sources.values()
     ]
-    knowledge = [
+    knowledge_catalog = {
+        "instruction": (
+            "This is a navigable catalog for /context/knowledge.md. The previews are not full "
+            "evidence. Call retrieve_knowledge with mode='section' or mode='token' to read "
+            "complete slices before relying on a knowledge definition."
+        ),
+        "section_count": len(state.knowledge_sections),
+        "lookup_count": len(state.knowledge_lookup),
+        "sections": [
+            {
+                "id": section.id,
+                "heading_path": section.heading_path,
+                "line_start": section.line_start,
+                "line_end": section.line_end,
+                "mention_count": len(section.mentions),
+                "mentions": list(section.mentions[:6]),
+                "preview": _preview(section.text),
+            }
+            for section in state.knowledge_sections
+        ],
+        "lookup_access": "Call retrieve_knowledge(mode='catalog') for lookup tokens, or mode='token' with candidate mentions.",
+    }
+    matched_knowledge = [
         {
             "id": section.id,
             "heading_path": section.heading_path,
             "line_start": section.line_start,
             "line_end": section.line_end,
             "text": section.text,
+            "mentions": list(section.mentions),
         }
         for section in state.matched_sections[:6]
     ]
@@ -156,7 +187,8 @@ def build_context_fragments(
         ContextFragment("ctx_question", "question", state.question),
         _json_fragment("tool_guide", TOOL_GUIDE, 4_000),
         _json_fragment("inventory", inventory, 8_000),
-        _json_fragment("knowledge", knowledge, 12_000),
+        _json_fragment("knowledge_catalog", knowledge_catalog, 16_000),
+        _json_fragment("matched_knowledge_sections", matched_knowledge, 12_000),
         _json_fragment("candidates", candidates, 6_000),
         _json_fragment("latest_evidence", evidence, 12_000),
         _json_fragment("source_coverage", source_coverage, 8_000),

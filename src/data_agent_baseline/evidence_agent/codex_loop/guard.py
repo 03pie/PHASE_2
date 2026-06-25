@@ -170,18 +170,18 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
         if existing is not None:
             source = state.sources.get(source_id)
             if source is not None and source.data_form in _DOCUMENT_FORMS:
-                preferred = ("profile_document", "search_document", "read_document_window", "bind")
-                allowed = ("profile_document", "search_document", "read_document_window", "bind")
+                preferred = ("preview_document", "search_document", "read_document_slice", "bind")
+                allowed = ("preview_document", "search_document", "read_document_slice", "bind")
                 fallback = (
                     {
-                        "tool_name": "profile_document",
+                        "tool_name": "preview_document",
                         "arguments": {"source_ref": source_id},
-                        "reason": "The source form is already observed; profile the document instead of re-inspecting it.",
+                        "reason": "The source form is already observed; preview the document before reading slices.",
                     },
                     {
                         "tool_name": "search_document",
                         "arguments": {"source_ref": source_id, "query": state.question},
-                        "reason": "Search bounded document windows after observing the document source.",
+                        "reason": "Search document text to locate relevant slices after observing the document source.",
                     },
                 )
             else:
@@ -224,23 +224,23 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
                 ),
             )
 
-    if tool_name == "profile_document" and source_id:
+    if tool_name == "preview_document" and source_id:
         existing = _successful_observation(
             state,
-            tool_name="profile_document",
+            tool_name="preview_document",
             source_id=source_id,
         )
         if existing is not None:
             return _noop_observation_guard(
                 state,
-                reason="This document profile has already been observed successfully; repeat profiling would not add evidence.",
-                allowed_next_tools=("search_document", "read_document_window", "extract_records", "bind"),
-                preferred_tools=("search_document", "read_document_window", "extract_records", "bind"),
+                reason="This document preview has already been observed successfully; repeat previewing would not add evidence.",
+                allowed_next_tools=("search_document", "read_document_slice", "extract_records", "bind"),
+                preferred_tools=("search_document", "read_document_slice", "extract_records", "bind"),
                 fallback_actions=(
                     {
                         "tool_name": "search_document",
                         "arguments": {"source_ref": source_id, "query": state.question},
-                        "reason": "Search bounded windows after profiling the document.",
+                        "reason": "Search document text to locate relevant slices after previewing the document.",
                     },
                 ),
             )
@@ -254,23 +254,27 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
             query=query,
         )
         if existing is not None:
+            payload = existing.payload or {}
+            read_recommendation = None
+            for match in payload.get("slice_matches") or []:
+                if isinstance(match, dict) and isinstance(match.get("recommended_read"), dict):
+                    read_recommendation = {
+                        "tool_name": "read_document_slice",
+                        "arguments": match["recommended_read"],
+                        "reason": "Read the slice located by the existing search result.",
+                    }
+                    break
             return _noop_observation_guard(
                 state,
-                reason="This document query has already returned a successful bounded-window observation; repeat search would not add evidence.",
-                allowed_next_tools=("read_document_window", "extract_records", "bind", "search_document"),
-                preferred_tools=("read_document_window", "extract_records", "bind", "search_document"),
-                fallback_actions=(
-                    {
-                        "tool_name": "extract_records",
-                        "arguments": {"evidence_refs": [existing.id], "spec": {}},
-                        "reason": "If the window contains repeated records, provide an extraction spec over the existing evidence.",
-                    },
-                ),
+                reason="This document query has already returned locator evidence; repeat search would not add evidence.",
+                allowed_next_tools=("read_document_slice", "extract_records", "bind", "search_document"),
+                preferred_tools=("read_document_slice", "extract_records", "bind", "search_document"),
+                fallback_actions=(read_recommendation,) if read_recommendation else (),
             )
 
-    if tool_name == "read_document_window" and source_id:
-        start = action.arguments.get("line_start") or action.arguments.get("start_line")
-        end = action.arguments.get("line_end") or action.arguments.get("end_line")
+    if tool_name == "read_document_slice" and source_id:
+        start = action.arguments.get("start_line")
+        end = action.arguments.get("end_line")
         try:
             start_int = int(start) if start is not None else None
             end_int = int(end) if end is not None else None
@@ -280,7 +284,7 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
         if start_int is not None and end_int is not None:
             existing = _successful_observation(
                 state,
-                tool_name="read_document_window",
+                tool_name="read_document_slice",
                 source_id=source_id,
                 start_line=start_int,
                 end_line=end_int,
@@ -288,14 +292,14 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
             if existing is not None:
                 return _noop_observation_guard(
                     state,
-                    reason="This exact document window has already been read successfully; repeat reading would not add evidence.",
-                    allowed_next_tools=("extract_records", "bind", "search_document", "read_document_window"),
-                    preferred_tools=("extract_records", "bind", "search_document", "read_document_window"),
+                    reason="This exact document slice has already been read successfully; repeat reading would not add evidence.",
+                    allowed_next_tools=("extract_records", "bind", "search_document", "read_document_slice"),
+                    preferred_tools=("extract_records", "bind", "search_document", "read_document_slice"),
                     fallback_actions=(
                         {
                             "tool_name": "bind",
                             "arguments": {"binding_type": "document_window", "evidence_refs": [existing.id]},
-                            "reason": "Bind the existing document window if it directly supports the answer.",
+                            "reason": "Bind the existing document slice if it directly supports the answer.",
                         },
                     ),
                 )
@@ -433,9 +437,9 @@ def guard_action(
                 "inspect_source",
                 "sample_records",
                 "search_values",
-                "profile_document",
+                "preview_document",
                 "search_document",
-                "read_document_window",
+                "read_document_slice",
                 "extract_records",
                 "inspect_relation",
                 "discover_join_paths",
@@ -473,31 +477,31 @@ def guard_action(
                     False,
                     f"{source.data_form} cannot be inspected as a structured table; use a document/video tool.",
                     allowed_next_tools=(
-                        "profile_document",
+                        "preview_document",
                         "search_document",
-                        "read_document_window",
+                        "read_document_slice",
                         "inspect_video",
                         "blocked",
                     ),
                     recommended_next_actions=(
                         {
-                            "tool_name": "profile_document",
+                            "tool_name": "preview_document",
                             "arguments": {"source_ref": source.id},
-                            "reason": "Profile the document before deciding whether windows or extraction can support the task.",
+                            "reason": "Preview the document start/end and slice catalog before reading document evidence.",
                         },
                         {
                             "tool_name": "search_document",
                             "arguments": {"source_ref": source.id, "query": state.question},
-                            "reason": "Search bounded document windows instead of treating the document as a table.",
+                            "reason": "Search document text to locate relevant slices instead of treating the document as a table.",
                         },
                     ),
                 )
-        if action.tool_name == "read_document_window":
+        if action.tool_name == "read_document_slice":
             source_id = str(source_ref or state.source_by_path.get(str(path)) or "")
             source = state.sources.get(source_id)
             if source is not None and source.data_form not in _DOCUMENT_FORMS:
                 return GuardDecision(False, f"{source.data_form} is not a PDF/MD document source.")
-        if action.tool_name in {"profile_document", "search_document"}:
+        if action.tool_name in {"preview_document", "search_document"}:
             source_id = str(source_ref or state.source_by_path.get(str(path)) or "")
             source = state.sources.get(source_id)
             if source is not None and source.data_form not in _DOCUMENT_FORMS:
@@ -537,7 +541,7 @@ def guard_action(
                     "inspect_source",
                     "sample_records",
                     "search_values",
-                    "read_document_window",
+                    "read_document_slice",
                     "search_document",
                     "extract_records",
                 ),
@@ -586,15 +590,15 @@ def guard_action(
                 item.data_form in _DOCUMENT_FORMS
                 and (
                     isinstance(item.payload.get("text"), str)
-                    or isinstance(item.payload.get("windows"), list)
+                    and item.tool_name == "read_document_slice"
                 )
                 for item in evidence_items
             )
             if not has_window_text:
                 return GuardDecision(
                     False,
-                    "Document-window binding requires successful PDF/MD window or search evidence.",
-                    allowed_next_tools=("profile_document", "search_document", "read_document_window"),
+                    "Document-window binding requires successful read_document_slice evidence.",
+                    allowed_next_tools=("preview_document", "search_document", "read_document_slice"),
                 )
         if any(item.data_form == "video" for item in evidence_items):
             return GuardDecision(False, "V1 video evidence cannot become a final binding.")
@@ -665,14 +669,14 @@ def guard_action(
         if partial_document_sets:
             return GuardDecision(
                 False,
-                "Compute cannot use partial document record-set bindings; read remaining document windows or extract a complete record set first: "
+                "Compute cannot use partial document record-set bindings; read remaining document slices or extract a complete record set first: "
                 + ", ".join(partial_document_sets),
-                allowed_next_tools=("search_document", "read_document_window", "extract_records", "bind", "blocked"),
+                allowed_next_tools=("search_document", "read_document_slice", "extract_records", "bind", "blocked"),
                 recommended_next_actions=(
                     {
                         "tool_name": "search_document",
                         "arguments": {"query": state.question},
-                        "reason": "Search/read additional bounded document windows before recomputing from document records.",
+                        "reason": "Search/read additional document slices before recomputing from document records.",
                     },
                 ),
             )

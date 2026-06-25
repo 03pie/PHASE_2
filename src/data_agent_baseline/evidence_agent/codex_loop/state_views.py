@@ -289,7 +289,7 @@ def _positive_unbound_evidence(state: LoopState) -> list[dict[str, Any]]:
         payload = evidence.payload or {}
         positive = any(
             isinstance(payload.get(key), list) and bool(payload.get(key))
-            for key in ("sample", "hits", "windows", "records", "columns")
+            for key in ("sample", "hits", "matches", "slice_matches", "slice_catalog", "records", "columns")
         ) or (isinstance(payload.get("text"), str) and bool(payload["text"].strip()))
         if positive:
             output.append(
@@ -366,8 +366,8 @@ def _is_negative_like_evidence(state: LoopState, evidence_ref: str) -> bool:
     payload = evidence.payload or {}
     if evidence.tool_name == "search_values" and isinstance(payload.get("hits"), list):
         return len(payload["hits"]) == 0
-    if evidence.tool_name == "search_document" and isinstance(payload.get("windows"), list):
-        return len(payload["windows"]) == 0
+    if evidence.tool_name == "search_document" and isinstance(payload.get("matches"), list):
+        return len(payload["matches"]) == 0
     if evidence.tool_name == "extract_records" and isinstance(payload.get("records"), list):
         return len(payload["records"]) == 0
     if evidence.tool_name == "run_verified_compute" and isinstance(payload.get("rows"), (list, tuple)):

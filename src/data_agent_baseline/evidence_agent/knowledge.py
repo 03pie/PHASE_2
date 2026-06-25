@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Any
 
 from data_agent_baseline.evidence_agent.semantic import semantic_terms
-from data_agent_baseline.evidence_agent.codex_loop.protocol import KnowledgeSection
+from data_agent_baseline.evidence_agent.codex_loop.protocol import (
+    KnowledgeLookupEntry,
+    KnowledgeSection,
+)
 from data_agent_baseline.evidence_agent.text import code_mentions, normalize_key
 from data_agent_baseline.prompts.loader import build_knowledge_bundle
 
@@ -25,20 +28,52 @@ def _section_from_payload(payload: dict[str, Any]) -> KnowledgeSection:
     )
 
 
-def build_knowledge_sections(context_dir: Path) -> tuple[list[KnowledgeSection], str, str]:
+def _lookup_from_payload(payload: dict[str, Any]) -> KnowledgeLookupEntry | None:
+    token = str(payload.get("token") or "").strip()
+    if not token:
+        return None
+    return KnowledgeLookupEntry(
+        token=token,
+        section_refs=tuple(str(ref) for ref in payload.get("section_refs") or [] if str(ref).strip()),
+        evidence_refs=tuple(str(ref) for ref in payload.get("evidence_refs") or [] if str(ref).strip()),
+        status=str(payload.get("status") or "document_mention_only"),
+        must_verify=bool(payload.get("must_verify", True)),
+    )
+
+
+def _lookup_key(token: str) -> str:
+    return normalize_key(token) or token.casefold()
+
+
+def build_knowledge_catalog(
+    context_dir: Path,
+) -> tuple[list[KnowledgeSection], dict[str, KnowledgeLookupEntry], str, str]:
     bundle = build_knowledge_bundle(context_dir)
     try:
         schema = json.loads(bundle.schema_json)
     except json.JSONDecodeError:
-        return [], bundle.schema_json, bundle.content_hash
+        return [], {}, bundle.schema_json, bundle.content_hash
     if schema.get("availability") != "available":
-        return [], bundle.schema_json, bundle.content_hash
+        return [], {}, bundle.schema_json, bundle.content_hash
     sections = [
         _section_from_payload(section)
         for section in schema.get("sections") or []
         if isinstance(section, dict)
     ]
-    return sections, bundle.schema_json, bundle.content_hash
+    lookup_entries = [
+        entry
+        for payload in schema.get("lookup") or []
+        if isinstance(payload, dict)
+        for entry in [_lookup_from_payload(payload)]
+        if entry is not None
+    ]
+    lookup = {_lookup_key(entry.token): entry for entry in lookup_entries}
+    return sections, lookup, bundle.schema_json, bundle.content_hash
+
+
+def build_knowledge_sections(context_dir: Path) -> tuple[list[KnowledgeSection], str, str]:
+    sections, _lookup, schema_json, content_hash = build_knowledge_catalog(context_dir)
+    return sections, schema_json, content_hash
 
 
 def _query_terms(question: str) -> set[str]:

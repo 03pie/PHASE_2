@@ -30,13 +30,28 @@ _LIST_FIELDS = {
     "target_refs",
     "requirement_refs",
     "knowledge_section_ids",
+    "section_ids",
+    "tokens",
     "evidence_refs",
     "binding_refs",
     "compute_refs",
     "source_refs",
     "allowed_columns",
 }
-_INT_FIELDS = {"limit", "start_line", "end_line", "window_lines", "sample_limit", "max_pairs"}
+_INT_FIELDS = {
+    "limit",
+    "start_line",
+    "end_line",
+    "window_lines",
+    "sample_limit",
+    "max_pairs",
+    "preview_lines",
+    "slice_lines",
+    "slice_index",
+    "center_line",
+    "context_lines",
+    "line",
+}
 _BINDING_TYPE_ALIASES = {
     "source": "structured_source",
     "data_source": "structured_source",
@@ -150,11 +165,22 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "retrieve_knowledge",
-            "description": "Retrieve full document-only knowledge.md sections relevant to a query.",
+            "description": (
+                "Navigate knowledge.md without treating it as physical schema. Use mode='catalog' "
+                "to list all sections/tokens, mode='token' to resolve mentions to complete sections, "
+                "mode='section' to read complete section slices, or mode='search' for lexical candidates."
+            ),
             "parameters": _object_schema(
                 {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["catalog", "search", "token", "section"],
+                    },
                     "query": {"type": "string"},
                     "section_ids": {"type": "array", "items": {"type": "string"}},
+                    "tokens": {"type": "array", "items": {"type": "string"}},
+                    "include_neighbors": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 80},
                 }
             ),
         },
@@ -221,30 +247,18 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "read_document_window",
-            "description": "Read a bounded text window from an observed PDF/MD source.",
+            "name": "preview_document",
+            "description": (
+                "Preview an observed PDF/MD source before reading it: document start, document end, "
+                "line/page counts, headings, and a deterministic slice catalog. This does not extract records."
+            ),
             "parameters": _object_schema(
                 {
                     "source_ref": {"type": "string"},
                     "path": {"type": "string"},
-                    "query": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1},
-                    "window_lines": {"type": "integer", "minimum": 3, "maximum": 120},
+                    "preview_lines": {"type": "integer", "minimum": 5, "maximum": 40},
+                    "slice_lines": {"type": "integer", "minimum": 20, "maximum": 200},
                 }
-            ),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "profile_document",
-            "description": (
-                "Profile an observed PDF/MD source: pages, line ranges, headings, and "
-                "table-like/list-like blocks. This does not extract records."
-            ),
-            "parameters": _object_schema(
-                {"source_ref": {"type": "string"}, "path": {"type": "string"}},
             ),
         },
     },
@@ -253,16 +267,17 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
         "function": {
             "name": "search_document",
             "description": (
-                "Search an observed PDF/MD source and return multiple bounded text windows. "
-                "This does not extract records."
+                "Locate query text in an observed PDF/MD source. Returns matching lines, slice-level "
+                "hit counts, and recommended read_document_slice arguments. This does not return "
+                "complete evidence text and does not extract records."
             ),
             "parameters": _object_schema(
                 {
                     "source_ref": {"type": "string"},
                     "path": {"type": "string"},
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
-                    "window_lines": {"type": "integer", "minimum": 3, "maximum": 80},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 80},
+                    "slice_lines": {"type": "integer", "minimum": 20, "maximum": 200},
                 },
                 required=["query"],
             ),
@@ -271,9 +286,33 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "read_document_slice",
+            "description": (
+                "Read one complete navigable slice from an observed PDF/MD source. Use slice_id/"
+                "slice_index from preview_document or search_document, or use start_line/end_line/"
+                "center_line to read or expand context."
+            ),
+            "parameters": _object_schema(
+                {
+                    "source_ref": {"type": "string"},
+                    "path": {"type": "string"},
+                    "slice_id": {"type": "string"},
+                    "slice_index": {"type": "integer", "minimum": 1},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                    "center_line": {"type": "integer", "minimum": 1},
+                    "context_lines": {"type": "integer", "minimum": 20, "maximum": 200},
+                    "slice_lines": {"type": "integer", "minimum": 20, "maximum": 200},
+                }
+            ),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "extract_records",
             "description": (
-                "Execute a model-provided extraction spec over cited document-window evidence. "
+                "Execute a model-provided extraction spec over cited read_document_slice evidence. "
                 "The spec must be executable: provide a Python regex with named groups or "
                 "fields/dotall, or provide records copied exactly from cited evidence. "
                 "Natural-language rules alone are not executed."

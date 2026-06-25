@@ -22,6 +22,10 @@ from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     SourceRef,
     ToolSpec,
 )
+from data_agent_baseline.evidence_agent.text import normalize_key
+
+
+_DEFAULT_DOCUMENT_SLICE_LINES = 80
 
 
 def _normalize(value: Any) -> str:
@@ -142,6 +146,177 @@ def _document_lines(source: SourceRef) -> list[dict[str, Any]]:
                     global_line += 1
         return lines
     return []
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _document_slice_lines(
+    state: LoopState,
+    source: SourceRef,
+    arguments: dict[str, Any],
+) -> tuple[int, str]:
+    explicit = arguments.get("slice_lines") or arguments.get("window_lines")
+    if explicit is not None:
+        slice_lines = _bounded_int(
+            explicit,
+            default=_DEFAULT_DOCUMENT_SLICE_LINES,
+            minimum=20,
+            maximum=200,
+        )
+        state.document_slice_lines[source.id] = slice_lines
+        return slice_lines, "explicit_argument"
+    preferred = state.document_slice_lines.get(source.id)
+    if preferred:
+        return preferred, "source_preference"
+    return _DEFAULT_DOCUMENT_SLICE_LINES, "default"
+
+
+def _document_page_count(lines: list[dict[str, Any]]) -> int | None:
+    pages = sorted({item["page"] for item in lines if item["page"] is not None})
+    return len(pages) if pages else None
+
+
+def _format_document_lines(lines: list[dict[str, Any]]) -> str:
+    return "\n".join(f"[page={item['page']} line={item['line']}] {item['text']}" for item in lines)
+
+
+def _compact_line_preview(text: Any, *, limit: int = 240) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _slice_id(source: SourceRef, index: int) -> str:
+    return f"{source.id}_slice_{index:04d}"
+
+
+def _slice_index_from_id(value: Any, source: SourceRef) -> int | None:
+    text = str(value or "").strip()
+    match = re.fullmatch(rf"{re.escape(source.id)}_slice_(\d{{4}})", text)
+    if match:
+        return int(match.group(1))
+    match = re.fullmatch(r"slice_(\d{4})", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _document_slice_catalog(
+    source: SourceRef,
+    lines: list[dict[str, Any]],
+    *,
+    slice_lines: int,
+) -> list[dict[str, Any]]:
+    catalog: list[dict[str, Any]] = []
+    if not lines:
+        return catalog
+    for start in range(0, len(lines), slice_lines):
+        index = len(catalog) + 1
+        window = lines[start : start + slice_lines]
+        first_nonblank = next(
+            (str(item["text"]).strip() for item in window if str(item["text"]).strip()),
+            "",
+        )
+        catalog.append(
+            {
+                "slice_id": _slice_id(source, index),
+                "slice_index": index,
+                "start_line": window[0]["line"],
+                "end_line": window[-1]["line"],
+                "page_start": window[0]["page"],
+                "page_end": window[-1]["page"],
+                "line_count": len(window),
+                "preview": _compact_line_preview(first_nonblank),
+            }
+        )
+    return catalog
+
+
+def _document_structure(source: SourceRef, lines: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    headings: list[dict[str, Any]] = []
+    table_like_blocks: list[dict[str, Any]] = []
+    list_like_blocks: list[dict[str, Any]] = []
+    current_table: list[dict[str, Any]] = []
+    current_list: list[dict[str, Any]] = []
+    for item in lines:
+        text = str(item["text"]).strip()
+        if source.data_form == "markdown_document" and text.startswith("#"):
+            headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
+        elif text and len(text) <= 120 and re.match(r"^(\d+[\.)]\s+|[A-Z][\w\s]{2,}:$)", text):
+            headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
+
+        if "|" in text or text.count("\t") >= 2:
+            current_table.append(item)
+        elif current_table:
+            if len(current_table) >= 2:
+                table_like_blocks.append(
+                    {
+                        "start_line": current_table[0]["line"],
+                        "end_line": current_table[-1]["line"],
+                        "line_count": len(current_table),
+                    }
+                )
+            current_table = []
+
+        if re.match(r"^(\s*[-*]\s+|\s*\d+[\.)]\s+)", text):
+            current_list.append(item)
+        elif current_list:
+            if len(current_list) >= 2:
+                list_like_blocks.append(
+                    {
+                        "start_line": current_list[0]["line"],
+                        "end_line": current_list[-1]["line"],
+                        "line_count": len(current_list),
+                    }
+                )
+            current_list = []
+    if len(current_table) >= 2:
+        table_like_blocks.append(
+            {
+                "start_line": current_table[0]["line"],
+                "end_line": current_table[-1]["line"],
+                "line_count": len(current_table),
+            }
+        )
+    if len(current_list) >= 2:
+        list_like_blocks.append(
+            {
+                "start_line": current_list[0]["line"],
+                "end_line": current_list[-1]["line"],
+                "line_count": len(current_list),
+            }
+        )
+    return {
+        "headings": headings,
+        "table_like_blocks": table_like_blocks,
+        "list_like_blocks": list_like_blocks,
+    }
+
+
+def _slice_for_line(
+    source: SourceRef,
+    line_number: int,
+    *,
+    slice_lines: int,
+) -> dict[str, Any]:
+    slice_index = ((max(1, line_number) - 1) // slice_lines) + 1
+    start_line = ((slice_index - 1) * slice_lines) + 1
+    end_line = slice_index * slice_lines
+    return {
+        "source_ref": source.id,
+        "slice_id": _slice_id(source, slice_index),
+        "slice_index": slice_index,
+        "start_line": start_line,
+        "end_line": end_line,
+        "slice_lines": slice_lines,
+    }
 
 
 def _recommend(tool_name: str, arguments: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -301,9 +476,9 @@ class EvidenceActionRegistry:
             "inspect_source": self._inspect_source,
             "sample_records": self._sample_records,
             "search_values": self._search_values,
-            "read_document_window": self._read_document_window,
-            "profile_document": self._profile_document,
+            "preview_document": self._preview_document,
             "search_document": self._search_document,
+            "read_document_slice": self._read_document_slice,
             "extract_records": self._extract_records,
             "inspect_relation": self._inspect_relation,
             "discover_join_paths": self._discover_join_paths,
@@ -317,7 +492,7 @@ class EvidenceActionRegistry:
         self._specs = {
             "list_inventory": ToolSpec("list_inventory", "Return observed context inventory."),
             "retrieve_knowledge": ToolSpec(
-                "retrieve_knowledge", "Return full document-only knowledge sections."
+                "retrieve_knowledge", "Navigate knowledge catalog and return complete slices."
             ),
             "locate_sources": ToolSpec(
                 "locate_sources", "Find source/table/field candidates by lexical evidence."
@@ -331,17 +506,17 @@ class EvidenceActionRegistry:
             "search_values": ToolSpec(
                 "search_values", "Search literal values across observed sources."
             ),
-            "read_document_window": ToolSpec(
-                "read_document_window", "Read a bounded PDF/MD text window."
-            ),
-            "profile_document": ToolSpec(
-                "profile_document", "Profile PDF/MD document structure without extracting records."
+            "preview_document": ToolSpec(
+                "preview_document", "Preview PDF/MD start, end, and slice catalog."
             ),
             "search_document": ToolSpec(
-                "search_document", "Search PDF/MD document text and return bounded windows."
+                "search_document", "Locate PDF/MD text matches and recommend slices."
+            ),
+            "read_document_slice": ToolSpec(
+                "read_document_slice", "Read a complete navigable PDF/MD slice."
             ),
             "extract_records": ToolSpec(
-                "extract_records", "Execute a model-provided extraction spec over document windows."
+                "extract_records", "Execute a model-provided extraction spec over document slices."
             ),
             "inspect_relation": ToolSpec(
                 "inspect_relation", "Inspect verified relation schema/sample before compute or SQL repair."
@@ -412,20 +587,154 @@ class EvidenceActionRegistry:
         )
 
     def _retrieve_knowledge(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        query = str(arguments.get("query") or state.question)
+        mode = str(arguments.get("mode") or "").strip().casefold()
+        raw_query = arguments.get("query")
+        query = str(raw_query or "").strip()
         section_ids = {
             str(item)
             for item in arguments.get("section_ids", [])
             if str(item).strip()
         }
+        tokens = [str(item).strip() for item in arguments.get("tokens", []) if str(item).strip()]
+        include_neighbors = bool(arguments.get("include_neighbors", False))
+        try:
+            limit = int(arguments.get("limit") or 8)
+        except (TypeError, ValueError):
+            limit = 8
+        limit = min(max(limit, 1), 80)
         sections = state.knowledge_sections
+        section_by_id = {section.id: section for section in sections}
+
+        def catalog_entry(section: Any) -> dict[str, Any]:
+            preview = " ".join(str(section.text or "").split())
+            if len(preview) > 240:
+                preview = preview[:237].rstrip() + "..."
+            return {
+                "id": section.id,
+                "heading_path": section.heading_path,
+                "line_start": section.line_start,
+                "line_end": section.line_end,
+                "mention_count": len(section.mentions),
+                "mentions": list(section.mentions[:12]),
+                "preview": preview,
+            }
+
+        def full_section_payload(section: Any) -> dict[str, Any]:
+            return {
+                "id": section.id,
+                "heading_path": section.heading_path,
+                "line_start": section.line_start,
+                "line_end": section.line_end,
+                "text": section.text,
+                "mentions": list(section.mentions),
+            }
+
+        def add_neighbors(ids: set[str]) -> set[str]:
+            if not include_neighbors:
+                return ids
+            ordered_ids = [section.id for section in sections]
+            expanded = set(ids)
+            for section_id in list(ids):
+                try:
+                    index = ordered_ids.index(section_id)
+                except ValueError:
+                    continue
+                for neighbor_index in (index - 1, index + 1):
+                    if 0 <= neighbor_index < len(ordered_ids):
+                        expanded.add(ordered_ids[neighbor_index])
+            return expanded
+
+        def ordered_sections(ids: set[str]) -> list[Any]:
+            return [section for section in sections if section.id in ids]
+
+        def lookup_key(token: str) -> str:
+            return normalize_key(token) or token.casefold()
+
+        def lookup_entry(token: str) -> Any | None:
+            key = lookup_key(token)
+            if key in state.knowledge_lookup:
+                return state.knowledge_lookup[key]
+            token_casefold = token.casefold()
+            for entry in state.knowledge_lookup.values():
+                if entry.token.casefold() == token_casefold:
+                    return entry
+            return None
+
+        catalog = {
+            "section_count": len(sections),
+            "lookup_count": len(state.knowledge_lookup),
+            "sections": [catalog_entry(section) for section in sections],
+            "lookup_tokens": [
+                {
+                    "token": entry.token,
+                    "section_refs": list(entry.section_refs),
+                    "status": entry.status,
+                    "must_verify": entry.must_verify,
+                }
+                for entry in list(state.knowledge_lookup.values())[:160]
+            ],
+        }
+        if not sections:
+            return state.add_evidence(
+                tool_name="retrieve_knowledge",
+                ok=False,
+                summary="No knowledge.md sections are available.",
+                payload={
+                    "mode": mode or "catalog",
+                    "catalog": catalog,
+                    "usage_note": "knowledge.md is missing, skipped, unreadable, or empty.",
+                },
+                negative_scope={"kind": "missing_knowledge"},
+                allowed_next_tools=("locate_sources", "inspect_source", "preview_document"),
+            )
+
+        selected_ids: set[str] = set()
+        missing_section_ids: list[str] = []
+        missing_tokens: list[str] = []
+        resolved_tokens: list[dict[str, Any]] = []
+
         if section_ids:
-            selected = [section for section in sections if section.id in section_ids]
+            mode = mode or "section"
+            missing_section_ids = sorted(section_id for section_id in section_ids if section_id not in section_by_id)
+            selected_ids.update(section_id for section_id in section_ids if section_id in section_by_id)
+        if tokens:
+            mode = mode or "token"
+            for token in tokens:
+                entry = lookup_entry(token)
+                if entry is None:
+                    missing_tokens.append(token)
+                    continue
+                refs = [ref for ref in entry.section_refs if ref in section_by_id]
+                selected_ids.update(refs)
+                resolved_tokens.append(
+                    {
+                        "query_token": token,
+                        "token": entry.token,
+                        "section_refs": refs,
+                        "evidence_refs": list(entry.evidence_refs),
+                        "status": entry.status,
+                        "must_verify": entry.must_verify,
+                    }
+                )
+        if mode == "catalog" or (not mode and not query and not selected_ids):
+            selected: list[Any] = []
+            actual_mode = "catalog"
+        elif selected_ids:
+            selected = ordered_sections(add_neighbors(selected_ids))
+            actual_mode = mode or "section"
         else:
+            actual_mode = "search"
+            query = query or state.question
             query_terms = set(_terms(query))
+            lookup_hits: set[str] = set()
+            for term in query_terms:
+                entry = lookup_entry(term)
+                if entry is not None:
+                    lookup_hits.update(ref for ref in entry.section_refs if ref in section_by_id)
             matched = [
                 (
-                    len(query_terms & set(_terms(f"{section.heading_path}\n{section.text}"))),
+                    len(query_terms & set(_terms(f"{section.heading_path}\n{section.text}")))
+                    + (3 if section.id in lookup_hits else 0),
                     section.line_start or 10**9,
                     section,
                 )
@@ -437,26 +746,33 @@ class EvidenceActionRegistry:
                 if overlap > 0
             ][:8]
             if not selected:
-                selected = state.matched_sections[:8]
+                actual_mode = "catalog_fallback"
         payload = {
-            "sections": [
-                {
-                    "id": section.id,
-                    "heading_path": section.heading_path,
-                    "line_start": section.line_start,
-                    "line_end": section.line_end,
-                    "text": section.text,
-                    "mentions": list(section.mentions),
-                }
-                for section in selected
-            ]
+            "mode": actual_mode,
+            "catalog": catalog if actual_mode in {"catalog", "catalog_fallback"} else {
+                "section_count": catalog["section_count"],
+                "lookup_count": catalog["lookup_count"],
+            },
+            "resolved_tokens": resolved_tokens,
+            "missing_tokens": missing_tokens,
+            "missing_section_ids": missing_section_ids,
+            "sections": [full_section_payload(section) for section in selected],
+            "usage_note": (
+                "Returned section text is document-only semantic evidence. Mentions are lookup "
+                "tokens and still require observed physical source verification."
+            ),
         }
+        if actual_mode == "catalog_fallback":
+            payload["search_notice"] = (
+                "No lexical section matched the query. Use the catalog/lookup tokens to choose "
+                "a candidate section, then call retrieve_knowledge with section_ids or tokens."
+            )
         return state.add_evidence(
             tool_name="retrieve_knowledge",
             ok=True,
-            summary=f"Retrieved {len(selected)} knowledge section(s).",
+            summary=f"Knowledge {actual_mode}: returned {len(selected)} full section(s).",
             payload=payload,
-            allowed_next_tools=("locate_sources", "inspect_source", "profile_document"),
+            allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source", "preview_document"),
         )
 
     def _locate_sources(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -522,7 +838,7 @@ class EvidenceActionRegistry:
                 if not candidates
                 else None
             ),
-            allowed_next_tools=("inspect_source", "sample_records", "profile_document", "search_document"),
+            allowed_next_tools=("inspect_source", "sample_records", "preview_document", "search_document"),
         )
 
     def _inspect_source(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -660,7 +976,7 @@ class EvidenceActionRegistry:
             return state.add_evidence(
                 tool_name="inspect_source",
                 ok=True,
-                summary=f"{source.data_form} source observed. Use read_document_window for text evidence.",
+                summary=f"{source.data_form} source observed. Use preview_document or read_document_slice for text evidence.",
                 payload={
                     "source_id": source.id,
                     "path": source.virtual_path,
@@ -669,7 +985,7 @@ class EvidenceActionRegistry:
                 },
                 source_id=source.id,
                 data_form=source.data_form,
-                allowed_next_tools=("profile_document", "search_document", "read_document_window"),
+                allowed_next_tools=("preview_document", "search_document", "read_document_slice"),
             )
 
         if source.data_form == "video":
@@ -827,174 +1143,73 @@ class EvidenceActionRegistry:
             recommended_next_actions=(),
         )
 
-    def _read_document_window(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+    def _preview_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
         source = _source_from_args(state, arguments)
         if source is None:
             return state.add_evidence(
-                tool_name="read_document_window",
+                tool_name="preview_document",
                 ok=False,
-                summary="No observed source matched read_document_window arguments.",
+                summary="No observed source matched preview_document arguments.",
                 payload={"arguments": arguments},
-                negative_scope={"kind": "unknown_source", "tool": "read_document_window", "arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "preview_document", "arguments": arguments},
                 allowed_next_tools=("list_inventory", "locate_sources"),
             )
         if source.data_form not in {"pdf_document", "markdown_document"}:
             return state.add_evidence(
-                tool_name="read_document_window",
-                ok=False,
-                summary=f"{source.data_form} is not a readable document window source.",
-                payload={"source_id": source.id, "data_form": source.data_form},
-                source_id=source.id,
-                data_form=source.data_form,
-                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
-                allowed_next_tools=("inspect_source", "sample_records", "search_values"),
-            )
-        query = str(arguments.get("query") or "").strip()
-        window_lines = max(3, min(int(arguments.get("window_lines") or 12), 80))
-        lines = _document_lines(source)
-        start_line = arguments.get("start_line")
-        end_line = arguments.get("end_line")
-        if isinstance(start_line, int) and start_line > 0:
-            start = max(0, start_line - 1)
-            if isinstance(end_line, int) and end_line >= start_line:
-                end = min(len(lines), end_line)
-            else:
-                end = min(len(lines), start + window_lines)
-        else:
-            query_terms = _terms(query)
-            matched_index = 0
-            if query_terms:
-                for index, line in enumerate(lines):
-                    text = str(line["text"]).casefold()
-                    if any(term in text for term in query_terms):
-                        matched_index = index
-                        break
-            start = max(0, matched_index - window_lines // 2)
-            end = min(len(lines), start + window_lines)
-        window = lines[start:end]
-        text = "\n".join(
-            f"[page={item['page']} line={item['line']}] {item['text']}" for item in window
-        )
-        if len(text) > 12_000:
-            text = text[:11_900] + "\n...[truncated]"
-        return state.add_evidence(
-            tool_name="read_document_window",
-            ok=True,
-            summary=f"Read {len(window)} bounded document line(s) from {source.virtual_path}.",
-            payload={
-                "source_id": source.id,
-                "path": source.virtual_path,
-                "data_form": source.data_form,
-                "query": query,
-                "start_line": window[0]["line"] if window else None,
-                "end_line": window[-1]["line"] if window else None,
-                "window": window,
-                "text": text,
-            },
-            source_id=source.id,
-            data_form=source.data_form,
-            negative_scope=(
-                _source_negative_scope(kind="document_window_empty", source=source, query=query)
-                if not window
-                else None
-            ),
-            allowed_next_tools=("extract_records", "search_document", "profile_document", "blocked"),
-        )
-
-    def _profile_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        source = _source_from_args(state, arguments)
-        if source is None:
-            return state.add_evidence(
-                tool_name="profile_document",
-                ok=False,
-                summary="No observed source matched profile_document arguments.",
-                payload={"arguments": arguments},
-                negative_scope={"kind": "unknown_source", "tool": "profile_document", "arguments": arguments},
-                allowed_next_tools=("list_inventory", "locate_sources"),
-            )
-        if source.data_form not in {"pdf_document", "markdown_document"}:
-            return state.add_evidence(
-                tool_name="profile_document",
+                tool_name="preview_document",
                 ok=False,
                 summary=f"{source.data_form} is not a document source.",
                 payload={"source_id": source.id, "data_form": source.data_form},
                 source_id=source.id,
                 data_form=source.data_form,
                 negative_scope=_source_negative_scope(kind="not_document_source", source=source),
-                allowed_next_tools=("inspect_source", "sample_records"),
+                allowed_next_tools=("inspect_source", "sample_records", "search_values"),
             )
         lines = _document_lines(source)
-        headings: list[dict[str, Any]] = []
-        table_like_blocks: list[dict[str, Any]] = []
-        list_like_blocks: list[dict[str, Any]] = []
-        current_table: list[dict[str, Any]] = []
-        current_list: list[dict[str, Any]] = []
-        for item in lines:
-            text = str(item["text"]).strip()
-            if source.data_form == "markdown_document" and text.startswith("#"):
-                headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
-            elif text and len(text) <= 120 and re.match(r"^(\d+[\.)]\s+|[A-Z][\w\s]{2,}:$)", text):
-                headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
-
-            is_table_line = "|" in text or text.count("\t") >= 2
-            if is_table_line:
-                current_table.append(item)
-            elif current_table:
-                if len(current_table) >= 2:
-                    table_like_blocks.append(
-                        {
-                            "start_line": current_table[0]["line"],
-                            "end_line": current_table[-1]["line"],
-                            "line_count": len(current_table),
-                        }
-                    )
-                current_table = []
-
-            is_list_line = bool(re.match(r"^(\s*[-*]\s+|\s*\d+[\.)]\s+)", text))
-            if is_list_line:
-                current_list.append(item)
-            elif current_list:
-                if len(current_list) >= 2:
-                    list_like_blocks.append(
-                        {
-                            "start_line": current_list[0]["line"],
-                            "end_line": current_list[-1]["line"],
-                            "line_count": len(current_list),
-                        }
-                    )
-                current_list = []
-        if len(current_table) >= 2:
-            table_like_blocks.append(
-                {
-                    "start_line": current_table[0]["line"],
-                    "end_line": current_table[-1]["line"],
-                    "line_count": len(current_table),
-                }
-            )
-        if len(current_list) >= 2:
-            list_like_blocks.append(
-                {
-                    "start_line": current_list[0]["line"],
-                    "end_line": current_list[-1]["line"],
-                    "line_count": len(current_list),
-                }
-            )
-        pages = sorted({item["page"] for item in lines if item["page"] is not None})
+        preview_lines = _bounded_int(arguments.get("preview_lines"), default=16, minimum=5, maximum=40)
+        slice_lines, slice_lines_source = _document_slice_lines(state, source, arguments)
+        catalog = _document_slice_catalog(source, lines, slice_lines=slice_lines)
+        structure = _document_structure(source, lines)
+        start_window = lines[:preview_lines]
+        end_window = lines[-preview_lines:] if len(lines) > preview_lines else []
         return state.add_evidence(
-            tool_name="profile_document",
+            tool_name="preview_document",
             ok=True,
-            summary=f"Profiled {source.virtual_path}: {len(lines)} line(s).",
+            summary=f"Previewed {source.virtual_path}: {len(lines)} line(s), {len(catalog)} slice(s).",
             payload={
                 "source_id": source.id,
                 "path": source.virtual_path,
                 "data_form": source.data_form,
                 "line_count": len(lines),
-                "page_count": len(pages) if pages else None,
+                "page_count": _document_page_count(lines),
                 "line_start": lines[0]["line"] if lines else None,
                 "line_end": lines[-1]["line"] if lines else None,
-                "headings": headings[:80],
-                "table_like_blocks": table_like_blocks[:40],
-                "list_like_blocks": list_like_blocks[:40],
+                "slice_lines": slice_lines,
+                "slice_lines_source": slice_lines_source,
+                "slice_count": len(catalog),
+                "slice_catalog": catalog,
+                "headings": structure["headings"][:120],
+                "table_like_blocks": structure["table_like_blocks"][:40],
+                "list_like_blocks": structure["list_like_blocks"][:40],
+                "start_preview": {
+                    "start_line": start_window[0]["line"] if start_window else None,
+                    "end_line": start_window[-1]["line"] if start_window else None,
+                    "text": _format_document_lines(start_window),
+                },
+                "end_preview": {
+                    "start_line": end_window[0]["line"] if end_window else None,
+                    "end_line": end_window[-1]["line"] if end_window else None,
+                    "text": _format_document_lines(end_window),
+                },
+                "recommended_first_slice": (
+                    {
+                        "source_ref": source.id,
+                        "slice_id": catalog[0]["slice_id"],
+                        "slice_lines": slice_lines,
+                    }
+                    if catalog
+                    else None
+                ),
             },
             source_id=source.id,
             data_form=source.data_form,
@@ -1003,7 +1218,162 @@ class EvidenceActionRegistry:
                 if not lines
                 else None
             ),
-            allowed_next_tools=("search_document", "read_document_window", "extract_records"),
+            allowed_next_tools=("search_document", "read_document_slice", "extract_records", "bind"),
+        )
+
+    def _read_document_slice(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        source = _source_from_args(state, arguments)
+        if source is None:
+            return state.add_evidence(
+                tool_name="read_document_slice",
+                ok=False,
+                summary="No observed source matched read_document_slice arguments.",
+                payload={"arguments": arguments},
+                negative_scope={"kind": "unknown_source", "tool": "read_document_slice", "arguments": arguments},
+                allowed_next_tools=("list_inventory", "locate_sources"),
+            )
+        if source.data_form not in {"pdf_document", "markdown_document"}:
+            return state.add_evidence(
+                tool_name="read_document_slice",
+                ok=False,
+                summary=f"{source.data_form} is not a readable document source.",
+                payload={"source_id": source.id, "data_form": source.data_form},
+                source_id=source.id,
+                data_form=source.data_form,
+                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
+                allowed_next_tools=("inspect_source", "sample_records", "search_values"),
+            )
+        lines = _document_lines(source)
+        slice_lines, slice_lines_source = _document_slice_lines(state, source, arguments)
+        catalog = _document_slice_catalog(source, lines, slice_lines=slice_lines)
+        total_slices = len(catalog)
+        start_line = arguments.get("start_line")
+        end_line = arguments.get("end_line")
+        center_line = arguments.get("center_line") or arguments.get("line")
+        slice_index = _slice_index_from_id(arguments.get("slice_id"), source)
+        if slice_index is None:
+            try:
+                slice_index = int(arguments.get("slice_index")) if arguments.get("slice_index") else None
+            except (TypeError, ValueError):
+                slice_index = None
+
+        if isinstance(start_line, int) and start_line > 0:
+            start = max(0, start_line - 1)
+            if isinstance(end_line, int) and end_line >= start_line:
+                end = min(len(lines), end_line)
+            else:
+                end = min(len(lines), start + slice_lines)
+            selected_slice_index = ((start + 1 - 1) // slice_lines) + 1 if lines else None
+        elif center_line is not None:
+            center = _bounded_int(center_line, default=1, minimum=1, maximum=max(1, len(lines)))
+            context_lines = _bounded_int(
+                arguments.get("context_lines"),
+                default=slice_lines,
+                minimum=20,
+                maximum=200,
+            )
+            start = max(0, center - 1 - context_lines // 2)
+            end = min(len(lines), start + context_lines)
+            selected_slice_index = ((center - 1) // slice_lines) + 1 if lines else None
+        else:
+            selected_slice_index = max(1, min(slice_index or 1, max(1, total_slices)))
+            start = (selected_slice_index - 1) * slice_lines
+            end = min(len(lines), start + slice_lines)
+
+        window = lines[start:end]
+        if not window:
+            return state.add_evidence(
+                tool_name="read_document_slice",
+                ok=False,
+                summary=f"No document text was available in requested slice for {source.virtual_path}.",
+                payload={
+                    "source_id": source.id,
+                    "path": source.virtual_path,
+                    "arguments": arguments,
+                    "line_count": len(lines),
+                },
+                source_id=source.id,
+                data_form=source.data_form,
+                negative_scope=_source_negative_scope(kind="document_slice_empty", source=source),
+                allowed_next_tools=("preview_document", "search_document", "blocked"),
+            )
+
+        actual_start = int(window[0]["line"])
+        actual_end = int(window[-1]["line"])
+        selected_slice_index = selected_slice_index or (((actual_start - 1) // slice_lines) + 1)
+        previous_slice = (
+            {
+                "source_ref": source.id,
+                "slice_id": _slice_id(source, selected_slice_index - 1),
+                "slice_index": selected_slice_index - 1,
+                "slice_lines": slice_lines,
+            }
+            if selected_slice_index > 1
+            else None
+        )
+        next_slice = (
+            {
+                "source_ref": source.id,
+                "slice_id": _slice_id(source, selected_slice_index + 1),
+                "slice_index": selected_slice_index + 1,
+                "slice_lines": slice_lines,
+            }
+            if selected_slice_index < total_slices
+            else None
+        )
+        expand_slice = {
+            "source_ref": source.id,
+            "center_line": max(actual_start, (actual_start + actual_end) // 2),
+            "context_lines": min(200, max(slice_lines * 2, actual_end - actual_start + 1)),
+            "slice_lines": slice_lines,
+        }
+        return state.add_evidence(
+            tool_name="read_document_slice",
+            ok=True,
+            summary=(
+                f"Read document slice {selected_slice_index}/{total_slices} "
+                f"from {source.virtual_path} lines {actual_start}-{actual_end}."
+            ),
+            payload={
+                "source_id": source.id,
+                "path": source.virtual_path,
+                "data_form": source.data_form,
+                "slice_id": _slice_id(source, selected_slice_index),
+                "slice_index": selected_slice_index,
+                "slice_lines": slice_lines,
+                "slice_lines_source": slice_lines_source,
+                "slice_count": total_slices,
+                "start_line": actual_start,
+                "end_line": actual_end,
+                "page_start": window[0]["page"],
+                "page_end": window[-1]["page"],
+                "line_count": len(window),
+                "document_line_count": len(lines),
+                "coverage": {
+                    "covered_line_start": actual_start,
+                    "covered_line_end": actual_end,
+                    "remaining_before": actual_start > 1,
+                    "remaining_after": actual_end < len(lines),
+                },
+                "previous_slice": previous_slice,
+                "next_slice": next_slice,
+                "expand_slice": expand_slice,
+                "window": window,
+                "text": _format_document_lines(window),
+            },
+            source_id=source.id,
+            data_form=source.data_form,
+            allowed_next_tools=("read_document_slice", "search_document", "extract_records", "bind", "blocked"),
+            recommended_next_actions=tuple(
+                action
+                for action in (
+                    _recommend("read_document_slice", next_slice, "Read the next slice if the document section continues.")
+                    if next_slice
+                    else None,
+                    _recommend("extract_records", {"evidence_refs": []}, "Extract records only if this slice contains complete record boundaries."),
+                )
+                if action is not None
+            ),
         )
 
     def _search_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1038,126 +1408,92 @@ class EvidenceActionRegistry:
                 source_id=source.id,
                 data_form=source.data_form,
                 negative_scope=_source_negative_scope(kind="invalid_tool_arguments", source=source, missing="query"),
-                allowed_next_tools=("profile_document", "read_document_window"),
+                allowed_next_tools=("preview_document", "read_document_slice"),
             )
         lines = _document_lines(source)
         terms = _terms(query)
-        limit = max(1, min(int(arguments.get("limit") or 8), 20))
-        requested_window_lines = int(arguments.get("window_lines") or 50)
-        window_lines = max(40, min(requested_window_lines, 80))
-        matched_windows: list[tuple[int, dict[str, Any]]] = []
-        seen_starts: set[int] = set()
+        limit = _bounded_int(arguments.get("limit"), default=20, minimum=1, maximum=80)
+        slice_lines, slice_lines_source = _document_slice_lines(state, source, arguments)
+        line_matches: list[dict[str, Any]] = []
+        slice_hits: dict[int, dict[str, Any]] = {}
         for index, line in enumerate(lines):
             text = str(line["text"]).casefold()
             matched_terms = [term for term in terms if term in text]
             if not matched_terms:
                 continue
-            start = max(0, index - window_lines // 2)
-            if start in seen_starts:
-                continue
-            seen_starts.add(start)
-            end = min(len(lines), start + window_lines)
-            window = lines[start:end]
-            matched_windows.append(
-                (
-                    index,
+            line_number = int(line["line"])
+            slice_ref = _slice_for_line(source, line_number, slice_lines=slice_lines)
+            slice_index = int(slice_ref["slice_index"])
+            bucket = slice_hits.setdefault(
+                slice_index,
+                {
+                    "slice_id": slice_ref["slice_id"],
+                    "slice_index": slice_index,
+                    "start_line": slice_ref["start_line"],
+                    "end_line": min(len(lines), int(slice_ref["end_line"])),
+                    "match_count": 0,
+                    "matched_terms": [],
+                    "recommended_read": slice_ref,
+                    "first_match_line": line_number,
+                    "first_match_preview": _compact_line_preview(line["text"]),
+                },
+            )
+            bucket["match_count"] += 1
+            for term in matched_terms:
+                if term not in bucket["matched_terms"]:
+                    bucket["matched_terms"].append(term)
+            if len(line_matches) < limit:
+                line_matches.append(
                     {
-                        "start_line": window[0]["line"] if window else None,
-                        "end_line": window[-1]["line"] if window else None,
-                        "page_start": window[0]["page"] if window else None,
-                        "page_end": window[-1]["page"] if window else None,
+                        "line": line_number,
+                        "page": line["page"],
                         "matched_terms": matched_terms[:12],
-                        "text": "\n".join(
-                            f"[page={item['page']} line={item['line']}] {item['text']}"
-                            for item in window
-                        )[:8_000],
-                    },
-                )
-            )
-        matches = [
-            item
-            for _index, item in sorted(matched_windows, key=lambda row: row[0])[:limit]
-        ]
-        total_matches = len(matched_windows)
-        selected_ranges = [
-            (
-                int(match.get("start_line") or 0),
-                int(match.get("end_line") or 0),
-            )
-            for match in matches
-        ]
-
-        def covered(line_number: int) -> bool:
-            return any(start <= line_number <= end for start, end in selected_ranges)
-
-        unreturned_matches: list[dict[str, Any]] = []
-        for index, item in sorted(matched_windows, key=lambda row: row[0]):
-            line_number = int(lines[index]["line"])
-            if covered(line_number):
-                continue
-            unreturned_matches.append(
-                {
-                    "line": line_number,
-                    "page": lines[index]["page"],
-                    "matched_terms": item.get("matched_terms") or [],
-                    "preview": str(lines[index]["text"])[:240],
-                    "recommended_window": {
-                        "source_ref": source.id,
-                        "start_line": max(1, line_number - window_lines // 2),
-                        "window_lines": window_lines,
-                    },
-                }
-            )
-            if len(unreturned_matches) >= 12:
-                break
-        recommended_next_actions: list[dict[str, Any]] = []
-        if matches:
-            recommended_next_actions.append(
-                {
-                    "tool_name": "extract_records",
-                    "arguments": {
-                        "evidence_refs": [],
-                        "spec": {
-                            "regex": "<Python regex over cited window text, preferably with named groups>",
-                            "dotall": True,
-                        },
-                    },
-                    "reason": "If these windows contain repeated records needed for the answer, retry with evidence_refs set to this search evidence id and an executable regex or copied records.",
-                }
-            )
-            if unreturned_matches:
-                recommended_next_actions.append(
-                    {
-                        "tool_name": "read_document_window",
-                        "arguments": unreturned_matches[0]["recommended_window"],
-                        "reason": "Additional matching document text exists outside returned windows; read the next uncovered bounded window before treating a record set as complete.",
+                        "preview": _compact_line_preview(line["text"]),
+                        "recommended_read": slice_ref,
                     }
                 )
+        total_matches = sum(int(item["match_count"]) for item in slice_hits.values())
+        slice_matches = sorted(
+            slice_hits.values(),
+            key=lambda item: (int(item["slice_index"])),
+        )
+        recommended_next_actions: list[dict[str, Any]] = []
+        if slice_matches:
+            recommended_next_actions.append(
+                {
+                    "tool_name": "read_document_slice",
+                    "arguments": slice_matches[0]["recommended_read"],
+                    "reason": "Read the full slice around the first document match before extracting or binding evidence.",
+                }
+            )
         return state.add_evidence(
             tool_name="search_document",
             ok=True,
             summary=(
-                f"Found {len(matches)} document window candidate(s)"
-                + (f" from {total_matches} matching line(s)." if total_matches else ".")
+                f"Found {total_matches} matching document line(s)"
+                + (f" across {len(slice_matches)} slice(s)." if total_matches else ".")
             ),
             payload={
                 "source_id": source.id,
                 "path": source.virtual_path,
                 "query": query,
+                "slice_lines": slice_lines,
+                "slice_lines_source": slice_lines_source,
                 "total_matches": total_matches,
-                "returned_matches": len(matches),
-                "more_matches_available": total_matches > len(matches),
-                "windows": matches,
-                "unreturned_matches": unreturned_matches,
+                "returned_matches": len(line_matches),
+                "more_matches_available": total_matches > len(line_matches),
+                "matches": line_matches,
+                "slice_matches": slice_matches[:80],
+                "usage_note": "Search locates text only. Use read_document_slice on recommended_read before extracting or binding document evidence.",
             },
             source_id=source.id,
             data_form=source.data_form,
             negative_scope=(
                 _source_negative_scope(kind="document_query_not_found", source=source, query=query)
-                if not matches
+                if not line_matches
                 else None
             ),
-            allowed_next_tools=("read_document_window", "extract_records", "profile_document", "locate_sources"),
+            allowed_next_tools=("read_document_slice", "preview_document", "locate_sources", "blocked"),
             recommended_next_actions=tuple(recommended_next_actions),
         )
 
@@ -1186,43 +1522,53 @@ class EvidenceActionRegistry:
                         "total_matches": payload.get("total_matches"),
                         "returned_matches": payload.get("returned_matches"),
                         "more_matches_available": bool(payload.get("more_matches_available")),
-                        "unreturned_matches": payload.get("unreturned_matches") or [],
+                        "slice_matches": payload.get("slice_matches") or [],
                     }
                 )
-            elif evidence.tool_name == "read_document_window":
+            elif evidence.tool_name == "read_document_slice":
                 coverage.append(
                     {
                         "evidence_ref": evidence_ref,
                         "source_id": evidence.source_id,
-                        "query": payload.get("query"),
+                        "slice_id": payload.get("slice_id"),
+                        "slice_index": payload.get("slice_index"),
                         "start_line": payload.get("start_line"),
                         "end_line": payload.get("end_line"),
+                        "next_slice": payload.get("next_slice"),
                         "more_matches_available": False,
                     }
                 )
-            if isinstance(evidence.payload.get("text"), str):
+            if evidence.tool_name == "read_document_slice" and isinstance(evidence.payload.get("text"), str):
                 source_text_parts.append(str(evidence.payload["text"]))
-            windows = evidence.payload.get("windows")
-            if isinstance(windows, list):
-                source_text_parts.extend(
-                    str(window.get("text") or "")
-                    for window in windows
-                    if isinstance(window, dict)
-                )
         source_text = "\n".join(part for part in source_text_parts if part)
         if not evidence_refs or not source_text:
+            recommended: list[dict[str, Any]] = []
+            for item in coverage:
+                for match in item.get("slice_matches") or []:
+                    if isinstance(match, dict) and isinstance(match.get("recommended_read"), dict):
+                        recommended.append(
+                            {
+                                "tool_name": "read_document_slice",
+                                "arguments": match["recommended_read"],
+                                "reason": "Search evidence only locates text; read the recommended slice before extracting records.",
+                            }
+                        )
+                        break
+                if recommended:
+                    break
             return state.add_evidence(
                 tool_name="extract_records",
                 ok=False,
-                summary="extract_records requires cited document window/search evidence with text.",
+                summary="extract_records requires cited read_document_slice evidence with text.",
                 payload={"evidence_refs": evidence_refs, "spec": spec},
                 source_id=source_id,
                 data_form=data_form,
                 negative_scope={
-                    "kind": "missing_document_window_evidence",
+                    "kind": "missing_document_slice_evidence",
                     "evidence_refs": evidence_refs,
                 },
-                allowed_next_tools=("profile_document", "search_document", "read_document_window"),
+                allowed_next_tools=("preview_document", "search_document", "read_document_slice"),
+                recommended_next_actions=tuple(recommended),
             )
         records: list[dict[str, Any]] = []
 
@@ -1247,7 +1593,7 @@ class EvidenceActionRegistry:
                     source_id=source_id,
                     data_form=data_form,
                     negative_scope={"kind": "invalid_extraction_spec", "error": str(exc)},
-                    allowed_next_tools=("extract_records", "read_document_window"),
+                    allowed_next_tools=("extract_records", "read_document_slice"),
                 )
             wide_matches: list[dict[str, Any]] = []
             for match in pattern.finditer(source_text):
@@ -1289,7 +1635,7 @@ class EvidenceActionRegistry:
                         "kind": "extraction_match_span_too_large",
                         "evidence_refs": evidence_refs,
                     },
-                    allowed_next_tools=("extract_records", "read_document_window", "search_document"),
+                    allowed_next_tools=("extract_records", "read_document_slice", "search_document"),
                     recommended_next_actions=(
                         {
                             "tool_name": "extract_records",
@@ -1335,7 +1681,7 @@ class EvidenceActionRegistry:
                     "evidence_refs": evidence_refs,
                     "unsupported_values": unsupported_values[:20],
                 },
-                allowed_next_tools=("read_document_window", "search_document", "blocked"),
+                allowed_next_tools=("read_document_slice", "search_document", "blocked"),
             )
 
         if not records:
@@ -1353,7 +1699,7 @@ class EvidenceActionRegistry:
                     "kind": "document_record_set_not_found",
                     "evidence_refs": evidence_refs,
                 },
-                allowed_next_tools=("search_document", "read_document_window", "profile_document", "blocked"),
+                allowed_next_tools=("search_document", "read_document_slice", "preview_document", "blocked"),
                 recommended_next_actions=(
                     {
                         "tool_name": "extract_records",
@@ -1381,7 +1727,7 @@ class EvidenceActionRegistry:
             },
             source_id=source_id,
             data_form=data_form,
-            allowed_next_tools=("bind", "read_document_window", "search_document"),
+            allowed_next_tools=("bind", "read_document_slice", "search_document"),
         )
 
     def _track_requirements(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1675,7 +2021,7 @@ class EvidenceActionRegistry:
                     _recommend(
                         "extract_records",
                         {"evidence_refs": list(evidence_refs), "spec": {}},
-                        "If the cited document windows contain repeated records, provide a generic extraction spec and extract provenance-backed records.",
+                        "If the cited document slices contain repeated records, provide a generic extraction spec and extract provenance-backed records.",
                     )
                 )
             if requirement_refs:

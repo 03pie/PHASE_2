@@ -45,7 +45,7 @@ from data_agent_baseline.evidence_agent.codex_loop.state_views import (
     verifier_decisions,
 )
 from data_agent_baseline.evidence_agent.knowledge import (
-    build_knowledge_sections,
+    build_knowledge_catalog,
     match_knowledge_sections,
 )
 from data_agent_baseline.evidence_agent.tracing import EvidenceTrace
@@ -130,6 +130,21 @@ def _progress_identity(evidence: Evidence) -> str:
             for window in windows[:8]
             if isinstance(window, dict)
         ]
+    matches = payload.get("matches")
+    if isinstance(matches, list):
+        identity["match_count"] = len(matches)
+        identity["match_scope"] = [
+            {
+                "line": match.get("line"),
+                "page": match.get("page"),
+                "recommended_read": match.get("recommended_read"),
+            }
+            for match in matches[:8]
+            if isinstance(match, dict)
+        ]
+    slice_catalog = payload.get("slice_catalog")
+    if isinstance(slice_catalog, list):
+        identity["slice_count"] = len(slice_catalog)
     if isinstance(payload.get("records"), list):
         identity["record_count"] = len(payload["records"])
     return json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
@@ -462,8 +477,9 @@ class CodexEvidenceController:
             },
         )
 
-        sections, schema_json, content_hash = build_knowledge_sections(task.context_dir)
+        sections, lookup, schema_json, content_hash = build_knowledge_catalog(task.context_dir)
         state.knowledge_sections = sections
+        state.knowledge_lookup = lookup
         state.matched_sections = match_knowledge_sections(task.question, sections)
         forbidden_terms = ("profile", "physical_schema", "table_schema", "field_schema")
         trace.add(
@@ -472,6 +488,24 @@ class CodexEvidenceController:
             observation={
                 "content_hash": content_hash,
                 "section_count": len(sections),
+                "lookup_count": len(lookup),
+                "catalog": [
+                    {
+                        "id": section.id,
+                        "heading_path": section.heading_path,
+                        "line_start": section.line_start,
+                        "line_end": section.line_end,
+                        "mentions": list(section.mentions[:12]),
+                    }
+                    for section in sections
+                ],
+                "lookup_tokens": [
+                    {
+                        "token": entry.token,
+                        "section_refs": list(entry.section_refs),
+                    }
+                    for entry in list(lookup.values())[:120]
+                ],
                 "matched_sections": [
                     {
                         "id": section.id,
@@ -634,9 +668,10 @@ class CodexEvidenceController:
                     "evidence_ref": item.id,
                     "source_id": item.source_id,
                     "data_form": item.data_form,
+                    "slice_id": item.payload.get("slice_id"),
+                    "slice_index": item.payload.get("slice_index"),
                     "start_line": item.payload.get("start_line"),
                     "end_line": item.payload.get("end_line"),
-                    "query": item.payload.get("query"),
                 }
                 for item in evidence_items
             ]
@@ -667,29 +702,29 @@ class CodexEvidenceController:
             ):
                 allowed_next_tools = (
                     "search_document",
-                    "read_document_window",
+                    "read_document_slice",
                     "extract_records",
                     "bind",
                     "inspect_relation",
                 )
                 for coverage in metadata.get("coverage") or []:
-                    for window in coverage.get("unreturned_matches") or []:
-                        if isinstance(window, dict) and isinstance(window.get("recommended_window"), dict):
+                    for match in coverage.get("slice_matches") or []:
+                        if isinstance(match, dict) and isinstance(match.get("recommended_read"), dict):
                             recommended_items.insert(
                                 0,
                                 {
-                                    "tool_name": "read_document_window",
-                                    "arguments": window["recommended_window"],
-                                    "reason": "This document record-set was extracted from partial search coverage; read the next uncovered matching window before treating it as complete.",
+                                    "tool_name": "read_document_slice",
+                                    "arguments": match["recommended_read"],
+                                    "reason": "This document record-set was extracted from partial search coverage; read the next matching slice before treating it as complete.",
                                 },
                             )
                             break
-                    if recommended_items[0]["tool_name"] == "read_document_window":
+                    if recommended_items[0]["tool_name"] == "read_document_slice":
                         break
             recommended_next_actions = tuple(recommended_items[:8])
             summary = f"Created verified binding {binding.id} as relation {binding.relation_name}."
         else:
-            allowed_next_tools = ("submit_final", "bind", "search_document", "read_document_window")
+            allowed_next_tools = ("submit_final", "bind", "search_document", "read_document_slice")
             recommended_next_actions = (
                 {
                     "tool_name": "submit_final",
