@@ -15,6 +15,10 @@ from data_agent_baseline.evidence_agent.codex_loop.compute import (
     load_binding_frame,
     run_sql_over_bindings,
 )
+from data_agent_baseline.evidence_agent.codex_loop.document_agent import (
+    DocTask,
+    DocumentAgent,
+)
 from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     Evidence,
     LoopState,
@@ -23,9 +27,6 @@ from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     ToolSpec,
 )
 from data_agent_baseline.evidence_agent.text import normalize_key
-
-
-_DEFAULT_DOCUMENT_SLICE_LINES = 80
 
 
 def _normalize(value: Any) -> str:
@@ -148,177 +149,6 @@ def _document_lines(source: SourceRef) -> list[dict[str, Any]]:
     return []
 
 
-def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    return max(minimum, min(parsed, maximum))
-
-
-def _document_slice_lines(
-    state: LoopState,
-    source: SourceRef,
-    arguments: dict[str, Any],
-) -> tuple[int, str]:
-    explicit = arguments.get("slice_lines") or arguments.get("window_lines")
-    if explicit is not None:
-        slice_lines = _bounded_int(
-            explicit,
-            default=_DEFAULT_DOCUMENT_SLICE_LINES,
-            minimum=20,
-            maximum=200,
-        )
-        state.document_slice_lines[source.id] = slice_lines
-        return slice_lines, "explicit_argument"
-    preferred = state.document_slice_lines.get(source.id)
-    if preferred:
-        return preferred, "source_preference"
-    return _DEFAULT_DOCUMENT_SLICE_LINES, "default"
-
-
-def _document_page_count(lines: list[dict[str, Any]]) -> int | None:
-    pages = sorted({item["page"] for item in lines if item["page"] is not None})
-    return len(pages) if pages else None
-
-
-def _format_document_lines(lines: list[dict[str, Any]]) -> str:
-    return "\n".join(f"[page={item['page']} line={item['line']}] {item['text']}" for item in lines)
-
-
-def _compact_line_preview(text: Any, *, limit: int = 240) -> str:
-    value = " ".join(str(text or "").split())
-    if len(value) <= limit:
-        return value
-    return value[: max(0, limit - 3)].rstrip() + "..."
-
-
-def _slice_id(source: SourceRef, index: int) -> str:
-    return f"{source.id}_slice_{index:04d}"
-
-
-def _slice_index_from_id(value: Any, source: SourceRef) -> int | None:
-    text = str(value or "").strip()
-    match = re.fullmatch(rf"{re.escape(source.id)}_slice_(\d{{4}})", text)
-    if match:
-        return int(match.group(1))
-    match = re.fullmatch(r"slice_(\d{4})", text)
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def _document_slice_catalog(
-    source: SourceRef,
-    lines: list[dict[str, Any]],
-    *,
-    slice_lines: int,
-) -> list[dict[str, Any]]:
-    catalog: list[dict[str, Any]] = []
-    if not lines:
-        return catalog
-    for start in range(0, len(lines), slice_lines):
-        index = len(catalog) + 1
-        window = lines[start : start + slice_lines]
-        first_nonblank = next(
-            (str(item["text"]).strip() for item in window if str(item["text"]).strip()),
-            "",
-        )
-        catalog.append(
-            {
-                "slice_id": _slice_id(source, index),
-                "slice_index": index,
-                "start_line": window[0]["line"],
-                "end_line": window[-1]["line"],
-                "page_start": window[0]["page"],
-                "page_end": window[-1]["page"],
-                "line_count": len(window),
-                "preview": _compact_line_preview(first_nonblank),
-            }
-        )
-    return catalog
-
-
-def _document_structure(source: SourceRef, lines: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    headings: list[dict[str, Any]] = []
-    table_like_blocks: list[dict[str, Any]] = []
-    list_like_blocks: list[dict[str, Any]] = []
-    current_table: list[dict[str, Any]] = []
-    current_list: list[dict[str, Any]] = []
-    for item in lines:
-        text = str(item["text"]).strip()
-        if source.data_form == "markdown_document" and text.startswith("#"):
-            headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
-        elif text and len(text) <= 120 and re.match(r"^(\d+[\.)]\s+|[A-Z][\w\s]{2,}:$)", text):
-            headings.append({"line": item["line"], "page": item["page"], "text": text[:300]})
-
-        if "|" in text or text.count("\t") >= 2:
-            current_table.append(item)
-        elif current_table:
-            if len(current_table) >= 2:
-                table_like_blocks.append(
-                    {
-                        "start_line": current_table[0]["line"],
-                        "end_line": current_table[-1]["line"],
-                        "line_count": len(current_table),
-                    }
-                )
-            current_table = []
-
-        if re.match(r"^(\s*[-*]\s+|\s*\d+[\.)]\s+)", text):
-            current_list.append(item)
-        elif current_list:
-            if len(current_list) >= 2:
-                list_like_blocks.append(
-                    {
-                        "start_line": current_list[0]["line"],
-                        "end_line": current_list[-1]["line"],
-                        "line_count": len(current_list),
-                    }
-                )
-            current_list = []
-    if len(current_table) >= 2:
-        table_like_blocks.append(
-            {
-                "start_line": current_table[0]["line"],
-                "end_line": current_table[-1]["line"],
-                "line_count": len(current_table),
-            }
-        )
-    if len(current_list) >= 2:
-        list_like_blocks.append(
-            {
-                "start_line": current_list[0]["line"],
-                "end_line": current_list[-1]["line"],
-                "line_count": len(current_list),
-            }
-        )
-    return {
-        "headings": headings,
-        "table_like_blocks": table_like_blocks,
-        "list_like_blocks": list_like_blocks,
-    }
-
-
-def _slice_for_line(
-    source: SourceRef,
-    line_number: int,
-    *,
-    slice_lines: int,
-) -> dict[str, Any]:
-    slice_index = ((max(1, line_number) - 1) // slice_lines) + 1
-    start_line = ((slice_index - 1) * slice_lines) + 1
-    end_line = slice_index * slice_lines
-    return {
-        "source_ref": source.id,
-        "slice_id": _slice_id(source, slice_index),
-        "slice_index": slice_index,
-        "start_line": start_line,
-        "end_line": end_line,
-        "slice_lines": slice_lines,
-    }
-
-
 def _recommend(tool_name: str, arguments: dict[str, Any], reason: str) -> dict[str, Any]:
     return {"tool_name": tool_name, "arguments": arguments, "reason": reason}
 
@@ -433,6 +263,107 @@ def _string_list(value: Any) -> tuple[str, ...]:
     return ()
 
 
+def _source_ids_from_refs(state: LoopState, refs: tuple[str, ...]) -> tuple[str, ...]:
+    source_ids: list[str] = []
+    for ref in refs:
+        source_id = ref if ref in state.sources else state.source_by_path.get(ref)
+        if source_id and source_id in state.sources:
+            source_ids.append(source_id)
+    return tuple(dict.fromkeys(source_ids))
+
+
+def _card_field_id(card: Any) -> str | None:
+    if isinstance(card, dict):
+        table = str(card.get("canonical_table") or "").strip()
+        field = str(card.get("canonical_field") or "").strip()
+    else:
+        table = str(getattr(card, "canonical_table", "") or "").strip()
+        field = str(getattr(card, "canonical_field", "") or "").strip()
+    if not table or not field:
+        return None
+    return f"{table}.{field}".casefold()
+
+
+def _enrich_document_agent_arguments(
+    state: LoopState,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(arguments)
+    card_by_id = {card.id: card for card in state.semantic_cards}
+    card_by_field: dict[str, Any] = {}
+    for card in state.semantic_cards:
+        field_id = _card_field_id(card)
+        if field_id and field_id not in card_by_field:
+            card_by_field[field_id] = card
+
+    raw_cards = [card for card in arguments.get("semantic_cards") or [] if isinstance(card, dict)]
+    enriched_cards: list[Any] = []
+    seen_card_ids: set[str] = set()
+    for raw_card in raw_cards:
+        full_card = card_by_id.get(str(raw_card.get("id") or ""))
+        if full_card is None:
+            field_id = _card_field_id(raw_card)
+            full_card = card_by_field.get(field_id or "")
+        if full_card is None:
+            enriched_cards.append(raw_card)
+            continue
+        if full_card.id in seen_card_ids:
+            continue
+        seen_card_ids.add(full_card.id)
+        enriched_cards.append(full_card)
+
+    source_ids = _source_ids_from_refs(state, _string_list(arguments.get("source_candidates")))
+    document_field_ids: set[str] = set()
+    document_card_ids: set[str] = set()
+    if source_ids:
+        for mapping in state.source_mappings:
+            if mapping.source_id not in source_ids or mapping.status != "document_source":
+                continue
+            card = card_by_id.get(mapping.card_id)
+            field_id = _card_field_id(card) if card is not None else None
+            if not field_id:
+                continue
+            document_field_ids.add(field_id)
+            document_card_ids.add(mapping.card_id)
+
+    if document_field_ids:
+        raw_target_fields = _string_list(arguments.get("target_fields"))
+        allowed_field_names = {
+            str(card_by_id[card_id].canonical_field)
+            for card_id in document_card_ids
+            if card_id in card_by_id and card_by_id[card_id].canonical_field
+        }
+        target_fields = [
+            field
+            for field in raw_target_fields
+            if field.casefold() in {item.casefold() for item in allowed_field_names}
+        ]
+        if not target_fields:
+            target_fields = sorted(allowed_field_names)
+        normalized["target_fields"] = target_fields
+
+        filtered_cards: list[Any] = []
+        seen_filtered_ids: set[str] = set()
+        for card in enriched_cards or [card_by_id[card_id] for card_id in document_card_ids if card_id in card_by_id]:
+            field_id = _card_field_id(card)
+            card_id = str(card.get("id", "") if isinstance(card, dict) else getattr(card, "id", ""))
+            if field_id not in document_field_ids:
+                continue
+            if card_id and card_id in seen_filtered_ids:
+                continue
+            if card_id:
+                seen_filtered_ids.add(card_id)
+            filtered_cards.append(card)
+        enriched_cards = filtered_cards
+
+    if enriched_cards:
+        normalized["semantic_cards"] = [
+            card.to_dict() if hasattr(card, "to_dict") else dict(card)
+            for card in enriched_cards
+        ]
+    return normalized
+
+
 def _source_evidence_refs(state: LoopState, source_ids: tuple[str, ...]) -> tuple[str, ...]:
     refs: list[str] = []
     for evidence in state.evidence.values():
@@ -468,7 +399,8 @@ def _compute_has_candidate_answer_verification(state: LoopState, compute_ref: st
 
 
 class EvidenceActionRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, document_agent: DocumentAgent | None = None) -> None:
+        self.document_agent = document_agent or DocumentAgent()
         self._dispatch: dict[str, Callable[[LoopState, dict[str, Any]], Evidence]] = {
             "list_inventory": self._list_inventory,
             "retrieve_knowledge": self._retrieve_knowledge,
@@ -476,10 +408,7 @@ class EvidenceActionRegistry:
             "inspect_source": self._inspect_source,
             "sample_records": self._sample_records,
             "search_values": self._search_values,
-            "preview_document": self._preview_document,
-            "search_document": self._search_document,
-            "read_document_slice": self._read_document_slice,
-            "extract_records": self._extract_records,
+            "run_document_agent": self._run_document_agent,
             "inspect_relation": self._inspect_relation,
             "discover_join_paths": self._discover_join_paths,
             "track_requirements": self._track_requirements,
@@ -506,17 +435,8 @@ class EvidenceActionRegistry:
             "search_values": ToolSpec(
                 "search_values", "Search literal values across observed sources."
             ),
-            "preview_document": ToolSpec(
-                "preview_document", "Preview PDF/MD start, end, and slice catalog."
-            ),
-            "search_document": ToolSpec(
-                "search_document", "Locate PDF/MD text matches and recommend slices."
-            ),
-            "read_document_slice": ToolSpec(
-                "read_document_slice", "Read a complete navigable PDF/MD slice."
-            ),
-            "extract_records": ToolSpec(
-                "extract_records", "Execute a model-provided extraction spec over document slices."
+            "run_document_agent": ToolSpec(
+                "run_document_agent", "Delegate PDF/MD evidence work to DocumentAgent."
             ),
             "inspect_relation": ToolSpec(
                 "inspect_relation", "Inspect verified relation schema/sample before compute or SQL repair."
@@ -595,6 +515,11 @@ class EvidenceActionRegistry:
             for item in arguments.get("section_ids", [])
             if str(item).strip()
         }
+        card_ids = {
+            str(item)
+            for item in arguments.get("card_ids", [])
+            if str(item).strip()
+        }
         tokens = [str(item).strip() for item in arguments.get("tokens", []) if str(item).strip()]
         include_neighbors = bool(arguments.get("include_neighbors", False))
         try:
@@ -604,6 +529,7 @@ class EvidenceActionRegistry:
         limit = min(max(limit, 1), 80)
         sections = state.knowledge_sections
         section_by_id = {section.id: section for section in sections}
+        card_by_id = {card.id: card for card in state.semantic_cards}
 
         def catalog_entry(section: Any) -> dict[str, Any]:
             preview = " ".join(str(section.text or "").split())
@@ -663,7 +589,20 @@ class EvidenceActionRegistry:
         catalog = {
             "section_count": len(sections),
             "lookup_count": len(state.knowledge_lookup),
+            "semantic_card_count": len(state.semantic_cards),
             "sections": [catalog_entry(section) for section in sections],
+            "semantic_cards": [
+                {
+                    "id": card.id,
+                    "kind": card.kind,
+                    "name": card.name,
+                    "canonical_table": card.canonical_table,
+                    "canonical_field": card.canonical_field,
+                    "unit": card.unit,
+                    "record_grain": card.record_grain,
+                }
+                for card in state.semantic_cards[:160]
+            ],
             "lookup_tokens": [
                 {
                     "token": entry.token,
@@ -674,6 +613,49 @@ class EvidenceActionRegistry:
                 for entry in list(state.knowledge_lookup.values())[:160]
             ],
         }
+        if mode == "semantic" or card_ids:
+            selected_cards = [card_by_id[card_id] for card_id in card_ids if card_id in card_by_id]
+            missing_card_ids = sorted(card_id for card_id in card_ids if card_id not in card_by_id)
+            if not selected_cards:
+                semantic_query = " ".join([query or state.question, *tokens]).strip()
+                if semantic_query:
+                    query_terms = set(_terms(semantic_query))
+                    scored: list[tuple[int, str, Any]] = []
+                    for card in state.semantic_cards:
+                        haystack = " ".join(
+                            [
+                                card.name,
+                                card.kind,
+                                card.canonical_table,
+                                card.canonical_field or "",
+                                card.definition,
+                                *card.aliases,
+                            ]
+                        )
+                        overlap = len(query_terms & set(_terms(haystack)))
+                        if overlap > 0:
+                            scored.append((-overlap, card.id, card))
+                    scored.sort(key=lambda item: (item[0], item[1]))
+                    selected_cards = [card for _score, _id, card in scored[:limit]]
+                else:
+                    selected_cards = state.matched_semantic_cards[:limit] or state.semantic_cards[:limit]
+            return state.add_evidence(
+                tool_name="retrieve_knowledge",
+                ok=bool(state.semantic_cards),
+                summary=f"Knowledge semantic: returned {len(selected_cards)} semantic card(s).",
+                payload={
+                    "mode": "semantic",
+                    "cards": [card.to_dict() for card in selected_cards],
+                    "missing_card_ids": missing_card_ids,
+                    "card_count": len(state.semantic_cards),
+                    "usage_note": (
+                        "Semantic cards define canonical meaning, aliases, units, grain, formulas, and ambiguity rules. "
+                        "They do not define physical source format; use locate_sources for source candidates."
+                    ),
+                },
+                negative_scope={"kind": "missing_semantic_knowledge"} if not state.semantic_cards else None,
+                allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source", "run_document_agent"),
+            )
         if not sections:
             return state.add_evidence(
                 tool_name="retrieve_knowledge",
@@ -685,7 +667,7 @@ class EvidenceActionRegistry:
                     "usage_note": "knowledge.md is missing, skipped, unreadable, or empty.",
                 },
                 negative_scope={"kind": "missing_knowledge"},
-                allowed_next_tools=("locate_sources", "inspect_source", "preview_document"),
+                allowed_next_tools=("locate_sources", "inspect_source", "run_document_agent"),
             )
 
         selected_ids: set[str] = set()
@@ -772,7 +754,7 @@ class EvidenceActionRegistry:
             ok=True,
             summary=f"Knowledge {actual_mode}: returned {len(selected)} full section(s).",
             payload=payload,
-            allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source", "preview_document"),
+            allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source", "run_document_agent"),
         )
 
     def _locate_sources(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -782,6 +764,93 @@ class EvidenceActionRegistry:
             tokens = _terms(query)
         query_norms = {_normalize(token) for token in tokens + [query] if _normalize(token)}
         candidates = []
+        semantic_plan: list[dict[str, Any]] = []
+        matched_card_ids = {card.id for card in state.matched_semantic_cards}
+        seen_semantic_candidates: set[tuple[str, str, str]] = set()
+
+        for card in state.semantic_cards:
+            canonical_field = str(card.canonical_field or "").strip()
+            if not canonical_field:
+                continue
+            canonical_id = f"{card.canonical_table}.{canonical_field}".casefold()
+            card_haystack = " ".join(
+                [
+                    card.name,
+                    card.kind,
+                    card.canonical_table,
+                    canonical_field,
+                    card.definition,
+                    *(card.aliases or ()),
+                ]
+            )
+            card_norm = _normalize(card_haystack)
+            relevant = card.id in matched_card_ids or any(
+                token and token in card_norm for token in query_norms
+            )
+            if not relevant:
+                continue
+            mappings = [mapping for mapping in state.source_mappings if mapping.card_id == card.id]
+            if not mappings:
+                continue
+            mapping_payloads: list[dict[str, Any]] = []
+            for mapping in mappings:
+                preferred = mapping.status in {"exact_structured_source", "document_source"}
+                mapping_payload = {
+                    **mapping.to_dict(),
+                    "canonical_field": canonical_id,
+                    "binding_priority": "preferred" if preferred else "fallback_only",
+                    "recommended_tool": (
+                        "run_document_agent"
+                        if mapping.status == "document_source"
+                        else "inspect_source"
+                        if mapping.status == "exact_structured_source"
+                        else "retrieve_knowledge"
+                    ),
+                    "usage_note": (
+                        "Preferred mapping for this canonical field."
+                        if preferred
+                        else "Fallback candidates are lexical hints only; do not bind as this canonical field without explicit semantic_contract proof."
+                    ),
+                }
+                mapping_payloads.append(mapping_payload)
+                if not mapping.source_id:
+                    continue
+                candidate_key = (card.id, mapping.source_id, mapping.status)
+                if candidate_key in seen_semantic_candidates:
+                    continue
+                seen_semantic_candidates.add(candidate_key)
+                source = state.sources.get(mapping.source_id)
+                candidate = state.add_candidate(
+                    kind="semantic_source_mapping",
+                    source_id=mapping.source_id,
+                    data_form=mapping.data_form or (source.data_form if source else "unknown_file"),
+                    match_reason=f"semantic_{mapping.status}: {mapping.match_reason}",
+                    path=mapping.source_path,
+                    table=mapping.matched_table,
+                    field=mapping.matched_field,
+                ).to_dict()
+                candidate.update(
+                    {
+                        "semantic_card_id": card.id,
+                        "canonical_field": canonical_id,
+                        "mapping_status": mapping.status,
+                        "binding_priority": "preferred" if preferred else "fallback_only",
+                        "recommended_tool": mapping_payload["recommended_tool"],
+                        "usage_note": mapping_payload["usage_note"],
+                    }
+                )
+                candidates.append(candidate)
+            semantic_plan.append(
+                {
+                    "card_id": card.id,
+                    "canonical_field": canonical_id,
+                    "canonical_table": card.canonical_table,
+                    "field": canonical_field,
+                    "unit": card.unit,
+                    "record_grain": card.record_grain,
+                    "source_mappings": mapping_payloads,
+                }
+            )
 
         for source in state.sources.values():
             haystack = " ".join(
@@ -831,14 +900,27 @@ class EvidenceActionRegistry:
         return state.add_evidence(
             tool_name="locate_sources",
             ok=True,
-            summary=f"Located {len(candidates)} candidate(s). Candidates are not bindings.",
-            payload={"query": query, "tokens": tokens, "candidates": candidates[:80]},
+            summary=(
+                f"Located {len(candidates)} candidate(s). Semantic preferred mappings are listed "
+                "before lexical candidates; candidates are not bindings."
+            ),
+            payload={
+                "query": query,
+                "tokens": tokens,
+                "semantic_source_plan": semantic_plan[:24],
+                "candidates": candidates[:80],
+                "usage_note": (
+                    "Use semantic_source_plan preferred mappings for knowledge-defined fields before "
+                    "substituting similarly named tables/columns. Fallback candidates require explicit "
+                    "semantic_contract proof."
+                ),
+            },
             negative_scope=(
                 {"kind": "candidate_search_empty", "query": query, "tokens": tokens}
                 if not candidates
                 else None
             ),
-            allowed_next_tools=("inspect_source", "sample_records", "preview_document", "search_document"),
+            allowed_next_tools=("inspect_source", "sample_records", "run_document_agent"),
         )
 
     def _inspect_source(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -976,7 +1058,7 @@ class EvidenceActionRegistry:
             return state.add_evidence(
                 tool_name="inspect_source",
                 ok=True,
-                summary=f"{source.data_form} source observed. Use preview_document or read_document_slice for text evidence.",
+                summary=f"{source.data_form} source observed. Use run_document_agent for record-slice evidence.",
                 payload={
                     "source_id": source.id,
                     "path": source.virtual_path,
@@ -985,7 +1067,7 @@ class EvidenceActionRegistry:
                 },
                 source_id=source.id,
                 data_form=source.data_form,
-                allowed_next_tools=("preview_document", "search_document", "read_document_slice"),
+                allowed_next_tools=("run_document_agent",),
             )
 
         if source.data_form == "video":
@@ -1143,591 +1225,53 @@ class EvidenceActionRegistry:
             recommended_next_actions=(),
         )
 
-    def _preview_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        source = _source_from_args(state, arguments)
-        if source is None:
-            return state.add_evidence(
-                tool_name="preview_document",
-                ok=False,
-                summary="No observed source matched preview_document arguments.",
-                payload={"arguments": arguments},
-                negative_scope={"kind": "unknown_source", "tool": "preview_document", "arguments": arguments},
-                allowed_next_tools=("list_inventory", "locate_sources"),
-            )
-        if source.data_form not in {"pdf_document", "markdown_document"}:
-            return state.add_evidence(
-                tool_name="preview_document",
-                ok=False,
-                summary=f"{source.data_form} is not a document source.",
-                payload={"source_id": source.id, "data_form": source.data_form},
-                source_id=source.id,
-                data_form=source.data_form,
-                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
-                allowed_next_tools=("inspect_source", "sample_records", "search_values"),
-            )
-        lines = _document_lines(source)
-        preview_lines = _bounded_int(arguments.get("preview_lines"), default=16, minimum=5, maximum=40)
-        slice_lines, slice_lines_source = _document_slice_lines(state, source, arguments)
-        catalog = _document_slice_catalog(source, lines, slice_lines=slice_lines)
-        structure = _document_structure(source, lines)
-        start_window = lines[:preview_lines]
-        end_window = lines[-preview_lines:] if len(lines) > preview_lines else []
+    def _run_document_agent(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        arguments = _enrich_document_agent_arguments(state, arguments)
+        task = DocTask.from_arguments(arguments, fallback_question=state.question)
+        package = self.document_agent.run(state, task)
+        payload = package.to_dict()
+        records = payload.get("records") if isinstance(payload.get("records"), list) else []
+        source_refs = payload.get("source_refs") if isinstance(payload.get("source_refs"), list) else []
+        source_id = str(source_refs[0]) if len(source_refs) == 1 else None
+        source = state.sources.get(source_id or "")
+        partial_coverage = bool(payload.get("remaining_risks")) or bool(payload.get("ambiguous_slice_ids"))
+        payload["partial_coverage"] = partial_coverage
+        payload["doc_task"] = task.to_dict()
+        evidence_ref = f"ev_{state._evidence_seq + 1:04d}"
+        summary = (
+            f"DocumentAgent returned {len(records)} validated record(s) "
+            f"from {len(source_refs)} document source(s)."
+        )
         return state.add_evidence(
-            tool_name="preview_document",
+            tool_name="run_document_agent",
             ok=True,
-            summary=f"Previewed {source.virtual_path}: {len(lines)} line(s), {len(catalog)} slice(s).",
-            payload={
-                "source_id": source.id,
-                "path": source.virtual_path,
-                "data_form": source.data_form,
-                "line_count": len(lines),
-                "page_count": _document_page_count(lines),
-                "line_start": lines[0]["line"] if lines else None,
-                "line_end": lines[-1]["line"] if lines else None,
-                "slice_lines": slice_lines,
-                "slice_lines_source": slice_lines_source,
-                "slice_count": len(catalog),
-                "slice_catalog": catalog,
-                "headings": structure["headings"][:120],
-                "table_like_blocks": structure["table_like_blocks"][:40],
-                "list_like_blocks": structure["list_like_blocks"][:40],
-                "start_preview": {
-                    "start_line": start_window[0]["line"] if start_window else None,
-                    "end_line": start_window[-1]["line"] if start_window else None,
-                    "text": _format_document_lines(start_window),
-                },
-                "end_preview": {
-                    "start_line": end_window[0]["line"] if end_window else None,
-                    "end_line": end_window[-1]["line"] if end_window else None,
-                    "text": _format_document_lines(end_window),
-                },
-                "recommended_first_slice": (
-                    {
-                        "source_ref": source.id,
-                        "slice_id": catalog[0]["slice_id"],
-                        "slice_lines": slice_lines,
-                    }
-                    if catalog
-                    else None
-                ),
-            },
-            source_id=source.id,
-            data_form=source.data_form,
-            negative_scope=(
-                _source_negative_scope(kind="empty_document", source=source)
-                if not lines
-                else None
-            ),
-            allowed_next_tools=("search_document", "read_document_slice", "extract_records", "bind"),
-        )
-
-    def _read_document_slice(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        source = _source_from_args(state, arguments)
-        if source is None:
-            return state.add_evidence(
-                tool_name="read_document_slice",
-                ok=False,
-                summary="No observed source matched read_document_slice arguments.",
-                payload={"arguments": arguments},
-                negative_scope={"kind": "unknown_source", "tool": "read_document_slice", "arguments": arguments},
-                allowed_next_tools=("list_inventory", "locate_sources"),
-            )
-        if source.data_form not in {"pdf_document", "markdown_document"}:
-            return state.add_evidence(
-                tool_name="read_document_slice",
-                ok=False,
-                summary=f"{source.data_form} is not a readable document source.",
-                payload={"source_id": source.id, "data_form": source.data_form},
-                source_id=source.id,
-                data_form=source.data_form,
-                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
-                allowed_next_tools=("inspect_source", "sample_records", "search_values"),
-            )
-        lines = _document_lines(source)
-        slice_lines, slice_lines_source = _document_slice_lines(state, source, arguments)
-        catalog = _document_slice_catalog(source, lines, slice_lines=slice_lines)
-        total_slices = len(catalog)
-        start_line = arguments.get("start_line")
-        end_line = arguments.get("end_line")
-        center_line = arguments.get("center_line") or arguments.get("line")
-        slice_index = _slice_index_from_id(arguments.get("slice_id"), source)
-        if slice_index is None:
-            try:
-                slice_index = int(arguments.get("slice_index")) if arguments.get("slice_index") else None
-            except (TypeError, ValueError):
-                slice_index = None
-
-        if isinstance(start_line, int) and start_line > 0:
-            start = max(0, start_line - 1)
-            if isinstance(end_line, int) and end_line >= start_line:
-                end = min(len(lines), end_line)
-            else:
-                end = min(len(lines), start + slice_lines)
-            selected_slice_index = ((start + 1 - 1) // slice_lines) + 1 if lines else None
-        elif center_line is not None:
-            center = _bounded_int(center_line, default=1, minimum=1, maximum=max(1, len(lines)))
-            context_lines = _bounded_int(
-                arguments.get("context_lines"),
-                default=slice_lines,
-                minimum=20,
-                maximum=200,
-            )
-            start = max(0, center - 1 - context_lines // 2)
-            end = min(len(lines), start + context_lines)
-            selected_slice_index = ((center - 1) // slice_lines) + 1 if lines else None
-        else:
-            selected_slice_index = max(1, min(slice_index or 1, max(1, total_slices)))
-            start = (selected_slice_index - 1) * slice_lines
-            end = min(len(lines), start + slice_lines)
-
-        window = lines[start:end]
-        if not window:
-            return state.add_evidence(
-                tool_name="read_document_slice",
-                ok=False,
-                summary=f"No document text was available in requested slice for {source.virtual_path}.",
-                payload={
-                    "source_id": source.id,
-                    "path": source.virtual_path,
-                    "arguments": arguments,
-                    "line_count": len(lines),
-                },
-                source_id=source.id,
-                data_form=source.data_form,
-                negative_scope=_source_negative_scope(kind="document_slice_empty", source=source),
-                allowed_next_tools=("preview_document", "search_document", "blocked"),
-            )
-
-        actual_start = int(window[0]["line"])
-        actual_end = int(window[-1]["line"])
-        selected_slice_index = selected_slice_index or (((actual_start - 1) // slice_lines) + 1)
-        previous_slice = (
-            {
-                "source_ref": source.id,
-                "slice_id": _slice_id(source, selected_slice_index - 1),
-                "slice_index": selected_slice_index - 1,
-                "slice_lines": slice_lines,
-            }
-            if selected_slice_index > 1
-            else None
-        )
-        next_slice = (
-            {
-                "source_ref": source.id,
-                "slice_id": _slice_id(source, selected_slice_index + 1),
-                "slice_index": selected_slice_index + 1,
-                "slice_lines": slice_lines,
-            }
-            if selected_slice_index < total_slices
-            else None
-        )
-        expand_slice = {
-            "source_ref": source.id,
-            "center_line": max(actual_start, (actual_start + actual_end) // 2),
-            "context_lines": min(200, max(slice_lines * 2, actual_end - actual_start + 1)),
-            "slice_lines": slice_lines,
-        }
-        return state.add_evidence(
-            tool_name="read_document_slice",
-            ok=True,
-            summary=(
-                f"Read document slice {selected_slice_index}/{total_slices} "
-                f"from {source.virtual_path} lines {actual_start}-{actual_end}."
-            ),
-            payload={
-                "source_id": source.id,
-                "path": source.virtual_path,
-                "data_form": source.data_form,
-                "slice_id": _slice_id(source, selected_slice_index),
-                "slice_index": selected_slice_index,
-                "slice_lines": slice_lines,
-                "slice_lines_source": slice_lines_source,
-                "slice_count": total_slices,
-                "start_line": actual_start,
-                "end_line": actual_end,
-                "page_start": window[0]["page"],
-                "page_end": window[-1]["page"],
-                "line_count": len(window),
-                "document_line_count": len(lines),
-                "coverage": {
-                    "covered_line_start": actual_start,
-                    "covered_line_end": actual_end,
-                    "remaining_before": actual_start > 1,
-                    "remaining_after": actual_end < len(lines),
-                },
-                "previous_slice": previous_slice,
-                "next_slice": next_slice,
-                "expand_slice": expand_slice,
-                "window": window,
-                "text": _format_document_lines(window),
-            },
-            source_id=source.id,
-            data_form=source.data_form,
-            allowed_next_tools=("read_document_slice", "search_document", "extract_records", "bind", "blocked"),
-            recommended_next_actions=tuple(
-                action
-                for action in (
-                    _recommend("read_document_slice", next_slice, "Read the next slice if the document section continues.")
-                    if next_slice
-                    else None,
-                    _recommend("extract_records", {"evidence_refs": []}, "Extract records only if this slice contains complete record boundaries."),
-                )
-                if action is not None
-            ),
-        )
-
-    def _search_document(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        source = _source_from_args(state, arguments)
-        query = str(arguments.get("query") or "").strip()
-        if source is None:
-            return state.add_evidence(
-                tool_name="search_document",
-                ok=False,
-                summary="No observed source matched search_document arguments.",
-                payload={"arguments": arguments},
-                negative_scope={"kind": "unknown_source", "tool": "search_document", "arguments": arguments},
-                allowed_next_tools=("list_inventory", "locate_sources"),
-            )
-        if source.data_form not in {"pdf_document", "markdown_document"}:
-            return state.add_evidence(
-                tool_name="search_document",
-                ok=False,
-                summary=f"{source.data_form} is not a document source.",
-                payload={"source_id": source.id, "data_form": source.data_form},
-                source_id=source.id,
-                data_form=source.data_form,
-                negative_scope=_source_negative_scope(kind="not_document_source", source=source),
-                allowed_next_tools=("inspect_source", "sample_records"),
-            )
-        if not query:
-            return state.add_evidence(
-                tool_name="search_document",
-                ok=False,
-                summary="search_document requires a query.",
-                payload={"arguments": arguments},
-                source_id=source.id,
-                data_form=source.data_form,
-                negative_scope=_source_negative_scope(kind="invalid_tool_arguments", source=source, missing="query"),
-                allowed_next_tools=("preview_document", "read_document_slice"),
-            )
-        lines = _document_lines(source)
-        terms = _terms(query)
-        limit = _bounded_int(arguments.get("limit"), default=20, minimum=1, maximum=80)
-        slice_lines, slice_lines_source = _document_slice_lines(state, source, arguments)
-        line_matches: list[dict[str, Any]] = []
-        slice_hits: dict[int, dict[str, Any]] = {}
-        for index, line in enumerate(lines):
-            text = str(line["text"]).casefold()
-            matched_terms = [term for term in terms if term in text]
-            if not matched_terms:
-                continue
-            line_number = int(line["line"])
-            slice_ref = _slice_for_line(source, line_number, slice_lines=slice_lines)
-            slice_index = int(slice_ref["slice_index"])
-            bucket = slice_hits.setdefault(
-                slice_index,
-                {
-                    "slice_id": slice_ref["slice_id"],
-                    "slice_index": slice_index,
-                    "start_line": slice_ref["start_line"],
-                    "end_line": min(len(lines), int(slice_ref["end_line"])),
-                    "match_count": 0,
-                    "matched_terms": [],
-                    "recommended_read": slice_ref,
-                    "first_match_line": line_number,
-                    "first_match_preview": _compact_line_preview(line["text"]),
-                },
-            )
-            bucket["match_count"] += 1
-            for term in matched_terms:
-                if term not in bucket["matched_terms"]:
-                    bucket["matched_terms"].append(term)
-            if len(line_matches) < limit:
-                line_matches.append(
-                    {
-                        "line": line_number,
-                        "page": line["page"],
-                        "matched_terms": matched_terms[:12],
-                        "preview": _compact_line_preview(line["text"]),
-                        "recommended_read": slice_ref,
-                    }
-                )
-        total_matches = sum(int(item["match_count"]) for item in slice_hits.values())
-        slice_matches = sorted(
-            slice_hits.values(),
-            key=lambda item: (int(item["slice_index"])),
-        )
-        recommended_next_actions: list[dict[str, Any]] = []
-        if slice_matches:
-            recommended_next_actions.append(
-                {
-                    "tool_name": "read_document_slice",
-                    "arguments": slice_matches[0]["recommended_read"],
-                    "reason": "Read the full slice around the first document match before extracting or binding evidence.",
-                }
-            )
-        return state.add_evidence(
-            tool_name="search_document",
-            ok=True,
-            summary=(
-                f"Found {total_matches} matching document line(s)"
-                + (f" across {len(slice_matches)} slice(s)." if total_matches else ".")
-            ),
-            payload={
-                "source_id": source.id,
-                "path": source.virtual_path,
-                "query": query,
-                "slice_lines": slice_lines,
-                "slice_lines_source": slice_lines_source,
-                "total_matches": total_matches,
-                "returned_matches": len(line_matches),
-                "more_matches_available": total_matches > len(line_matches),
-                "matches": line_matches,
-                "slice_matches": slice_matches[:80],
-                "usage_note": "Search locates text only. Use read_document_slice on recommended_read before extracting or binding document evidence.",
-            },
-            source_id=source.id,
-            data_form=source.data_form,
-            negative_scope=(
-                _source_negative_scope(kind="document_query_not_found", source=source, query=query)
-                if not line_matches
-                else None
-            ),
-            allowed_next_tools=("read_document_slice", "preview_document", "locate_sources", "blocked"),
-            recommended_next_actions=tuple(recommended_next_actions),
-        )
-
-    def _extract_records(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        evidence_refs = [
-            str(item) for item in arguments.get("evidence_refs", []) if str(item).strip()
-        ]
-        spec = arguments.get("spec") if isinstance(arguments.get("spec"), dict) else arguments
-        source_text_parts: list[str] = []
-        source_id = None
-        data_form = None
-        coverage: list[dict[str, Any]] = []
-        for evidence_ref in evidence_refs:
-            evidence = state.evidence.get(evidence_ref)
-            if evidence is None:
-                continue
-            source_id = source_id or evidence.source_id
-            data_form = data_form or evidence.data_form
-            payload = evidence.payload or {}
-            if evidence.tool_name == "search_document":
-                coverage.append(
-                    {
-                        "evidence_ref": evidence_ref,
-                        "source_id": evidence.source_id,
-                        "query": payload.get("query"),
-                        "total_matches": payload.get("total_matches"),
-                        "returned_matches": payload.get("returned_matches"),
-                        "more_matches_available": bool(payload.get("more_matches_available")),
-                        "slice_matches": payload.get("slice_matches") or [],
-                    }
-                )
-            elif evidence.tool_name == "read_document_slice":
-                coverage.append(
-                    {
-                        "evidence_ref": evidence_ref,
-                        "source_id": evidence.source_id,
-                        "slice_id": payload.get("slice_id"),
-                        "slice_index": payload.get("slice_index"),
-                        "start_line": payload.get("start_line"),
-                        "end_line": payload.get("end_line"),
-                        "next_slice": payload.get("next_slice"),
-                        "more_matches_available": False,
-                    }
-                )
-            if evidence.tool_name == "read_document_slice" and isinstance(evidence.payload.get("text"), str):
-                source_text_parts.append(str(evidence.payload["text"]))
-        source_text = "\n".join(part for part in source_text_parts if part)
-        if not evidence_refs or not source_text:
-            recommended: list[dict[str, Any]] = []
-            for item in coverage:
-                for match in item.get("slice_matches") or []:
-                    if isinstance(match, dict) and isinstance(match.get("recommended_read"), dict):
-                        recommended.append(
-                            {
-                                "tool_name": "read_document_slice",
-                                "arguments": match["recommended_read"],
-                                "reason": "Search evidence only locates text; read the recommended slice before extracting records.",
-                            }
-                        )
-                        break
-                if recommended:
-                    break
-            return state.add_evidence(
-                tool_name="extract_records",
-                ok=False,
-                summary="extract_records requires cited read_document_slice evidence with text.",
-                payload={"evidence_refs": evidence_refs, "spec": spec},
-                source_id=source_id,
-                data_form=data_form,
-                negative_scope={
-                    "kind": "missing_document_slice_evidence",
-                    "evidence_refs": evidence_refs,
-                },
-                allowed_next_tools=("preview_document", "search_document", "read_document_slice"),
-                recommended_next_actions=tuple(recommended),
-            )
-        records: list[dict[str, Any]] = []
-
-        provided = spec.get("records") if isinstance(spec, dict) else None
-        if isinstance(provided, list):
-            for item in provided:
-                if isinstance(item, dict):
-                    records.append(dict(item))
-
-        regex = spec.get("regex") if isinstance(spec, dict) else None
-        if regex and source_text:
-            flags = re.MULTILINE | re.DOTALL if bool(spec.get("dotall")) else re.MULTILINE
-            max_span_chars = max(120, min(int(spec.get("max_span_chars") or 500), 5_000))
-            try:
-                pattern = re.compile(str(regex), flags)
-            except re.error as exc:
-                return state.add_evidence(
-                    tool_name="extract_records",
-                    ok=False,
-                    summary=f"Invalid extraction regex: {exc}.",
-                    payload={"error": "invalid_regex", "regex": regex},
-                    source_id=source_id,
-                    data_form=data_form,
-                    negative_scope={"kind": "invalid_extraction_spec", "error": str(exc)},
-                    allowed_next_tools=("extract_records", "read_document_slice"),
-                )
-            wide_matches: list[dict[str, Any]] = []
-            for match in pattern.finditer(source_text):
-                span = match.span()
-                if span[1] - span[0] > max_span_chars:
-                    wide_matches.append(
-                        {
-                            "span": span,
-                            "max_span_chars": max_span_chars,
-                            "preview": match.group(0)[:240],
-                        }
-                    )
-                    continue
-                if match.groupdict():
-                    record = dict(match.groupdict())
-                else:
-                    fields = [str(field) for field in spec.get("fields", [])]
-                    values = list(match.groups())
-                    record = dict(zip(fields, values, strict=False)) if fields else {"match": match.group(0)}
-                record.setdefault("provenance", {"evidence_refs": evidence_refs, "span": match.span()})
-                records.append(record)
-            if wide_matches:
-                return state.add_evidence(
-                    tool_name="extract_records",
-                    ok=False,
-                    summary=(
-                        "Extraction regex matched spans that are too wide for reliable record provenance. "
-                        "Tighten the regex to one record boundary or provide copied records."
-                    ),
-                    payload={
-                        "error": "extraction_match_span_too_large",
-                        "wide_matches": wide_matches[:10],
-                        "evidence_refs": evidence_refs,
-                        "spec": spec,
-                    },
-                    source_id=source_id,
-                    data_form=data_form,
-                    negative_scope={
-                        "kind": "extraction_match_span_too_large",
-                        "evidence_refs": evidence_refs,
-                    },
-                    allowed_next_tools=("extract_records", "read_document_slice", "search_document"),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "extract_records",
-                            "arguments": {
-                                "evidence_refs": evidence_refs,
-                                "spec": {
-                                    "regex": "<tighter one-record regex or copied records>",
-                                    "dotall": True,
-                                    "max_span_chars": max_span_chars,
-                                },
-                            },
-                            "reason": "Retry with a tighter record-boundary regex so captured fields come from the same record span.",
-                        },
-                    ),
-                )
-
-        normalized_source_text = re.sub(r"\s+", "", source_text.casefold())
-        unsupported_values: list[str] = []
-        for record in records:
-            flat_values = [
-                str(value)
-                for key, value in record.items()
-                if key != "provenance" and value is not None and str(value).strip()
-            ]
-            for value in flat_values:
-                compact = re.sub(r"\s+", "", value.casefold())
-                if compact and source_text and compact not in normalized_source_text:
-                    unsupported_values.append(value)
-        if unsupported_values:
-            return state.add_evidence(
-                tool_name="extract_records",
-                ok=False,
-                summary="Extraction spec produced values not present in cited document evidence.",
-                payload={
-                    "error": "unsupported_extracted_values",
-                    "unsupported_values": unsupported_values[:20],
-                    "evidence_refs": evidence_refs,
-                },
-                source_id=source_id,
-                data_form=data_form,
-                negative_scope={
-                    "kind": "unsupported_extracted_values",
-                    "evidence_refs": evidence_refs,
-                    "unsupported_values": unsupported_values[:20],
-                },
-                allowed_next_tools=("read_document_slice", "search_document", "blocked"),
-            )
-
-        if not records:
-            return state.add_evidence(
-                tool_name="extract_records",
-                ok=False,
-                summary=(
-                    "Extraction spec did not produce a record set. "
-                    "Use an executable regex with capture groups, or provide records copied exactly from cited evidence."
-                ),
-                payload={"spec": spec, "evidence_refs": evidence_refs},
-                source_id=source_id,
-                data_form=data_form,
-                negative_scope={
-                    "kind": "document_record_set_not_found",
-                    "evidence_refs": evidence_refs,
-                },
-                allowed_next_tools=("search_document", "read_document_slice", "preview_document", "blocked"),
-                recommended_next_actions=(
-                    {
-                        "tool_name": "extract_records",
-                        "arguments": {
-                            "evidence_refs": evidence_refs,
-                            "spec": {
-                                "regex": "<Python regex over cited window text, preferably with named groups>",
-                                "dotall": True,
-                            },
-                        },
-                        "reason": "Retry extraction with an executable regex or copied records if the cited window contains the needed record boundaries and values.",
-                    },
-                ),
-            )
-        return state.add_evidence(
-            tool_name="extract_records",
-            ok=True,
-            summary=f"Extracted {len(records)} provenance-backed record(s).",
-            payload={
-                "records": records,
-                "evidence_refs": evidence_refs,
-                "spec": spec,
-                "coverage": coverage,
-                "partial_coverage": any(item.get("more_matches_available") for item in coverage),
-            },
+            summary=summary,
+            payload=payload,
             source_id=source_id,
-            data_form=data_form,
-            allowed_next_tools=("bind", "read_document_slice", "search_document"),
+            data_form=source.data_form if source is not None else None,
+            negative_scope=(
+                {
+                    "kind": "document_agent_remaining_risk",
+                    "remaining_risks": payload.get("remaining_risks") or [],
+                }
+                if payload.get("remaining_risks")
+                else None
+            ),
+            allowed_next_tools=("verify_alignment", "bind", "run_document_agent", "locate_sources", "blocked"),
+            recommended_next_actions=(
+                {
+                    "tool_name": "bind",
+                    "arguments": {
+                        "binding_type": "document_record_set",
+                        "evidence_refs": [evidence_ref],
+                        "allowed_columns": list((records[0] or {}).keys()) if records else [],
+                        "alignment": "Bind validated DocumentAgent records if they satisfy the target semantic fields.",
+                    },
+                    "reason": "Bind the document record set only when records and coverage are sufficient.",
+                },
+            )
+            if records
+            else (),
         )
 
     def _track_requirements(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1837,7 +1381,7 @@ class EvidenceActionRegistry:
                 "retrieve_knowledge",
                 "locate_sources",
                 "inspect_source",
-                "search_document",
+                "run_document_agent",
                 "verify_alignment",
                 "bind",
                 "run_verified_compute",
@@ -2019,9 +1563,9 @@ class EvidenceActionRegistry:
             if target_kind in {"document_window", "direct_evidence"} and evidence_refs:
                 recommended_actions.append(
                     _recommend(
-                        "extract_records",
-                        {"evidence_refs": list(evidence_refs), "spec": {}},
-                        "If the cited document slices contain repeated records, provide a generic extraction spec and extract provenance-backed records.",
+                        "run_document_agent",
+                        {"question": state.question},
+                        "Delegate remaining PDF/MD evidence work to DocumentAgent instead of extracting records in the main loop.",
                     )
                 )
             if requirement_refs:
@@ -2092,7 +1636,13 @@ class EvidenceActionRegistry:
                     "target_kind": target_kind,
                     "invalid": invalid,
                 },
-                allowed_next_tools=("verify_alignment", "track_requirements", "inspect_relation", "blocked"),
+                allowed_next_tools=(
+                    "verify_alignment",
+                    "track_requirements",
+                    "inspect_relation",
+                    "run_verified_compute",
+                    "blocked",
+                ),
             )
 
         negative_scope = None
@@ -2118,7 +1668,7 @@ class EvidenceActionRegistry:
                 "run_verified_compute",
                 "submit_final",
                 "locate_sources",
-                "search_document",
+                "run_document_agent",
                 "blocked",
             ),
             recommended_next_actions=tuple(recommended_actions[:8]),
@@ -2185,7 +1735,7 @@ class EvidenceActionRegistry:
                     ],
                 },
                 negative_scope={"kind": "unknown_relation", "arguments": arguments},
-                allowed_next_tools=("bind", "inspect_source", "extract_records"),
+                allowed_next_tools=("bind", "inspect_source", "run_document_agent"),
             )
         try:
             frame = load_binding_frame(state, binding)
@@ -2671,7 +2221,7 @@ class EvidenceActionRegistry:
                     "failed_evidence": failed_evidence,
                 },
                 negative_scope={"kind": "invalid_direct_final_lineage"},
-                allowed_next_tools=("bind", "search_document", "inspect_relation", "blocked"),
+                allowed_next_tools=("bind", "run_document_agent", "inspect_relation", "blocked"),
             )
         columns, rows = normalized
         state.final_answer = {
@@ -2734,3 +2284,4 @@ class EvidenceActionRegistry:
             },
             allowed_next_tools=("locate_sources", "blocked"),
         )
+

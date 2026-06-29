@@ -16,6 +16,7 @@ from data_agent_baseline.evidence_agent.codex_loop.context import (
     build_context_fragments,
     render_user_context,
 )
+from data_agent_baseline.evidence_agent.codex_loop.document_agent import DocumentAgent
 from data_agent_baseline.evidence_agent.codex_loop.guard import guard_action
 from data_agent_baseline.evidence_agent.codex_loop.inventory import build_inventory
 from data_agent_baseline.evidence_agent.codex_loop.native_tools import (
@@ -46,7 +47,11 @@ from data_agent_baseline.evidence_agent.codex_loop.state_views import (
 )
 from data_agent_baseline.evidence_agent.knowledge import (
     build_knowledge_catalog,
+    build_semantic_cards,
+    build_source_mappings,
+    expand_semantic_card_dependencies,
     match_knowledge_sections,
+    match_semantic_cards,
 )
 from data_agent_baseline.evidence_agent.tracing import EvidenceTrace
 
@@ -79,6 +84,63 @@ def _compact(value: Any, *, limit: int = 40) -> Any:
     return value
 
 
+def _semantic_norm(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
+
+
+def _infer_semantic_contract(
+    state: LoopState,
+    *,
+    binding_type: str,
+    source_id: str | None,
+    table: str | None,
+    allowed_columns: tuple[str, ...],
+) -> dict[str, Any]:
+    if not source_id:
+        return {}
+    column_norms = {_semantic_norm(column) for column in allowed_columns}
+    table_norm = _semantic_norm(table)
+    canonical_fields: list[str] = []
+    physical_field_mapping: dict[str, dict[str, Any]] = {}
+    for card in state.semantic_cards:
+        if not card.canonical_field:
+            continue
+        field_norm = _semantic_norm(card.canonical_field)
+        if field_norm and column_norms and field_norm not in column_norms:
+            continue
+        field_id = f"{card.canonical_table}.{card.canonical_field}".casefold()
+        for mapping in state.source_mappings:
+            if mapping.card_id != card.id or mapping.source_id != source_id:
+                continue
+            if mapping.status == "exact_structured_source" and binding_type in {"structured_source", "structured_field"}:
+                mapped_table = _semantic_norm(mapping.matched_table)
+                if table_norm and mapped_table and table_norm != mapped_table:
+                    continue
+                canonical_fields.append(field_id)
+                physical_field_mapping[field_id] = {
+                    "source_id": source_id,
+                    "source_path": mapping.source_path,
+                    "table": table,
+                    "field": card.canonical_field,
+                    "mapping_status": mapping.status,
+                }
+            elif mapping.status == "document_source" and binding_type == "document_record_set":
+                canonical_fields.append(field_id)
+                physical_field_mapping[field_id] = {
+                    "source_id": source_id,
+                    "source_path": mapping.source_path,
+                    "field": card.canonical_field,
+                    "mapping_status": mapping.status,
+                }
+    canonical_fields = sorted(set(canonical_fields))
+    if not canonical_fields:
+        return {}
+    return {
+        "canonical_fields": canonical_fields,
+        "physical_field_mapping": physical_field_mapping,
+    }
+
+
 def _progress_identity(evidence: Evidence) -> str:
     payload = evidence.payload or {}
     identity: dict[str, Any] = {
@@ -94,8 +156,6 @@ def _progress_identity(evidence: Evidence) -> str:
         "path",
         "source_id",
         "table",
-        "start_line",
-        "end_line",
         "compute_ref",
         "sql",
     ):
@@ -120,16 +180,7 @@ def _progress_identity(evidence: Evidence) -> str:
     windows = payload.get("windows")
     if isinstance(windows, list):
         identity["window_count"] = len(windows)
-        identity["window_scope"] = [
-            {
-                "start_line": window.get("start_line"),
-                "end_line": window.get("end_line"),
-                "page_start": window.get("page_start"),
-                "page_end": window.get("page_end"),
-            }
-            for window in windows[:8]
-            if isinstance(window, dict)
-        ]
+        identity["window_scope"] = [window for window in windows[:8] if isinstance(window, dict)]
     matches = payload.get("matches")
     if isinstance(matches, list):
         identity["match_count"] = len(matches)
@@ -427,7 +478,8 @@ class CodexEvidenceController:
         self.model = model
         self.tool_model = bind_native_tools(model)
         self.config = config
-        self.registry = EvidenceActionRegistry()
+        self.document_agent = DocumentAgent(model=model)
+        self.registry = EvidenceActionRegistry(document_agent=self.document_agent)
 
     def _emit(
         self,
@@ -481,14 +533,24 @@ class CodexEvidenceController:
         state.knowledge_sections = sections
         state.knowledge_lookup = lookup
         state.matched_sections = match_knowledge_sections(task.question, sections)
+        state.semantic_cards = build_semantic_cards(sections)
+        state.matched_semantic_cards = expand_semantic_card_dependencies(
+            match_semantic_cards(task.question, state.semantic_cards),
+            state.semantic_cards,
+        )
+        state.source_mappings = build_source_mappings(
+            state.semantic_cards,
+            tuple(state.sources.values()),
+        )
         forbidden_terms = ("profile", "physical_schema", "table_schema", "field_schema")
         trace.add(
             action="codex_bootstrap_knowledge",
-            thought="Knowledge remains document-only; it can guide semantics but cannot bind data.",
+            thought="Compile knowledge.md into pure semantic cards; knowledge guides meaning but does not define physical data format.",
             observation={
                 "content_hash": content_hash,
                 "section_count": len(sections),
                 "lookup_count": len(lookup),
+                "semantic_card_count": len(state.semantic_cards),
                 "catalog": [
                     {
                         "id": section.id,
@@ -516,7 +578,42 @@ class CodexEvidenceController:
                     }
                     for section in state.matched_sections[:8]
                 ],
+                "matched_semantic_cards": [
+                    card.to_dict()
+                    for card in state.matched_semantic_cards[:12]
+                ],
                 "schema_contract_ok": all(term not in schema_json for term in forbidden_terms),
+            },
+        )
+        trace.add(
+            action="codex_bootstrap_source_resolution",
+            thought="Compare semantic cards with observed inventory to prepare source candidates; this is separate from knowledge semantics.",
+            observation={
+                "source_mapping_count": len(state.source_mappings),
+                "source_mappings": [
+                    mapping.to_dict()
+                    for mapping in state.source_mappings[:160]
+                ],
+            },
+        )
+
+        document_indexes = self.document_agent.ensure_indexes(state)
+        trace.add(
+            action="codex_bootstrap_document_agent",
+            thought="Pre-index PDF/MD sources as record slices for the isolated DocumentAgent loop.",
+            observation={
+                "document_count": len(document_indexes),
+                "total_slice_count": sum(index.slice_count for index in document_indexes.values()),
+                "documents": [
+                    {
+                        "source_id": index.source_id,
+                        "path": index.path,
+                        "data_form": index.data_form,
+                        "slice_count": index.slice_count,
+                        "page_count": index.page_count,
+                    }
+                    for index in document_indexes.values()
+                ],
             },
         )
 
@@ -650,14 +747,35 @@ class CodexEvidenceController:
         metadata: dict[str, Any] = {}
         if isinstance(arguments.get("answer"), dict):
             metadata["answer"] = arguments["answer"]
+        explicit_contract: dict[str, Any] = {}
+        if isinstance(arguments.get("semantic_contract"), dict):
+            explicit_contract.update(arguments["semantic_contract"])
+        canonical_fields_arg = arguments.get("canonical_fields")
+        if isinstance(canonical_fields_arg, list):
+            explicit_contract["canonical_fields"] = [
+                str(item).casefold()
+                for item in canonical_fields_arg
+                if str(item).strip()
+            ]
+        physical_mapping_arg = arguments.get("physical_field_mapping")
+        if isinstance(physical_mapping_arg, dict):
+            explicit_contract["physical_field_mapping"] = physical_mapping_arg
+        semantic_card_ids_arg = arguments.get("semantic_card_ids")
+        if isinstance(semantic_card_ids_arg, list):
+            explicit_contract["semantic_card_ids"] = [
+                str(item)
+                for item in semantic_card_ids_arg
+                if str(item).strip()
+            ]
         if action.binding_type == "document_record_set":
             for item in evidence_items:
                 records = item.payload.get("records")
                 if isinstance(records, list):
                     metadata["records"] = records
                     metadata["record_count"] = len(records)
-                    metadata["coverage"] = item.payload.get("coverage") or []
+                    metadata["coverage"] = item.payload.get("coverage_summary") or {}
                     metadata["partial_coverage"] = bool(item.payload.get("partial_coverage"))
+                    metadata["include_missing_records"] = bool(item.payload.get("include_missing_records"))
                     if not allowed_columns and records and isinstance(records[0], dict):
                         allowed_columns = tuple(str(column) for column in records[0] if column != "provenance")
                     break
@@ -668,15 +786,23 @@ class CodexEvidenceController:
                     "evidence_ref": item.id,
                     "source_id": item.source_id,
                     "data_form": item.data_form,
-                    "slice_id": item.payload.get("slice_id"),
-                    "slice_index": item.payload.get("slice_index"),
-                    "start_line": item.payload.get("start_line"),
-                    "end_line": item.payload.get("end_line"),
+                    "processed_slice_ids": item.payload.get("processed_slice_ids") or [],
+                    "coverage_summary": item.payload.get("coverage_summary") or {},
                 }
                 for item in evidence_items
             ]
         alignment = str(arguments.get("alignment") or action.reason or "")
         binding_type = action.binding_type or "structured_source"
+        inferred_contract = _infer_semantic_contract(
+            state,
+            binding_type=str(binding_type),
+            source_id=source_id,
+            table=table,
+            allowed_columns=allowed_columns,
+        )
+        semantic_contract = {**inferred_contract, **explicit_contract}
+        if semantic_contract:
+            metadata["semantic_contract"] = semantic_contract
         binding = state.add_binding(
             binding_type=binding_type,
             evidence_refs=action.evidence_refs,
@@ -701,30 +827,22 @@ class CodexEvidenceController:
                 and metadata.get("partial_coverage")
             ):
                 allowed_next_tools = (
-                    "search_document",
-                    "read_document_slice",
-                    "extract_records",
+                    "run_document_agent",
                     "bind",
                     "inspect_relation",
                 )
-                for coverage in metadata.get("coverage") or []:
-                    for match in coverage.get("slice_matches") or []:
-                        if isinstance(match, dict) and isinstance(match.get("recommended_read"), dict):
-                            recommended_items.insert(
-                                0,
-                                {
-                                    "tool_name": "read_document_slice",
-                                    "arguments": match["recommended_read"],
-                                    "reason": "This document record-set was extracted from partial search coverage; read the next matching slice before treating it as complete.",
-                                },
-                            )
-                            break
-                    if recommended_items[0]["tool_name"] == "read_document_slice":
-                        break
+                recommended_items.insert(
+                    0,
+                    {
+                        "tool_name": "run_document_agent",
+                        "arguments": {"question": state.question},
+                        "reason": "This document record-set has partial coverage; rerun DocumentAgent with a tighter DocTask before compute.",
+                    },
+                )
             recommended_next_actions = tuple(recommended_items[:8])
             summary = f"Created verified binding {binding.id} as relation {binding.relation_name}."
         else:
-            allowed_next_tools = ("submit_final", "bind", "search_document", "read_document_slice")
+            allowed_next_tools = ("submit_final", "bind", "run_document_agent")
             recommended_next_actions = (
                 {
                     "tool_name": "submit_final",

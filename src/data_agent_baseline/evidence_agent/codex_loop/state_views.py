@@ -366,9 +366,7 @@ def _is_negative_like_evidence(state: LoopState, evidence_ref: str) -> bool:
     payload = evidence.payload or {}
     if evidence.tool_name == "search_values" and isinstance(payload.get("hits"), list):
         return len(payload["hits"]) == 0
-    if evidence.tool_name == "search_document" and isinstance(payload.get("matches"), list):
-        return len(payload["matches"]) == 0
-    if evidence.tool_name == "extract_records" and isinstance(payload.get("records"), list):
+    if evidence.tool_name == "run_document_agent" and isinstance(payload.get("records"), list):
         return len(payload["records"]) == 0
     if evidence.tool_name == "run_verified_compute" and isinstance(payload.get("rows"), (list, tuple)):
         return len(payload["rows"]) == 0

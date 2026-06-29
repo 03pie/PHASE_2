@@ -40,8 +40,8 @@ SYSTEM_PROMPT = """You are a Codex-style evidence agent for data tasks.
 Use native tool calls only. Do not put tool requests in assistant text.
 
 Allowed flow:
-- observe the real environment through tools such as inspect_source, sample_records, search_values, preview_document, search_document, read_document_slice.
-- call bind only after successful evidence proves a usable source/field/value/record set.
+- observe the real environment through tools such as inspect_source, sample_records, search_values, and run_document_agent.
+- call bind only after successful evidence proves a usable source/field/value/record set; include canonical_fields / physical_field_mapping when binding evidence for knowledge-defined fields.
 - call run_verified_compute only over verified relation names from bindings.
 - after a successful compute, call verify_alignment(decision="candidate_answer", target_kind="compute_result") before relying on it as final.
 - call submit_final with compute_ref only after candidate_answer verification and with an explicit answer.columns projection.
@@ -53,34 +53,37 @@ Allowed flow:
 
 Rules:
 - Do not assume a business domain. Use only the user question, knowledge document text, and observations.
-- knowledge.md is an authority for semantics, not a physical schema.
+- knowledge.md is an authority for semantics, not a physical schema or data format hint.
 - Candidate sources, filenames, document search hits, and semantic similarities are not bindings.
-- PDF/MD/video are not structured tables. Documents require slice evidence and either extracted record-set evidence before compute or direct document/value bindings before direct final.
-- extract_records only executes an explicit spec: either `{"regex": "...", "fields": [...], "dotall": true}` / named capture groups, or `{"records": [...]}` copied from cited document slices. Natural-language extraction rules are not executable evidence.
+- PDF/MD/video are not structured tables. Documents must go through run_document_agent, which returns a compact DocEvidencePackage with validated records and coverage.
+- Use semantic source mapping status as the source priority: exact_structured_source, then document_source, then fallback_candidate. A fallback_candidate is only a discovery hint, even if it is structured.
 - Video is unsupported in v1. It can be inspected for metadata but cannot support final evidence.
-- Every physical field/table/path used for compute must come from observed evidence and verified bindings.
+- Every physical field/table/path used for compute must come from observed evidence and verified bindings, and required knowledge-defined canonical fields must be covered by binding semantic_contract metadata.
 - Verifier decisions and requirement tracking are audit evidence, not physical data. They cannot replace real observations.
 - A requested answer may require multiple verified sources. If different requested fields are observed in different relations, bind each relation and join or align them using observed shared keys instead of requiring one source to contain every field.
 - Use discover_join_paths when multiple verified relations may need joining and the shared key is uncertain.
 - Any transformed value, row reduction, aggregation, ordering, join, or direct extraction must be justified by observed evidence, knowledge text, or a verifier decision.
+- Final answers should contain only requested answer columns. Drop helper join/filter columns unless the user asked for them as answer dimensions.
+- For list/show-data tasks, decide row coverage before compute. Preserve null/empty source rows unless the question asks to filter/rank non-empty values or a metric requires non-null inputs.
 - Do not turn unobserved tokens into physical fields, filters, tables, files, or values.
 """
 
 
 TOOL_GUIDE = {
     "tool_protocol": "Use native tool calls. Text-only answers are not accepted.",
-    "final_protocol": "For compute-backed final answers, first verify_alignment(candidate_answer, target_kind=compute_result), then submit_final(compute_ref=..., answer={columns:[...]}) with explicit final columns. For direct document/value evidence, provide answer plus binding_refs and evidence_refs.",
-    "binding_protocol": "Use bind(...) with evidence_refs before compute.",
+    "final_protocol": "For compute-backed final answers, first verify_alignment(candidate_answer, target_kind=compute_result), then submit_final(compute_ref=..., answer={columns:[...]}) with explicit requested final columns only. For direct document/value evidence, provide answer plus binding_refs and evidence_refs.",
+    "binding_protocol": "Use bind(...) with evidence_refs before compute. For knowledge-defined fields, bind with semantic_card_ids, canonical_fields, and physical_field_mapping, or rely on an exact source mapping that can infer the semantic_contract.",
     "requirement_protocol": "Use track_requirements(...) to declare/update generic required answer conditions when the answer depends on multiple constraints.",
     "verifier_protocol": "Use verify_alignment(...) to mark observed evidence/compute as bindable, candidate_answer, intermediate, not_applicable, needs_more_evidence, conflict, or blocked_ok.",
     "relation_protocol": "Use generated relation_name values such as rel_0001 in SQL.",
     "multi_source_protocol": "Requested fields may be assembled from multiple verified relations when observed shared keys support a join/alignment.",
     "join_discovery_protocol": "Use discover_join_paths over verified relations to observe generic same-column or sample-overlap join candidates before uncertain joins.",
     "evidence_protocol": "Use observed evidence, knowledge text, or verifier decisions to justify transformations, filters, joins, aggregation, ordering, and direct extraction.",
-    "knowledge_protocol": "Start from the knowledge catalog. Use retrieve_knowledge(mode='catalog') to inspect the catalog, mode='token' to resolve mentions to sections, and mode='section' with section_ids to read complete slices before using knowledge semantics.",
+    "knowledge_protocol": "Start from semantic_knowledge cards for canonical meaning, aliases, units, record_grain, join_keys, formulas, and ambiguity rules. Use source_resolution or locate_sources for physical source candidates and data formats. Use retrieve_knowledge(mode='semantic') to refresh cards, and retrieve_knowledge(mode='section') only when raw knowledge wording is needed for audit.",
+    "source_resolution_protocol": "Use source_resolution and locate_sources to choose physical sources. Source priority is exact_structured_source, then document_source, then fallback_candidate; fallback candidates are not directly bindable canonical fields without extra observed semantic/grain proof.",
     "failure_protocol": "When a tool returns negative_scope or a repeated failure, switch tools or call blocked.",
     "blocked_protocol": "When calling blocked, cite evidence_refs that support the absence/conflict/exhaustion claim whenever possible.",
-    "document_protocol": "For PDF/MD use preview_document to see start/end and a slice catalog, search_document only to locate relevant lines/slices, and read_document_slice to read complete evidence text. slice_lines is the model's reading intent: if set for a source, later document tools for that source reuse it unless explicitly changed. Use center_line/context_lines when you need a focused expansion. extract_records must cite read_document_slice evidence and requires executable regex or copied records.",
+    "document_protocol": "For document_source mappings or PDF/MD evidence, call run_document_agent with question, target_fields, semantic_cards, source_candidates, required_record_grain, and coverage_policy. The DocumentAgent owns record-slice search/read/extract/coverage internally and returns only a compact DocEvidencePackage to the main loop.",
     "sql_protocol": "Use inspect_relation after bind and before repairing failed SQL.",
 }
 
@@ -90,6 +93,108 @@ def _preview(text: str, *, limit: int = 120) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _semantic_field_id(card: Any) -> str | None:
+    table = str(getattr(card, "canonical_table", "") or "").strip()
+    field = str(getattr(card, "canonical_field", "") or "").strip()
+    if not table or not field:
+        return None
+    return f"{table}.{field}".casefold()
+
+
+def _compact_mapping(mapping: Any, *, preferred: bool) -> dict[str, Any]:
+    status = str(getattr(mapping, "status", "") or "")
+    priority = "fallback_only"
+    if preferred and status == "exact_structured_source":
+        priority = "preferred_exact_structured"
+    elif preferred and status == "document_source":
+        priority = "document_when_needed"
+    return {
+        "source_id": getattr(mapping, "source_id", None),
+        "source_path": getattr(mapping, "source_path", None),
+        "data_form": getattr(mapping, "data_form", None),
+        "status": status,
+        "matched_table": getattr(mapping, "matched_table", None),
+        "matched_field": getattr(mapping, "matched_field", None),
+        "warnings": list(getattr(mapping, "warnings", ()) or ()),
+        "binding_priority": priority,
+        "recommended_tool": (
+            "run_document_agent"
+            if status == "document_source"
+            else "inspect_source"
+            if status == "exact_structured_source"
+            else "retrieve_knowledge"
+        ),
+    }
+
+
+def _semantic_source_plan(state: LoopState) -> dict[str, Any]:
+    mappings_by_card: dict[str, list[Any]] = {}
+    for mapping in state.source_mappings:
+        mappings_by_card.setdefault(mapping.card_id, []).append(mapping)
+
+    required_fields: list[dict[str, Any]] = []
+    seen_fields: set[str] = set()
+    for card in state.matched_semantic_cards:
+        field_id = _semantic_field_id(card)
+        if not field_id or field_id in seen_fields:
+            continue
+        seen_fields.add(field_id)
+        mappings = mappings_by_card.get(card.id, [])
+        exact_structured = [
+            _compact_mapping(mapping, preferred=True)
+            for mapping in mappings
+            if mapping.status == "exact_structured_source"
+        ]
+        documents = [
+            _compact_mapping(mapping, preferred=True)
+            for mapping in mappings
+            if mapping.status == "document_source"
+        ]
+        fallback = [
+            _compact_mapping(mapping, preferred=False)
+            for mapping in mappings
+            if mapping.status == "fallback_candidate"
+        ]
+        missing = [
+            _compact_mapping(mapping, preferred=False)
+            for mapping in mappings
+            if mapping.status == "unsupported_or_missing"
+        ]
+        if not (exact_structured or documents or fallback or missing):
+            continue
+        required_fields.append(
+            {
+                "card_id": card.id,
+                "canonical_field": field_id,
+                "canonical_table": card.canonical_table,
+                "field": card.canonical_field,
+                "unit": card.unit,
+                "record_grain": card.record_grain,
+                "preferred_mappings": [*exact_structured, *documents],
+                "exact_structured_mappings": exact_structured,
+                "document_mappings": documents,
+                "fallback_candidates": fallback,
+                "missing_mappings": missing,
+                "binding_instruction": (
+                    "Use exact_structured_mappings first, then document_mappings. A fallback_candidate is only "
+                    "a discovery hint, even if structured; do not bind it as this canonical field while a direct "
+                    "exact/document mapping can answer. Use fallback only after direct mappings are proven "
+                    "unusable and observed evidence proves the same semantic field and record grain."
+                ),
+            }
+        )
+
+    return {
+        "instruction": (
+            "Resolve these canonical fields before choosing physical sources. Source priority is "
+            "exact_structured_mappings, then document_mappings, then fallback_candidates. Fallback candidates "
+            "are not direct bindings; similarly named tables or columns need extra semantic/grain proof."
+        ),
+        "required_fields": required_fields[:8],
+        "has_required_fields": bool(required_fields),
+    }
 
 
 def build_context_fragments(
@@ -109,11 +214,89 @@ def build_context_fragments(
         }
         for source in state.sources.values()
     ]
+    document_agent = {
+        "instruction": (
+            "PDF/MD work is isolated behind run_document_agent. The main loop should pass a DocTask "
+            "and consume only the returned DocEvidencePackage; do not request line/window document tools."
+        ),
+        "indexed_document_count": len(state.document_record_indexes),
+        "total_record_slice_count": sum(
+            int(getattr(index, "slice_count", 0))
+            for index in state.document_record_indexes.values()
+        ),
+        "indexes": [
+            {
+                "source_id": getattr(index, "source_id", source_id),
+                "path": getattr(index, "path", ""),
+                "data_form": getattr(index, "data_form", ""),
+                "slice_count": getattr(index, "slice_count", 0),
+                "page_count": getattr(index, "page_count", None),
+            }
+            for source_id, index in state.document_record_indexes.items()
+        ],
+        "latest_packages": state.document_agent_packages[-3:],
+        "latest_coverage": state.document_coverage,
+    }
+    semantic_knowledge = {
+        "instruction": (
+            "Use these semantic cards for meaning only: canonical fields, aliases, units, record grain, "
+            "join keys, formulas, and ambiguity rules. Do not infer physical data format from this fragment."
+        ),
+        "card_count": len(state.semantic_cards),
+        "matched_cards": [
+            {
+                "id": card.id,
+                "kind": card.kind,
+                "name": card.name,
+                "canonical_table": card.canonical_table,
+                "canonical_field": card.canonical_field,
+                "definition_preview": _preview(card.definition, limit=300),
+                "aliases": list(card.aliases[:8]),
+                "unit": card.unit,
+                "record_grain": card.record_grain,
+                "join_keys": list(card.join_keys),
+                "formula": card.formula,
+                "section_id": card.section_id,
+                "heading_path": card.heading_path,
+            }
+            for card in state.matched_semantic_cards[:8]
+        ],
+        "card_catalog": [
+            {
+                "id": card.id,
+                "kind": card.kind,
+                "name": card.name,
+                "canonical_table": card.canonical_table,
+                "canonical_field": card.canonical_field,
+                "unit": card.unit,
+                "record_grain": card.record_grain,
+                "join_keys": list(card.join_keys),
+            }
+            for card in state.semantic_cards[:30]
+        ],
+    }
+    matched_card_ids = {card.id for card in state.matched_semantic_cards}
+    source_resolution = {
+        "instruction": (
+            "Physical source candidates derived by comparing semantic cards with the observed inventory. "
+            "This is source-resolution context, not knowledge. Use it to choose tools and then verify/bind "
+            "real sources through evidence."
+        ),
+        "source_plan": _semantic_source_plan(state),
+        "matched_mappings": [
+            mapping.to_dict()
+            for mapping in state.source_mappings
+            if mapping.card_id in matched_card_ids
+        ][:80],
+        "matched_source_mapping_count": sum(
+            1 for mapping in state.source_mappings if mapping.card_id in matched_card_ids
+        ),
+    }
     knowledge_catalog = {
         "instruction": (
-            "This is a navigable catalog for /context/knowledge.md. The previews are not full "
-            "evidence. Call retrieve_knowledge with mode='section' or mode='token' to read "
-            "complete slices before relying on a knowledge definition."
+            "Raw /context/knowledge.md section catalog for audit only. Prefer semantic_knowledge "
+            "for definitions; use source_resolution or locate_sources for source choices. Call retrieve_knowledge with mode='section' or mode='token' "
+            "when exact wording is needed."
         ),
         "section_count": len(state.knowledge_sections),
         "lookup_count": len(state.knowledge_lookup),
@@ -187,8 +370,11 @@ def build_context_fragments(
         ContextFragment("ctx_question", "question", state.question),
         _json_fragment("tool_guide", TOOL_GUIDE, 4_000),
         _json_fragment("inventory", inventory, 8_000),
-        _json_fragment("knowledge_catalog", knowledge_catalog, 16_000),
-        _json_fragment("matched_knowledge_sections", matched_knowledge, 12_000),
+        _json_fragment("document_agent", document_agent, 6_000),
+        _json_fragment("semantic_knowledge", semantic_knowledge, 12_000),
+        _json_fragment("source_resolution", source_resolution, 12_000),
+        _json_fragment("knowledge_catalog", knowledge_catalog, 8_000),
+        _json_fragment("matched_knowledge_sections", matched_knowledge, 6_000),
         _json_fragment("candidates", candidates, 6_000),
         _json_fragment("latest_evidence", evidence, 12_000),
         _json_fragment("source_coverage", source_coverage, 8_000),

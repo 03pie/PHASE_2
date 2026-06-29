@@ -20,6 +20,10 @@ _RELATION_PATTERN = re.compile(r'\b(?:from|join)\s+("([^"]+)"|[A-Za-z_][\w]*)', 
 _QUOTED_IDENTIFIER_PATTERN = re.compile(r'"([^"]+)"')
 
 
+def _normalize(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
 def _source_exists(state: LoopState, source_ref: str | None) -> bool:
     return bool(source_ref and source_ref in state.sources)
 
@@ -73,6 +77,155 @@ def _compute_has_candidate_answer_verification(state: LoopState, compute_ref: st
     return False
 
 
+def _semantic_field_id(card: Any) -> str | None:
+    table = str(getattr(card, "canonical_table", "") or "").strip()
+    field = str(getattr(card, "canonical_field", "") or "").strip()
+    if not table or not field:
+        return None
+    return f"{table}.{field}".casefold()
+
+
+def _semantic_refs_from_definition(definition: str) -> set[str]:
+    refs = {f"{left}.{right}".casefold() for left, right in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", definition)}
+    alias_to_table: dict[str, str] = {}
+    relation_pattern = re.compile(
+        r"\b(?:from|join)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:as\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?",
+        re.IGNORECASE,
+    )
+    for match in relation_pattern.finditer(definition):
+        table = match.group(1)
+        alias = match.group(2)
+        if alias:
+            alias_to_table[alias.casefold()] = table.casefold()
+    for left, field in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", definition):
+        table = alias_to_table.get(left.casefold())
+        if table:
+            refs.add(f"{table}.{field.casefold()}")
+    return refs
+
+
+def _active_required_semantic_cards(state: LoopState) -> list[Any]:
+    if not state.matched_semantic_cards:
+        return []
+    top_card = state.matched_semantic_cards[0]
+    if getattr(top_card, "canonical_field", None):
+        candidates = [top_card]
+    else:
+        refs = _semantic_refs_from_definition(str(getattr(top_card, "definition", "") or ""))
+        candidates = [
+            card for card in state.semantic_cards
+            if _semantic_field_id(card) in refs and getattr(card, "kind", "") in {"field", "metric"}
+        ]
+    mapped_cards: list[Any] = []
+    for card in candidates:
+        if any(
+            mapping.card_id == card.id
+            and mapping.source_id
+            and mapping.status in {"exact_structured_source", "document_source"}
+            for mapping in state.source_mappings
+        ):
+            mapped_cards.append(card)
+    return mapped_cards
+
+
+def _contract_covers_field(binding: Any, field_id: str) -> bool:
+    metadata = getattr(binding, "metadata", {}) or {}
+    contract = metadata.get("semantic_contract")
+    canonical_fields: list[str] = []
+    if isinstance(contract, dict):
+        raw = contract.get("canonical_fields")
+        if isinstance(raw, list):
+            canonical_fields.extend(str(item).casefold() for item in raw)
+        raw_mapping = contract.get("physical_field_mapping")
+        if isinstance(raw_mapping, dict):
+            canonical_fields.extend(str(key).casefold() for key in raw_mapping)
+    raw = metadata.get("canonical_fields")
+    if isinstance(raw, list):
+        canonical_fields.extend(str(item).casefold() for item in raw)
+    return field_id.casefold() in set(canonical_fields)
+
+
+def _binding_covers_semantic_card(state: LoopState, binding: Any, card: Any) -> bool:
+    field_id = _semantic_field_id(card)
+    if not field_id:
+        return False
+    if _contract_covers_field(binding, field_id):
+        return True
+    field_norm = _normalize(str(getattr(card, "canonical_field", "") or ""))
+    table_norm = _normalize(str(getattr(card, "canonical_table", "") or ""))
+    allowed_columns = {_normalize(column) for column in getattr(binding, "allowed_columns", ())}
+    binding_table = _normalize(str(getattr(binding, "table", "") or ""))
+    for mapping in state.source_mappings:
+        if mapping.card_id != card.id or mapping.source_id != getattr(binding, "source_id", None):
+            continue
+        if mapping.status == "exact_structured_source" and getattr(binding, "binding_type", "") in {"structured_source", "structured_field"}:
+            if field_norm and field_norm not in allowed_columns:
+                continue
+            mapped_table = _normalize(str(mapping.matched_table or ""))
+            if binding_table and mapped_table and binding_table != mapped_table:
+                continue
+            if table_norm and binding_table and table_norm != binding_table:
+                continue
+            return True
+        if mapping.status == "document_source" and getattr(binding, "binding_type", "") == "document_record_set":
+            return not field_norm or field_norm in allowed_columns
+    return False
+
+
+def _missing_semantic_compute_requirements(state: LoopState, binding_refs: tuple[str, ...]) -> list[str]:
+    if not binding_refs:
+        return []
+    bindings = [state.bindings[ref] for ref in binding_refs if ref in state.bindings]
+    missing: list[str] = []
+    for card in _active_required_semantic_cards(state):
+        field_id = _semantic_field_id(card)
+        if not field_id:
+            continue
+        if not any(_binding_covers_semantic_card(state, binding, card) for binding in bindings):
+            missing.append(field_id)
+    return sorted(set(missing))
+
+
+def _semantic_requirement_recommendations(state: LoopState, missing_fields: list[str]) -> tuple[dict[str, object], ...]:
+    recommendations: list[dict[str, object]] = []
+    cards_by_field = {
+        _semantic_field_id(card): card
+        for card in state.semantic_cards
+        if _semantic_field_id(card)
+    }
+    for field_id in missing_fields[:4]:
+        card = cards_by_field.get(field_id)
+        if card is None:
+            continue
+        mappings = [mapping for mapping in state.source_mappings if mapping.card_id == card.id]
+        document_sources = [mapping.source_id for mapping in mappings if mapping.status == "document_source" and mapping.source_id]
+        if document_sources:
+            recommendations.append(
+                {
+                    "tool_name": "run_document_agent",
+                    "arguments": {
+                        "question": state.question,
+                        "target_fields": [str(getattr(card, "canonical_field", "") or "")],
+                        "semantic_cards": [card.to_dict()],
+                        "source_candidates": document_sources[:4],
+                        "required_record_grain": str(getattr(card, "record_grain", "") or ""),
+                    },
+                    "reason": f"Collect verified document records for canonical field {field_id}.",
+                }
+            )
+            continue
+        structured_sources = [mapping.source_id for mapping in mappings if mapping.status == "exact_structured_source" and mapping.source_id]
+        if structured_sources:
+            recommendations.append(
+                {
+                    "tool_name": "inspect_source",
+                    "arguments": {"source_ref": structured_sources[0]},
+                    "reason": f"Observe the mapped source for canonical field {field_id} before compute.",
+                }
+            )
+    return tuple(recommendations[:6])
+
+
 def _compute_final_answer_columns(action: ModelAction) -> list[str]:
     answer = action.answer if isinstance(action.answer, dict) else action.arguments.get("answer")
     if not isinstance(answer, dict):
@@ -102,8 +255,6 @@ def _successful_observation(
     binding_ref: str | None = None,
     relation_name: str | None = None,
     query: str | None = None,
-    start_line: int | None = None,
-    end_line: int | None = None,
 ) -> object | None:
     for evidence in reversed(list(state.evidence.values())):
         if not evidence.ok or evidence.tool_name != tool_name:
@@ -118,10 +269,6 @@ def _successful_observation(
         if relation_name is not None and str(payload.get("relation_name") or "") != relation_name:
             continue
         if query is not None and str(payload.get("query") or "").casefold() != query.casefold():
-            continue
-        if start_line is not None and int(payload.get("line_start") or payload.get("start_line") or -1) != start_line:
-            continue
-        if end_line is not None and int(payload.get("line_end") or payload.get("end_line") or -1) != end_line:
             continue
         return evidence
     return None
@@ -170,18 +317,13 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
         if existing is not None:
             source = state.sources.get(source_id)
             if source is not None and source.data_form in _DOCUMENT_FORMS:
-                preferred = ("preview_document", "search_document", "read_document_slice", "bind")
-                allowed = ("preview_document", "search_document", "read_document_slice", "bind")
+                preferred = ("run_document_agent", "bind")
+                allowed = ("run_document_agent", "bind")
                 fallback = (
                     {
-                        "tool_name": "preview_document",
-                        "arguments": {"source_ref": source_id},
-                        "reason": "The source form is already observed; preview the document before reading slices.",
-                    },
-                    {
-                        "tool_name": "search_document",
-                        "arguments": {"source_ref": source_id, "query": state.question},
-                        "reason": "Search document text to locate relevant slices after observing the document source.",
+                        "tool_name": "run_document_agent",
+                        "arguments": {"question": state.question, "source_candidates": [source_id]},
+                        "reason": "The source form is already observed; delegate document evidence work to DocumentAgent.",
                     },
                 )
             else:
@@ -223,86 +365,6 @@ def _guard_repeated_observation(state: LoopState, action: ModelAction) -> GuardD
                     },
                 ),
             )
-
-    if tool_name == "preview_document" and source_id:
-        existing = _successful_observation(
-            state,
-            tool_name="preview_document",
-            source_id=source_id,
-        )
-        if existing is not None:
-            return _noop_observation_guard(
-                state,
-                reason="This document preview has already been observed successfully; repeat previewing would not add evidence.",
-                allowed_next_tools=("search_document", "read_document_slice", "extract_records", "bind"),
-                preferred_tools=("search_document", "read_document_slice", "extract_records", "bind"),
-                fallback_actions=(
-                    {
-                        "tool_name": "search_document",
-                        "arguments": {"source_ref": source_id, "query": state.question},
-                        "reason": "Search document text to locate relevant slices after previewing the document.",
-                    },
-                ),
-            )
-
-    if tool_name == "search_document" and source_id:
-        query = str(action.arguments.get("query") or state.question or "").strip()
-        existing = _successful_observation(
-            state,
-            tool_name="search_document",
-            source_id=source_id,
-            query=query,
-        )
-        if existing is not None:
-            payload = existing.payload or {}
-            read_recommendation = None
-            for match in payload.get("slice_matches") or []:
-                if isinstance(match, dict) and isinstance(match.get("recommended_read"), dict):
-                    read_recommendation = {
-                        "tool_name": "read_document_slice",
-                        "arguments": match["recommended_read"],
-                        "reason": "Read the slice located by the existing search result.",
-                    }
-                    break
-            return _noop_observation_guard(
-                state,
-                reason="This document query has already returned locator evidence; repeat search would not add evidence.",
-                allowed_next_tools=("read_document_slice", "extract_records", "bind", "search_document"),
-                preferred_tools=("read_document_slice", "extract_records", "bind", "search_document"),
-                fallback_actions=(read_recommendation,) if read_recommendation else (),
-            )
-
-    if tool_name == "read_document_slice" and source_id:
-        start = action.arguments.get("start_line")
-        end = action.arguments.get("end_line")
-        try:
-            start_int = int(start) if start is not None else None
-            end_int = int(end) if end is not None else None
-        except (TypeError, ValueError):
-            start_int = None
-            end_int = None
-        if start_int is not None and end_int is not None:
-            existing = _successful_observation(
-                state,
-                tool_name="read_document_slice",
-                source_id=source_id,
-                start_line=start_int,
-                end_line=end_int,
-            )
-            if existing is not None:
-                return _noop_observation_guard(
-                    state,
-                    reason="This exact document slice has already been read successfully; repeat reading would not add evidence.",
-                    allowed_next_tools=("extract_records", "bind", "search_document", "read_document_slice"),
-                    preferred_tools=("extract_records", "bind", "search_document", "read_document_slice"),
-                    fallback_actions=(
-                        {
-                            "tool_name": "bind",
-                            "arguments": {"binding_type": "document_window", "evidence_refs": [existing.id]},
-                            "reason": "Bind the existing document slice if it directly supports the answer.",
-                        },
-                    ),
-                )
 
     if tool_name == "inspect_relation":
         binding_ref = str(action.arguments.get("binding_ref") or "").strip()
@@ -437,10 +499,7 @@ def guard_action(
                 "inspect_source",
                 "sample_records",
                 "search_values",
-                "preview_document",
-                "search_document",
-                "read_document_slice",
-                "extract_records",
+                "run_document_agent",
                 "inspect_relation",
                 "discover_join_paths",
                 "run_verified_compute",
@@ -473,42 +532,25 @@ def guard_action(
             source_id = str(source_ref or state.source_by_path.get(str(path)) or "")
             source = state.sources.get(source_id)
             if source is not None and source.data_form in _DOCUMENT_FORMS | {"video"}:
+                allowed = ("inspect_video", "blocked") if source.data_form == "video" else ("run_document_agent", "blocked")
+                recommended = (
+                    {
+                        "tool_name": "inspect_video",
+                        "arguments": {"source_ref": source.id},
+                        "reason": "Inspect unsupported video metadata instead of treating it as a table.",
+                    },
+                ) if source.data_form == "video" else (
+                    {
+                        "tool_name": "run_document_agent",
+                        "arguments": {"question": state.question, "source_candidates": [source.id]},
+                        "reason": "Delegate PDF/MD search, record reading, extraction, and coverage to DocumentAgent.",
+                    },
+                )
                 return GuardDecision(
                     False,
                     f"{source.data_form} cannot be inspected as a structured table; use a document/video tool.",
-                    allowed_next_tools=(
-                        "preview_document",
-                        "search_document",
-                        "read_document_slice",
-                        "inspect_video",
-                        "blocked",
-                    ),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "preview_document",
-                            "arguments": {"source_ref": source.id},
-                            "reason": "Preview the document start/end and slice catalog before reading document evidence.",
-                        },
-                        {
-                            "tool_name": "search_document",
-                            "arguments": {"source_ref": source.id, "query": state.question},
-                            "reason": "Search document text to locate relevant slices instead of treating the document as a table.",
-                        },
-                    ),
-                )
-        if action.tool_name == "read_document_slice":
-            source_id = str(source_ref or state.source_by_path.get(str(path)) or "")
-            source = state.sources.get(source_id)
-            if source is not None and source.data_form not in _DOCUMENT_FORMS:
-                return GuardDecision(False, f"{source.data_form} is not a PDF/MD document source.")
-        if action.tool_name in {"preview_document", "search_document"}:
-            source_id = str(source_ref or state.source_by_path.get(str(path)) or "")
-            source = state.sources.get(source_id)
-            if source is not None and source.data_form not in _DOCUMENT_FORMS:
-                return GuardDecision(
-                    False,
-                    f"{source.data_form} is not a PDF/MD document source.",
-                    allowed_next_tools=("inspect_source", "sample_records", "search_values"),
+                    allowed_next_tools=allowed,
+                    recommended_next_actions=recommended,
                 )
         if action.tool_name == "inspect_relation":
             relation_name = str(action.arguments.get("relation_name") or "").strip()
@@ -541,9 +583,7 @@ def guard_action(
                     "inspect_source",
                     "sample_records",
                     "search_values",
-                    "read_document_slice",
-                    "search_document",
-                    "extract_records",
+                    "run_document_agent",
                 ),
             )
         if action.binding_type in {"structured_source", "structured_field"}:
@@ -586,19 +626,12 @@ def guard_action(
             if not has_records:
                 return GuardDecision(False, "Document record-set binding requires extracted record evidence.")
         if action.binding_type == "document_window":
-            has_window_text = any(
-                item.data_form in _DOCUMENT_FORMS
-                and (
-                    isinstance(item.payload.get("text"), str)
-                    and item.tool_name == "read_document_slice"
-                )
-                for item in evidence_items
-            )
-            if not has_window_text:
+            has_document_package = any(item.tool_name == "run_document_agent" for item in evidence_items)
+            if not has_document_package:
                 return GuardDecision(
                     False,
-                    "Document-window binding requires successful read_document_slice evidence.",
-                    allowed_next_tools=("preview_document", "search_document", "read_document_slice"),
+                    "Document-window binding requires successful DocumentAgent evidence.",
+                    allowed_next_tools=("run_document_agent",),
                 )
         if any(item.data_form == "video" for item in evidence_items):
             return GuardDecision(False, "V1 video evidence cannot become a final binding.")
@@ -669,17 +702,21 @@ def guard_action(
         if partial_document_sets:
             return GuardDecision(
                 False,
-                "Compute cannot use partial document record-set bindings; read remaining document slices or extract a complete record set first: "
+                "Compute cannot use partial document record-set bindings; rerun DocumentAgent for a complete record set first: "
                 + ", ".join(partial_document_sets),
-                allowed_next_tools=("search_document", "read_document_slice", "extract_records", "bind", "blocked"),
+                allowed_next_tools=("run_document_agent", "bind", "blocked"),
                 recommended_next_actions=(
                     {
-                        "tool_name": "search_document",
-                        "arguments": {"query": state.question},
-                        "reason": "Search/read additional document slices before recomputing from document records.",
+                        "tool_name": "run_document_agent",
+                        "arguments": {"question": state.question},
+                        "reason": "Let DocumentAgent search/read/extract additional record slices before recomputing.",
                     },
                 ),
             )
+        # Canonical semantic source selection is surfaced before the model chooses
+        # sources (source_resolution.source_plan and locate_sources). The compute
+        # guard stays focused on executable safety instead of acting as a strict
+        # post-hoc semantic interceptor.
         preflight = _check_sql_preflight(state, action)
         if preflight is not None:
             return preflight
@@ -794,3 +831,4 @@ def guard_action(
         return GuardDecision(True, "Direct final allowed from verified binding and evidence lineage.")
 
     return GuardDecision(False, "Unhandled action.")
+

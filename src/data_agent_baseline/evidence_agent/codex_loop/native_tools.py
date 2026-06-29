@@ -32,25 +32,22 @@ _LIST_FIELDS = {
     "knowledge_section_ids",
     "section_ids",
     "tokens",
+    "card_ids",
+    "semantic_card_ids",
+    "canonical_fields",
     "evidence_refs",
     "binding_refs",
     "compute_refs",
     "source_refs",
+    "source_candidates",
+    "target_fields",
+    "slice_ids",
     "allowed_columns",
 }
 _INT_FIELDS = {
     "limit",
-    "start_line",
-    "end_line",
-    "window_lines",
     "sample_limit",
     "max_pairs",
-    "preview_lines",
-    "slice_lines",
-    "slice_index",
-    "center_line",
-    "context_lines",
-    "line",
 }
 _BINDING_TYPE_ALIASES = {
     "source": "structured_source",
@@ -166,18 +163,20 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
         "function": {
             "name": "retrieve_knowledge",
             "description": (
-                "Navigate knowledge.md without treating it as physical schema. Use mode='catalog' "
-                "to list all sections/tokens, mode='token' to resolve mentions to complete sections, "
-                "mode='section' to read complete section slices, or mode='search' for lexical candidates."
+                "Navigate knowledge.md without treating it as physical schema. Use mode='semantic' "
+                "for semantic cards/source mappings, mode='catalog' to list sections/tokens, "
+                "mode='token' to resolve mentions to complete sections, mode='section' to read "
+                "complete section slices, or mode='search' for lexical candidates."
             ),
             "parameters": _object_schema(
                 {
                     "mode": {
                         "type": "string",
-                        "enum": ["catalog", "search", "token", "section"],
+                        "enum": ["semantic", "catalog", "search", "token", "section"],
                     },
                     "query": {"type": "string"},
                     "section_ids": {"type": "array", "items": {"type": "string"}},
+                    "card_ids": {"type": "array", "items": {"type": "string"}},
                     "tokens": {"type": "array", "items": {"type": "string"}},
                     "include_neighbors": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 80},
@@ -247,82 +246,23 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "preview_document",
+            "name": "run_document_agent",
             "description": (
-                "Preview an observed PDF/MD source before reading it: document start, document end, "
-                "line/page counts, headings, and a deterministic slice catalog. This does not extract records."
+                "Delegate PDF/MD work to the bounded DocumentAgent sub-loop. It inspects "
+                "record indexes, searches/reads record slices, performs local semantic extraction, "
+                "checks coverage, and returns a compact DocEvidencePackage. It cannot compute or final-answer."
             ),
             "parameters": _object_schema(
                 {
-                    "source_ref": {"type": "string"},
-                    "path": {"type": "string"},
-                    "preview_lines": {"type": "integer", "minimum": 5, "maximum": 40},
-                    "slice_lines": {"type": "integer", "minimum": 20, "maximum": 200},
+                    "question": {"type": "string"},
+                    "target_fields": {"type": "array", "items": {"type": "string"}},
+                    "semantic_cards": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                    "source_candidates": {"type": "array", "items": {"type": "string"}},
+                    "required_record_grain": {"type": "string"},
+                    "coverage_policy": {"type": "object", "additionalProperties": True},
+                    "records": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                    "slice_decisions": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
                 }
-            ),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_document",
-            "description": (
-                "Locate query text in an observed PDF/MD source. Returns matching lines, slice-level "
-                "hit counts, and recommended read_document_slice arguments. This does not return "
-                "complete evidence text and does not extract records."
-            ),
-            "parameters": _object_schema(
-                {
-                    "source_ref": {"type": "string"},
-                    "path": {"type": "string"},
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 80},
-                    "slice_lines": {"type": "integer", "minimum": 20, "maximum": 200},
-                },
-                required=["query"],
-            ),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_document_slice",
-            "description": (
-                "Read one complete navigable slice from an observed PDF/MD source. Use slice_id/"
-                "slice_index from preview_document or search_document, or use start_line/end_line/"
-                "center_line to read or expand context."
-            ),
-            "parameters": _object_schema(
-                {
-                    "source_ref": {"type": "string"},
-                    "path": {"type": "string"},
-                    "slice_id": {"type": "string"},
-                    "slice_index": {"type": "integer", "minimum": 1},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1},
-                    "center_line": {"type": "integer", "minimum": 1},
-                    "context_lines": {"type": "integer", "minimum": 20, "maximum": 200},
-                    "slice_lines": {"type": "integer", "minimum": 20, "maximum": 200},
-                }
-            ),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "extract_records",
-            "description": (
-                "Execute a model-provided extraction spec over cited read_document_slice evidence. "
-                "The spec must be executable: provide a Python regex with named groups or "
-                "fields/dotall, or provide records copied exactly from cited evidence. "
-                "Natural-language rules alone are not executed."
-            ),
-            "parameters": _object_schema(
-                {
-                    "evidence_refs": {"type": "array", "items": {"type": "string"}},
-                    "spec": {"type": "object", "additionalProperties": True},
-                },
-                required=["evidence_refs", "spec"],
             ),
         },
     },
@@ -483,6 +423,10 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
                     "table": {"type": "string"},
                     "field": {"type": "string"},
                     "allowed_columns": {"type": "array", "items": {"type": "string"}},
+                    "semantic_card_ids": {"type": "array", "items": {"type": "string"}},
+                    "canonical_fields": {"type": "array", "items": {"type": "string"}},
+                    "physical_field_mapping": {"type": "object", "additionalProperties": True},
+                    "semantic_contract": {"type": "object", "additionalProperties": True},
                     "alignment": {"type": "string"},
                     "answer": {"type": "object", "additionalProperties": True},
                 },

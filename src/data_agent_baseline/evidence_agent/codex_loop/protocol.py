@@ -70,6 +70,44 @@ class KnowledgeLookupEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeSemanticCard:
+    id: str
+    kind: str
+    canonical_table: str
+    canonical_field: str | None
+    name: str
+    definition: str
+    aliases: tuple[str, ...] = ()
+    unit: str | None = None
+    record_grain: str | None = None
+    join_keys: tuple[str, ...] = ()
+    formula: str | None = None
+    section_id: str | None = None
+    heading_path: str = ""
+    line_start: int | None = None
+    line_end: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeSourceMapping:
+    card_id: str
+    source_id: str | None
+    source_path: str | None
+    data_form: DataForm | str | None
+    status: str
+    matched_table: str | None = None
+    matched_field: str | None = None
+    match_reason: str = ""
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class SourceRef:
     id: str
     path: Path
@@ -343,12 +381,17 @@ class LoopState:
     knowledge_sections: list[KnowledgeSection] = dataclass_field(default_factory=list)
     knowledge_lookup: dict[str, KnowledgeLookupEntry] = dataclass_field(default_factory=dict)
     matched_sections: list[KnowledgeSection] = dataclass_field(default_factory=list)
+    semantic_cards: list[KnowledgeSemanticCard] = dataclass_field(default_factory=list)
+    matched_semantic_cards: list[KnowledgeSemanticCard] = dataclass_field(default_factory=list)
+    source_mappings: list[KnowledgeSourceMapping] = dataclass_field(default_factory=list)
     candidates: dict[str, CandidateRef] = dataclass_field(default_factory=dict)
     evidence: dict[str, Evidence] = dataclass_field(default_factory=dict)
     bindings: dict[str, Binding] = dataclass_field(default_factory=dict)
     requirements: dict[str, Requirement] = dataclass_field(default_factory=dict)
     compute_results: dict[str, ComputeResult] = dataclass_field(default_factory=dict)
-    document_slice_lines: dict[str, int] = dataclass_field(default_factory=dict)
+    document_record_indexes: dict[str, Any] = dataclass_field(default_factory=dict)
+    document_coverage: dict[str, Any] = dataclass_field(default_factory=dict)
+    document_agent_packages: list[dict[str, Any]] = dataclass_field(default_factory=list)
     guard_feedback: list[dict[str, Any]] = dataclass_field(default_factory=list)
     negative_scopes: list[dict[str, Any]] = dataclass_field(default_factory=list)
     _negative_scope_keys: set[str] = dataclass_field(default_factory=set)
