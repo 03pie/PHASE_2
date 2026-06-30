@@ -13,7 +13,7 @@ from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     KnowledgeSourceMapping,
     SourceRef,
 )
-from data_agent_baseline.evidence_agent.text import code_mentions, normalize_key
+from data_agent_baseline.evidence_agent.text import code_mentions, normalize_key, sql_blocks
 from data_agent_baseline.prompts.loader import build_knowledge_bundle
 
 
@@ -52,6 +52,48 @@ def _lookup_key(token: str) -> str:
 _CODE_SPAN_RE = re.compile(r"`([^`\n]{1,160})`")
 _TABLE_ROW_RE = re.compile(r"^\s*\|\s*`?([^`|\n]+?)`?\s*\|\s*(.+?)\s*\|\s*$")
 _FORMULA_RE = re.compile(r"`?([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)`?")
+_SQL_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_SQL_RELATION_RE = re.compile(
+    r"\b(?:from|join)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:as\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?",
+    re.IGNORECASE,
+)
+_SQL_KEYWORDS = {
+    "and",
+    "as",
+    "asc",
+    "between",
+    "by",
+    "case",
+    "cast",
+    "count",
+    "desc",
+    "distinct",
+    "else",
+    "end",
+    "from",
+    "group",
+    "having",
+    "in",
+    "is",
+    "join",
+    "left",
+    "limit",
+    "max",
+    "min",
+    "not",
+    "null",
+    "on",
+    "or",
+    "order",
+    "right",
+    "select",
+    "strftime",
+    "sum",
+    "then",
+    "time_to_str",
+    "where",
+    "when",
+}
 
 
 def _clean_table_cell(value: str) -> str:
@@ -72,6 +114,7 @@ def _is_markdown_separator(cells: list[str]) -> bool:
 def _table_header_map(cells: list[str]) -> dict[str, int]:
     table_names = {"table", "tablename", "relation", "source", "表名", "数据表"}
     field_names = {"field", "fields", "column", "columns", "columnname", "字段", "列名", "字段名"}
+    unit_names = {"unit", "units", "measurementunit", "单位", "计量单位"}
     definition_names = {
         "definition",
         "meaning",
@@ -89,6 +132,8 @@ def _table_header_map(cells: list[str]) -> dict[str, int]:
             mapping["table"] = index
         elif key in field_names and "field" not in mapping:
             mapping["field"] = index
+        elif key in unit_names and "unit" not in mapping:
+            mapping["unit"] = index
         elif key in definition_names and "definition" not in mapping:
             mapping["definition"] = index
     return mapping
@@ -127,32 +172,36 @@ def _first_code_identifier(text: str, *, allow_dotted: bool = False) -> str | No
     return None
 
 
+def _clean_unit_text(value: str) -> str:
+    text = value.strip().strip("` ").strip()
+    if text.endswith((")", "）")) and "(" not in text[:-1] and "（" not in text[:-1]:
+        text = text[:-1].rstrip()
+    return text.strip(" \t`，,;；。")
+
+
 def _unit_from_text(text: str) -> str | None:
     unit_match = re.search(r"unit\s*:\s*([^\n;。]+)", text, flags=re.IGNORECASE)
     if unit_match:
-        return unit_match.group(1).strip()
+        return _clean_unit_text(unit_match.group(1))
     cn_match = re.search(r"单位\s*[:：]\s*([^\n;。]+)", text)
     if cn_match:
-        return cn_match.group(1).strip()
+        return _clean_unit_text(cn_match.group(1))
     if "亿元" in text:
         return "亿元"
     if re.search(r"percentage|百分比|%", text, flags=re.IGNORECASE):
         return "percentage"
-    if re.search(r"\bdays?\b|天数|天", text, flags=re.IGNORECASE):
-        return "days"
-    if re.search(r"\byears?\b|年限|年", text, flags=re.IGNORECASE):
-        return "years"
     return None
 
 
 def _record_grain(table: str, field: str | None, definition: str) -> str:
-    haystack = f"{table} {field or ''} {definition}".casefold()
-    if "personalcode" in haystack or "fund manager" in haystack or "基金经理" in haystack:
-        return "fund_manager"
-    if "innercode" in haystack or "fund " in haystack or "基金" in haystack:
-        return "fund"
-    if "company" in haystack or "fundcompany" in haystack or "公司" in haystack:
-        return "fund_company"
+    del field
+    explicit = re.search(
+        r"(?:record[_ -]?grain|grain|粒度)\s*[:：]\s*([^\n;。]+)",
+        definition,
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        return explicit.group(1).strip()
     return table or "record"
 
 
@@ -171,9 +220,6 @@ def _aliases(name: str, definition: str, extra: tuple[str, ...] = ()) -> tuple[s
     aliases = [name]
     aliases.extend(extra)
     aliases.extend(_CODE_SPAN_RE.findall(definition))
-    for term in semantic_terms(definition):
-        if len(term) >= 3:
-            aliases.append(term)
     return _unique(aliases[:24])
 
 
@@ -215,18 +261,19 @@ def build_semantic_cards(sections: list[KnowledgeSection]) -> list[KnowledgeSema
         section: KnowledgeSection,
         formula: str | None = None,
         aliases: tuple[str, ...] = (),
+        unit: str | None = None,
     ) -> None:
         card_id = f"sem_{len(cards) + 1:04d}"
         cards.append(
             KnowledgeSemanticCard(
                 id=card_id,
                 kind=kind,
-                canonical_table=table,
-                canonical_field=field,
+                semantic_scope=table,
+                semantic_slot=field,
                 name=name,
                 definition=definition.strip(),
                 aliases=_aliases(name, definition, aliases),
-                unit=_unit_from_text(definition),
+                unit=unit or _unit_from_text(definition),
                 record_grain=_record_grain(table, field, definition),
                 join_keys=_join_keys(definition),
                 formula=formula,
@@ -250,7 +297,8 @@ def build_semantic_cards(sections: list[KnowledgeSection]) -> list[KnowledgeSema
                 aliases=section.mentions,
             )
 
-        table = _first_code_identifier(section.heading_path) or _first_code_identifier(section.text)
+        heading_table = _first_code_identifier(section.heading_path)
+        table = heading_table or _first_code_identifier(section.text)
         if not table:
             formula_match = _FORMULA_RE.search(section.text)
             if formula_match:
@@ -280,10 +328,16 @@ def build_semantic_cards(sections: list[KnowledgeSection]) -> list[KnowledgeSema
             if field_index >= len(cells):
                 continue
 
-            row_table = table
             table_index = header_map.get("table")
             if table_index is not None and table_index < len(cells):
-                row_table = _identifier_cell(cells[table_index]) or row_table
+                row_table = _identifier_cell(cells[table_index]) or table
+            elif heading_table:
+                row_table = heading_table
+            else:
+                # Two-column "field / meaning" tables outside a concrete table
+                # section are usually ambiguity notes or examples. Treat them as
+                # prose rules, not new canonical physical fields.
+                continue
             field = _identifier_cell(cells[field_index])
             if not field:
                 continue
@@ -291,6 +345,14 @@ def build_semantic_cards(sections: list[KnowledgeSection]) -> list[KnowledgeSema
                 definition = cells[definition_index]
             else:
                 definition = " | ".join(cell for index, cell in enumerate(cells) if index != field_index)
+            unit_index = header_map.get("unit")
+            unit = (
+                _clean_unit_text(_clean_table_cell(cells[unit_index]))
+                if unit_index is not None
+                and unit_index < len(cells)
+                and _clean_table_cell(cells[unit_index])
+                else None
+            )
             add_card(
                 kind="field",
                 table=row_table,
@@ -298,6 +360,7 @@ def build_semantic_cards(sections: list[KnowledgeSection]) -> list[KnowledgeSema
                 name=f"{row_table}.{field}",
                 definition=definition,
                 section=section,
+                unit=unit,
             )
 
         formula_match = _FORMULA_RE.search(section.text)
@@ -317,24 +380,24 @@ def build_semantic_cards(sections: list[KnowledgeSection]) -> list[KnowledgeSema
     return cards
 
 
-def _canonical_field_name(card: KnowledgeSemanticCard) -> str | None:
-    if not card.canonical_field:
+def _semantic_slot_id(card: KnowledgeSemanticCard) -> str | None:
+    if not card.semantic_slot:
         return None
-    return f"{card.canonical_table}.{card.canonical_field}".casefold()
+    return f"{card.semantic_scope}.{card.semantic_slot}".casefold()
 
 
 def _definition_field_refs(definition: str) -> set[str]:
+    return semantic_field_refs_from_text(definition)
+
+
+def semantic_field_refs_from_text(definition: str) -> set[str]:
     refs = {f"{match.group(1)}.{match.group(2)}".casefold() for match in _FORMULA_RE.finditer(definition)}
     alias_to_table: dict[str, str] = {}
-    relation_re = re.compile(
-        r"\b(?:from|join)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:as\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?",
-        re.IGNORECASE,
-    )
-    for match in relation_re.finditer(definition):
-        table = match.group(1)
-        alias = match.group(2)
-        if alias:
-            alias_to_table[alias.casefold()] = table.casefold()
+    for match in _SQL_RELATION_RE.finditer(definition):
+        table = match.group(1).casefold()
+        alias = (match.group(2) or "").casefold()
+        if alias and alias not in _SQL_KEYWORDS:
+            alias_to_table[alias] = table
     alias_field_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
     for match in alias_field_re.finditer(definition):
         left = match.group(1).casefold()
@@ -342,6 +405,25 @@ def _definition_field_refs(definition: str) -> set[str]:
         table = alias_to_table.get(left)
         if table:
             refs.add(f"{table}.{field}")
+    for block in sql_blocks(definition):
+        relations = []
+        for match in _SQL_RELATION_RE.finditer(block):
+            table = match.group(1).casefold()
+            alias = (match.group(2) or "").casefold()
+            if table:
+                relations.append(table)
+            if alias and alias not in _SQL_KEYWORDS:
+                alias_to_table[alias] = table
+        unique_relations = sorted(set(relations))
+        if len(unique_relations) != 1:
+            continue
+        table = unique_relations[0]
+        scrubbed = re.sub(r"'[^']*'|\"[^\"]*\"", " ", block)
+        for token in _SQL_IDENTIFIER_RE.findall(scrubbed):
+            lowered = token.casefold()
+            if lowered in _SQL_KEYWORDS or lowered == table or lowered in alias_to_table:
+                continue
+            refs.add(f"{table}.{lowered}")
     return refs
 
 
@@ -368,18 +450,18 @@ def expand_semantic_card_dependencies(
         seen.add(card.id)
         output.append(card)
 
-    canonical_to_cards: dict[str, list[KnowledgeSemanticCard]] = {}
+    semantic_slot_to_cards: dict[str, list[KnowledgeSemanticCard]] = {}
     for card in all_cards:
-        canonical = _canonical_field_name(card)
-        if canonical:
-            canonical_to_cards.setdefault(canonical, []).append(card)
+        slot_id = _semantic_slot_id(card)
+        if slot_id:
+            semantic_slot_to_cards.setdefault(slot_id, []).append(card)
 
     for card in selected_cards:
         add(card)
         if card.kind not in {"relationship_rule", "metric_rule", "section_rule", "definition_section"}:
             continue
         for ref in sorted(_definition_field_refs(card.definition)):
-            for dependency in canonical_to_cards.get(ref, []):
+            for dependency in semantic_slot_to_cards.get(ref, []):
                 add(dependency)
     return output
 
@@ -398,8 +480,8 @@ def match_semantic_cards(
                 " ".join(
                     [
                         card.name,
-                        card.canonical_table,
-                        card.canonical_field or "",
+                        card.semantic_scope,
+                        card.semantic_slot or "",
                         card.definition,
                         *card.aliases,
                     ]
@@ -414,11 +496,95 @@ def match_semantic_cards(
     return [card for _score, _id, card in matched[:limit]]
 
 
-def build_source_mappings(
+def _card_candidate_terms(card: KnowledgeSemanticCard) -> set[str]:
+    values = [
+        card.name,
+        card.semantic_scope,
+        card.semantic_slot or "",
+        card.definition,
+        card.formula or "",
+        card.unit or "",
+        card.record_grain or "",
+        *card.aliases,
+    ]
+    return {
+        term
+        for value in values
+        for term in semantic_terms(value)
+        if term and len(term) > 1
+    }
+
+
+def _field_semantic_overlap(column: str, card_terms: set[str]) -> tuple[str, ...]:
+    del column, card_terms
+    return ()
+
+
+def _structured_field_hits(
+    source: SourceRef,
+    field_norm: str,
+    *,
+    card_terms: set[str] | None = None,
+) -> list[tuple[str | None, str, str]]:
+    if not field_norm and not card_terms:
+        return []
+    hits: list[tuple[str | None, str, str]] = []
+    seen: set[tuple[str | None, str]] = set()
+
+    def add_hit(table: str | None, column: str, reason: str) -> None:
+        key = (table, column)
+        if key in seen:
+            return
+        seen.add(key)
+        hits.append((table, column, reason))
+
+    def inspect_column(table: str | None, column: str) -> None:
+        column_text = str(column)
+        if field_norm and normalize_key(column_text) == field_norm:
+            add_hit(table, column_text, "exact_slot_label")
+
+    if source.data_form == "sqlite_database":
+        columns_by_table = source.metadata.get("columns_by_table")
+        if not isinstance(columns_by_table, dict):
+            return []
+        for table, raw_columns in columns_by_table.items():
+            if not isinstance(raw_columns, list):
+                continue
+            for column in raw_columns:
+                inspect_column(str(table), str(column))
+        return hits
+    for column in source.columns:
+        inspect_column(None, str(column))
+    return hits
+
+
+def _source_table_match(source: SourceRef, semantic_scope_norm: str) -> str | None:
+    if not semantic_scope_norm:
+        return None
+    for table in source.tables:
+        table_norm = normalize_key(table)
+        if table_norm and (semantic_scope_norm == table_norm or semantic_scope_norm in table_norm):
+            return table
+    source_names = {
+        normalize_key(source.stem),
+        normalize_key(source.basename),
+        normalize_key(source.virtual_path),
+    }
+    if any(semantic_scope_norm == name or semantic_scope_norm in name for name in source_names if name):
+        return source.stem
+    return None
+
+
+def build_grounding_candidates(
     cards: list[KnowledgeSemanticCard],
     sources: list[SourceRef] | tuple[SourceRef, ...],
 ) -> list[KnowledgeSourceMapping]:
     mappings: list[KnowledgeSourceMapping] = []
+    terms_by_semantic_slot: dict[str, set[str]] = {}
+    for card in cards:
+        slot_id = _semantic_slot_id(card)
+        if slot_id:
+            terms_by_semantic_slot.setdefault(slot_id, set()).update(_card_candidate_terms(card))
     for card in cards:
         if card.kind in {
             "business_context",
@@ -426,7 +592,7 @@ def build_source_mappings(
             "relationship_rule",
             "metric_rule",
             "section_rule",
-        } and not card.canonical_field:
+        } and not card.semantic_slot:
             mappings.append(
                 KnowledgeSourceMapping(
                     card_id=card.id,
@@ -434,57 +600,92 @@ def build_source_mappings(
                     source_path=None,
                     data_form=None,
                     status="semantic_only",
-                    matched_table=card.canonical_table,
-                    matched_field=None,
+                    semantic_scope=card.semantic_scope,
+                    semantic_slot=None,
                     match_reason="section-level knowledge rule; no physical source required",
                 )
             )
             continue
-        table_norm = normalize_key(card.canonical_table)
-        field_norm = normalize_key(card.canonical_field or "")
+        scope_norm = normalize_key(card.semantic_scope)
+        slot_norm = normalize_key(card.semantic_slot or "")
+        card_terms = set(_card_candidate_terms(card))
+        slot_id = _semantic_slot_id(card)
+        if slot_id:
+            card_terms.update(terms_by_semantic_slot.get(slot_id, set()))
         found = False
         for source in sources:
-            source_names = {
-                normalize_key(source.stem),
-                normalize_key(source.basename),
-                normalize_key(source.virtual_path),
-                *(normalize_key(table) for table in source.tables),
-            }
-            column_names = {normalize_key(column) for column in source.columns}
-            table_match = bool(
-                table_norm
-                and any(table_norm == name or table_norm in name for name in source_names if name)
-            )
-            field_match = bool(field_norm and field_norm in column_names)
+            matched_source_table = _source_table_match(source, scope_norm)
+            table_match = bool(matched_source_table)
+            field_hits = _structured_field_hits(source, slot_norm, card_terms=card_terms)
+            same_scope_hits = [
+                (table, column, match_kind)
+                for table, column, match_kind in field_hits
+                if not matched_source_table
+                or not table
+                or normalize_key(table) == normalize_key(matched_source_table)
+            ]
             if source.data_form in {"sqlite_database", "csv_records", "json_records"}:
-                if table_match and (field_match or not source.columns):
+                if table_match and same_scope_hits:
+                    for physical_table, physical_field, match_kind in same_scope_hits:
+                        mappings.append(
+                            KnowledgeSourceMapping(
+                                card_id=card.id,
+                                source_id=source.id,
+                                source_path=source.virtual_path,
+                                data_form=source.data_form,
+                                status="unverified_structured_candidate",
+                                semantic_scope=card.semantic_scope,
+                                semantic_slot=card.semantic_slot,
+                                physical_table=physical_table or matched_source_table,
+                                physical_field=physical_field,
+                                match_reason=(
+                                    "observed inventory has a source/table plus a candidate field label "
+                                    f"({match_kind}); inspect/sample before binding"
+                                ),
+                            )
+                        )
+                    found = True
+                elif table_match:
                     mappings.append(
                         KnowledgeSourceMapping(
                             card_id=card.id,
                             source_id=source.id,
                             source_path=source.virtual_path,
                             data_form=source.data_form,
-                            status="exact_structured_source",
-                            matched_table=card.canonical_table,
-                            matched_field=card.canonical_field if field_match else None,
-                            match_reason="table/source name matched knowledge table and field matched observed columns when available",
+                            status="unverified_structured_candidate",
+                            semantic_scope=card.semantic_scope,
+                            semantic_slot=card.semantic_slot,
+                            physical_table=matched_source_table,
+                            physical_field=None,
+                            match_reason=(
+                                "observed inventory source/table label matched the semantic scope; the semantic "
+                                "slot was not proven as a physical field"
+                            ),
+                            warnings=("semantic_slot_unobserved",),
                         )
                     )
                     found = True
-                elif table_match or field_match:
-                    mappings.append(
-                        KnowledgeSourceMapping(
-                            card_id=card.id,
-                            source_id=source.id,
-                            source_path=source.virtual_path,
-                            data_form=source.data_form,
-                            status="fallback_candidate",
-                            matched_table=card.canonical_table if table_match else None,
-                            matched_field=card.canonical_field if field_match else None,
-                            match_reason="partial table or field match; verify grain before use",
-                            warnings=("partial_source_mapping",),
+                elif field_hits:
+                    for physical_table, physical_field, match_kind in field_hits:
+                        mappings.append(
+                            KnowledgeSourceMapping(
+                                card_id=card.id,
+                                source_id=source.id,
+                                source_path=source.virtual_path,
+                                data_form=source.data_form,
+                                status="unverified_lexical_candidate",
+                                semantic_scope=card.semantic_scope,
+                                semantic_slot=card.semantic_slot,
+                                physical_table=physical_table,
+                                physical_field=physical_field,
+                                match_reason=(
+                                    "observed inventory field label matched the semantic card text "
+                                    f"({match_kind}), but the source/table scope did not match; "
+                                    "verify semantics and grain before binding"
+                                ),
+                                warnings=("scope_mismatch_requires_verification",),
+                            )
                         )
-                    )
                     found = True
             elif source.data_form in {"pdf_document", "markdown_document"} and table_match:
                 mappings.append(
@@ -493,10 +694,16 @@ def build_source_mappings(
                         source_id=source.id,
                         source_path=source.virtual_path,
                         data_form=source.data_form,
-                        status="document_source",
-                        matched_table=card.canonical_table,
-                        matched_field=None,
-                        match_reason="document filename/path matched knowledge table; use DocumentAgent for evidence",
+                        status="unverified_document_candidate",
+                        semantic_scope=card.semantic_scope,
+                        semantic_slot=card.semantic_slot,
+                        physical_table=matched_source_table,
+                        physical_field=None,
+                        match_reason=(
+                            "document filename/path matched the semantic scope; extract record anchors and "
+                            "field spans before binding"
+                        ),
+                        warnings=("document_mapping_requires_extraction_plan",),
                     )
                 )
                 found = True
@@ -507,14 +714,21 @@ def build_source_mappings(
                     source_id=None,
                     source_path=None,
                     data_form=None,
-                    status="unsupported_or_missing",
-                    matched_table=card.canonical_table,
-                    matched_field=card.canonical_field,
-                    match_reason="no observed source matched this semantic card",
-                    warnings=("must_locate_or_block",),
+                    status="unresolved_grounding",
+                    semantic_scope=card.semantic_scope,
+                    semantic_slot=card.semantic_slot,
+                    match_reason="no observed inventory candidate matched this semantic card yet",
+                    warnings=("must_locate_or_extract",),
                 )
             )
     return mappings
+
+
+def build_source_mappings(
+    cards: list[KnowledgeSemanticCard],
+    sources: list[SourceRef] | tuple[SourceRef, ...],
+) -> list[KnowledgeSourceMapping]:
+    return build_grounding_candidates(cards, sources)
 
 
 def build_knowledge_catalog(

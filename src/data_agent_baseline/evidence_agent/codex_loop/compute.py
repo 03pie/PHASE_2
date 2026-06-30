@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import closing
 from typing import Any
@@ -9,6 +10,101 @@ import duckdb
 import pandas as pd
 
 from data_agent_baseline.evidence_agent.codex_loop.protocol import Binding, LoopState
+
+_CJK_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "兩": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CJK_NUMBER_CHARS = "零〇一二两兩三四五六七八九十廿"
+
+
+def _parse_year_token(value: str) -> int | None:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}", text):
+        return int(text)
+    if not re.fullmatch(r"[零〇一二两兩三四五六七八九]{4}", text):
+        return None
+    digits = [_CJK_DIGITS.get(char) for char in text]
+    if any(digit is None for digit in digits):
+        return None
+    return int("".join(str(digit) for digit in digits))
+
+
+def _parse_month_day_token(value: str) -> int | None:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{1,2}", text):
+        return int(text)
+    if not text:
+        return None
+    text = text.replace("廿", "二十")
+    if "十" in text:
+        left, right = text.split("十", 1)
+        tens = _CJK_DIGITS.get(left, 1) if left else 1
+        ones = _CJK_DIGITS.get(right, 0) if right else 0
+        if tens is None or ones is None:
+            return None
+        return tens * 10 + ones
+    digits = [_CJK_DIGITS.get(char) for char in text]
+    if any(digit is None for digit in digits):
+        return None
+    return int("".join(str(digit) for digit in digits))
+
+
+def _date_key(year: int | None, month: int | None, day: int | None) -> int | None:
+    if year is None or month is None:
+        return None
+    day = day if day is not None else 1
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return year * 10000 + month * 100 + day
+
+
+def parse_date_key(value: Any) -> int | None:
+    """Normalize common date strings to an integer key suitable for sorting."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(
+        r"\b(?P<year>\d{4})\s*[-/.]\s*(?P<month>\d{1,2})(?:\s*[-/.]\s*(?P<day>\d{1,2}))?\b",
+        text,
+    )
+    if match:
+        return _date_key(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")) if match.group("day") else None,
+        )
+    match = re.search(r"\b(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})\b", text)
+    if match:
+        return _date_key(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+        )
+    cjk_or_digit = rf"\d{{1,2}}|[{_CJK_NUMBER_CHARS}]{{1,4}}"
+    match = re.search(
+        rf"(?P<year>\d{{4}}|[零〇一二两兩三四五六七八九]{{4}})\s*年\s*"
+        rf"(?P<month>{cjk_or_digit})\s*月(?:\s*(?P<day>{cjk_or_digit})\s*(?:日|号)?)?",
+        text,
+    )
+    if not match:
+        return None
+    return _date_key(
+        _parse_year_token(match.group("year")),
+        _parse_month_day_token(match.group("month")),
+        _parse_month_day_token(match.group("day") or "1"),
+    )
 
 
 def _json_records(payload: Any) -> list[dict[str, Any]]:
@@ -57,6 +153,15 @@ def load_binding_frame(state: LoopState, binding: Binding) -> pd.DataFrame:
     return _load_binding_frame(state, binding)
 
 
+def _register_compute_functions(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.create_function(
+        "parse_date_key",
+        parse_date_key,
+        return_type="BIGINT",
+        null_handling="special",
+    )
+
+
 def _cell(value: Any) -> Any:
     if value is None:
         return ""
@@ -96,6 +201,7 @@ def run_sql_over_bindings(
 
     evidence_refs: list[str] = []
     with duckdb.connect(database=":memory:") as connection:
+        _register_compute_functions(connection)
         for binding in bindings:
             frame = _load_binding_frame(state, binding)
             connection.register(binding.relation_name, frame)

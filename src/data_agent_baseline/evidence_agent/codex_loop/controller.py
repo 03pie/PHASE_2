@@ -30,20 +30,18 @@ from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     Evidence,
     LoopState,
     ModelAction,
-    RecoveryHint,
     ToolInvocation,
     ToolOutputEnvelope,
     TranscriptWindow,
 )
 from data_agent_baseline.evidence_agent.codex_loop.registry import EvidenceActionRegistry
 from data_agent_baseline.evidence_agent.codex_loop.state_views import (
+    answer_contract_view,
     answer_candidates,
-    blocked_audit,
     final_output_contract,
-    recovery_hints,
-    requirement_coverage,
+    selected_source_candidates,
+    semantic_selection_view,
     source_coverage_map,
-    verifier_decisions,
 )
 from data_agent_baseline.evidence_agent.knowledge import (
     build_knowledge_catalog,
@@ -59,6 +57,8 @@ _SQL_RELATION_PATTERN = re.compile(
     r'\b(from|join)\s+("([^"]+)"|[A-Za-z_][\w]*)',
     re.IGNORECASE,
 )
+
+_DEFAULT_TOOL_CHOICE = "required"
 
 
 def _compact(value: Any, *, limit: int = 40) -> Any:
@@ -88,6 +88,148 @@ def _semantic_norm(value: Any) -> str:
     return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
 
 
+def _observed_column_for_field(field: str | None, allowed_columns: tuple[str, ...]) -> str | None:
+    field_norm = _semantic_norm(field)
+    if not field_norm:
+        return None
+    for column in allowed_columns:
+        if _semantic_norm(column) == field_norm:
+            return str(column)
+    return None
+
+
+def _field_variants(field_id: str) -> set[str]:
+    text = str(field_id or "").casefold()
+    variants = {text}
+    if "." in text:
+        variants.add(text.rsplit(".", 1)[-1])
+    return {item for item in variants if item}
+
+
+def _physical_columns_from_contract_value(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, dict):
+        return []
+    columns: list[str] = []
+    for key in ("source_field", "source_column", "field", "column", "physical_field", "physical_column"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            columns.append(raw)
+    return columns
+
+
+def _record_columns(records: Any) -> tuple[str, ...]:
+    if not isinstance(records, list):
+        return ()
+    columns: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for column in record:
+            text = str(column).strip()
+            if not text or text == "provenance" or text in seen:
+                continue
+            seen.add(text)
+            columns.append(text)
+    return tuple(columns)
+
+
+def _merge_columns(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for column in group:
+            text = str(column).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+    return tuple(merged)
+
+
+def _sanitize_semantic_contract(
+    state: LoopState,
+    contract: dict[str, Any],
+    *,
+    source_id: str | None,
+    binding_type: str,
+    allowed_columns: tuple[str, ...],
+) -> tuple[dict[str, Any], list[str]]:
+    if not contract or not allowed_columns:
+        return {}, []
+    allowed_norms = {_semantic_norm(column): str(column) for column in allowed_columns}
+    allowed_statuses = (
+        {"unverified_document_candidate"}
+        if binding_type == "document_record_set"
+        else {"unverified_structured_candidate"}
+        if binding_type in {"structured_source", "structured_field"}
+        else set()
+    )
+    selected_card_ids = (
+        set(state.semantic_selection.card_ids)
+        if state.semantic_selection is not None
+        else set()
+    )
+    grounded_fields = {
+        f"{card.semantic_scope}.{card.semantic_slot}".casefold()
+        for card in state.semantic_cards
+        if card.semantic_slot
+        and (not selected_card_ids or card.id in selected_card_ids)
+        for mapping in state.source_mappings
+        if mapping.card_id == card.id
+        and mapping.source_id == source_id
+        and mapping.status in allowed_statuses
+    }
+    physical_mapping: dict[str, Any] = {}
+    rejected: list[str] = []
+    raw_mapping = contract.get("physical_field_mapping")
+    if isinstance(raw_mapping, dict):
+        for key, value in raw_mapping.items():
+            field_id = str(key).casefold()
+            if field_id not in grounded_fields:
+                rejected.append(field_id)
+                continue
+            physical_columns = _physical_columns_from_contract_value(value)
+            observed = [column for column in physical_columns if _semantic_norm(column) in allowed_norms]
+            if not observed:
+                rejected.append(field_id)
+                continue
+            if isinstance(value, dict):
+                physical_mapping[field_id] = {**value, "field": allowed_norms[_semantic_norm(observed[0])]}
+            else:
+                physical_mapping[field_id] = allowed_norms[_semantic_norm(observed[0])]
+    canonical_fields: list[str] = []
+    raw = contract.get("canonical_fields")
+    if isinstance(raw, list):
+        for item in raw:
+            field_id = str(item).casefold()
+            if field_id not in grounded_fields:
+                rejected.append(field_id)
+                continue
+            if field_id in physical_mapping:
+                canonical_fields.append(field_id)
+                continue
+            variants = _field_variants(field_id)
+            observed = next((variant for variant in variants if _semantic_norm(variant) in allowed_norms), None)
+            if observed:
+                canonical_fields.append(field_id)
+                physical_mapping.setdefault(field_id, allowed_norms[_semantic_norm(observed)])
+            elif field_id not in rejected:
+                rejected.append(field_id)
+    if not canonical_fields and not physical_mapping:
+        return {}, sorted(set(rejected))
+    sanitized = {
+        key: value
+        for key, value in contract.items()
+        if key not in {"canonical_fields", "physical_field_mapping"}
+    }
+    sanitized["canonical_fields"] = sorted(set(canonical_fields or physical_mapping))
+    sanitized["physical_field_mapping"] = physical_mapping
+    return sanitized, sorted(set(rejected))
+
+
 def _infer_semantic_contract(
     state: LoopState,
     *,
@@ -102,18 +244,27 @@ def _infer_semantic_contract(
     table_norm = _semantic_norm(table)
     canonical_fields: list[str] = []
     physical_field_mapping: dict[str, dict[str, Any]] = {}
+    selected_card_ids = (
+        set(state.semantic_selection.card_ids)
+        if state.semantic_selection is not None
+        else set()
+    )
+    if not selected_card_ids:
+        return {}
     for card in state.semantic_cards:
-        if not card.canonical_field:
+        if card.id not in selected_card_ids:
             continue
-        field_norm = _semantic_norm(card.canonical_field)
-        if field_norm and column_norms and field_norm not in column_norms:
+        if not card.semantic_slot:
             continue
-        field_id = f"{card.canonical_table}.{card.canonical_field}".casefold()
+        observed_column = _observed_column_for_field(card.semantic_slot, allowed_columns)
+        if column_norms and observed_column is None:
+            continue
+        field_id = f"{card.semantic_scope}.{card.semantic_slot}".casefold()
         for mapping in state.source_mappings:
             if mapping.card_id != card.id or mapping.source_id != source_id:
                 continue
-            if mapping.status == "exact_structured_source" and binding_type in {"structured_source", "structured_field"}:
-                mapped_table = _semantic_norm(mapping.matched_table)
+            if mapping.status == "unverified_structured_candidate" and binding_type in {"structured_source", "structured_field"}:
+                mapped_table = _semantic_norm(mapping.physical_table)
                 if table_norm and mapped_table and table_norm != mapped_table:
                     continue
                 canonical_fields.append(field_id)
@@ -121,15 +272,15 @@ def _infer_semantic_contract(
                     "source_id": source_id,
                     "source_path": mapping.source_path,
                     "table": table,
-                    "field": card.canonical_field,
+                    "field": observed_column or mapping.physical_field or card.semantic_slot,
                     "mapping_status": mapping.status,
                 }
-            elif mapping.status == "document_source" and binding_type == "document_record_set":
+            elif mapping.status == "unverified_document_candidate" and binding_type == "document_record_set":
                 canonical_fields.append(field_id)
                 physical_field_mapping[field_id] = {
                     "source_id": source_id,
                     "source_path": mapping.source_path,
-                    "field": card.canonical_field,
+                    "field": observed_column or mapping.physical_field or card.semantic_slot,
                     "mapping_status": mapping.status,
                 }
     canonical_fields = sorted(set(canonical_fields))
@@ -203,7 +354,7 @@ def _progress_identity(evidence: Evidence) -> str:
 
 def _trace_action_name(action: ModelAction, evidence: Evidence, *, guard_allowed: bool) -> str:
     if not guard_allowed:
-        return "guard_block"
+        return "tool_error"
     if action.kind == "tool_call":
         return action.tool_name or evidence.tool_name
     if action.kind == "compute":
@@ -387,7 +538,6 @@ def _audit_final(state: LoopState) -> dict[str, Any]:
     binding_refs: list[str] = []
     evidence_refs: list[str] = []
     final_mode = "compute" if compute_ref else "direct"
-    requirements = requirement_coverage(state)
     output_contract = final_output_contract(state)
     if compute_ref:
         if compute is None:
@@ -416,26 +566,11 @@ def _audit_final(state: LoopState) -> dict[str, Any]:
             missing_requirements.append("missing_binding_lineage")
         if not evidence_refs:
             missing_requirements.append("missing_evidence_lineage")
-        direct_types = {"document_window", "value", "operation", "answer_candidate"}
-        if binding_refs and not any(
-            (state.bindings.get(ref) is not None and state.bindings[ref].binding_type in direct_types)
-            for ref in binding_refs
-        ):
-            unsupported_operations.append("direct_final_without_direct_binding")
 
     more_missing, more_weak, more_conflicts = _audit_binding_refs(
         state, binding_refs, evidence_refs
     )
     missing_requirements.extend(more_missing)
-    if requirements["declared_count"]:
-        for item in requirements["pending_requirements"]:
-            warnings.append(f"pending_requirement:{item['id']}")
-        for item in requirements["blocked_requirements"]:
-            warnings.append(f"blocked_requirement:{item['id']}")
-        for item in requirements["weak_satisfied_requirements"]:
-            weak_bindings.append(f"weak_requirement_lineage:{item['id']}")
-        for item in requirements["conflict_requirements"]:
-            conflicts.append(f"conflict_requirement:{item['id']}")
     weak_bindings.extend(more_weak)
     conflicts.extend(dict.fromkeys(more_conflicts))
     warnings.extend(f"output_contract:{warning}" for warning in output_contract["warnings"])
@@ -459,7 +594,6 @@ def _audit_final(state: LoopState) -> dict[str, Any]:
         "weak_bindings": weak_bindings,
         "conflicts": conflicts,
         "audit_warnings": warnings,
-        "requirement_coverage": requirements,
         "final_output_contract": output_contract,
         "issues": issues,
         "passed": bool(state.final_answer) and not issues,
@@ -476,7 +610,8 @@ class CodexEvidenceController:
 
     def __init__(self, *, model: Any, config: DeepAgentConfig) -> None:
         self.model = model
-        self.tool_model = bind_native_tools(model)
+        self.default_tool_choice = _DEFAULT_TOOL_CHOICE
+        self.tool_model = bind_native_tools(model, tool_choice=self.default_tool_choice)
         self.config = config
         self.document_agent = DocumentAgent(model=model)
         self.registry = EvidenceActionRegistry(document_agent=self.document_agent)
@@ -587,13 +722,15 @@ class CodexEvidenceController:
         )
         trace.add(
             action="codex_bootstrap_source_resolution",
-            thought="Compare semantic cards with observed inventory to prepare source candidates; this is separate from knowledge semantics.",
+            thought="Prepare source candidate ledger, but do not expose candidates until the LLM selects semantic cards.",
             observation={
                 "source_mapping_count": len(state.source_mappings),
-                "source_mappings": [
-                    mapping.to_dict()
-                    for mapping in state.source_mappings[:160]
-                ],
+                "selected_source_mapping_count": 0,
+                "selection_required": True,
+                "note": (
+                    "Full source mappings are internal until select_semantic_cards records "
+                    "the task-specific business semantic selection."
+                ),
             },
         )
 
@@ -623,13 +760,13 @@ class CodexEvidenceController:
         *,
         transcript: TranscriptWindow | None = None,
         last_error: str | None = None,
-        recovery_hint: RecoveryHint | None = None,
+        recovery_hint: dict[str, Any] | None = None,
         extra_instruction: str | None = None,
     ) -> tuple[list[Any], list[str], dict[str, bool]]:
         fragments = build_context_fragments(
             state,
             last_error=last_error,
-            recovery_hint=recovery_hint.to_dict() if recovery_hint else None,
+            recovery_hint=recovery_hint,
         )
         context = render_user_context(fragments)
         messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=context)]
@@ -665,10 +802,11 @@ class CodexEvidenceController:
         tool_names: tuple[str, ...] | None = None,
     ) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
         last_exc: Exception | None = None
+        effective_tool_choice = tool_choice if tool_choice is not None else self.default_tool_choice
         tool_model = (
             bind_native_tools(
                 self.model,
-                tool_choice=tool_choice,
+                tool_choice=effective_tool_choice,
                 tool_names=tool_names,
             )
             if tool_choice is not None or tool_names is not None
@@ -680,11 +818,11 @@ class CodexEvidenceController:
                 break
             except Exception as exc:  # noqa: BLE001 - model transport errors are retriable
                 last_exc = exc
-                if attempt == 0 and isinstance(tool_choice, dict):
-                    tool_choice = "required"
+                if attempt == 0 and isinstance(effective_tool_choice, dict):
+                    effective_tool_choice = self.default_tool_choice
                     tool_model = bind_native_tools(
                         self.model,
-                        tool_choice=tool_choice,
+                        tool_choice=effective_tool_choice,
                         tool_names=tool_names,
                     )
                     continue
@@ -699,33 +837,12 @@ class CodexEvidenceController:
         raw = {
             "content": getattr(response, "content", ""),
             "tool_calls": tool_calls,
+            "invalid_tool_calls": _compact(getattr(response, "invalid_tool_calls", None) or []),
             "response_metadata": getattr(response, "response_metadata", {}),
-            "tool_choice": tool_choice,
+            "tool_choice": effective_tool_choice,
             "tool_names": list(tool_names) if tool_names else None,
         }
         return response, tool_calls, raw
-
-    def _forced_recovery_policy(
-        self,
-        state: LoopState,
-        *,
-        attempt: int,
-    ) -> tuple[str | dict[str, Any], tuple[str, ...] | None, RecoveryHint | None]:
-        del attempt
-        hints = recovery_hints(state, limit=1)
-        hint = hints[0] if hints else None
-        if hint is None:
-            return "required", None, None
-        tool_names = tuple(dict.fromkeys((hint.tool_name, "blocked")))
-        tool_choice: str | dict[str, Any]
-        if hint.tool_name and hint.tool_name != "blocked":
-            tool_choice = {
-                "type": "function",
-                "function": {"name": hint.tool_name},
-            }
-        else:
-            tool_choice = "required"
-        return tool_choice, tool_names, hint
 
     def _apply_bind(self, state: LoopState, action: ModelAction) -> Evidence:
         evidence_items = [state.evidence[ref] for ref in action.evidence_refs]
@@ -747,6 +864,15 @@ class CodexEvidenceController:
         metadata: dict[str, Any] = {}
         if isinstance(arguments.get("answer"), dict):
             metadata["answer"] = arguments["answer"]
+        raw_semantic_mappings = arguments.get("semantic_mappings")
+        if isinstance(raw_semantic_mappings, list):
+            semantic_mappings = [
+                dict(item)
+                for item in raw_semantic_mappings
+                if isinstance(item, dict)
+            ]
+            if semantic_mappings:
+                metadata["semantic_mappings"] = semantic_mappings
         explicit_contract: dict[str, Any] = {}
         if isinstance(arguments.get("semantic_contract"), dict):
             explicit_contract.update(arguments["semantic_contract"])
@@ -771,13 +897,13 @@ class CodexEvidenceController:
             for item in evidence_items:
                 records = item.payload.get("records")
                 if isinstance(records, list):
+                    record_columns = _record_columns(records)
+                    allowed_columns = _merge_columns(allowed_columns, record_columns)
                     metadata["records"] = records
                     metadata["record_count"] = len(records)
                     metadata["coverage"] = item.payload.get("coverage_summary") or {}
                     metadata["partial_coverage"] = bool(item.payload.get("partial_coverage"))
                     metadata["include_missing_records"] = bool(item.payload.get("include_missing_records"))
-                    if not allowed_columns and records and isinstance(records[0], dict):
-                        allowed_columns = tuple(str(column) for column in records[0] if column != "provenance")
                     break
         if action.binding_type == "document_window":
             metadata["window_evidence_refs"] = list(action.evidence_refs)
@@ -801,8 +927,17 @@ class CodexEvidenceController:
             allowed_columns=allowed_columns,
         )
         semantic_contract = {**inferred_contract, **explicit_contract}
+        semantic_contract, rejected_contract_fields = _sanitize_semantic_contract(
+            state,
+            semantic_contract,
+            source_id=source_id,
+            binding_type=str(binding_type),
+            allowed_columns=allowed_columns,
+        )
         if semantic_contract:
             metadata["semantic_contract"] = semantic_contract
+        if rejected_contract_fields:
+            metadata["rejected_semantic_contract_fields"] = rejected_contract_fields
         binding = state.add_binding(
             binding_type=binding_type,
             evidence_refs=action.evidence_refs,
@@ -822,23 +957,6 @@ class CodexEvidenceController:
                     "reason": "Inspect verified relation schema before compute.",
                 },
             ]
-            if (
-                action.binding_type == "document_record_set"
-                and metadata.get("partial_coverage")
-            ):
-                allowed_next_tools = (
-                    "run_document_agent",
-                    "bind",
-                    "inspect_relation",
-                )
-                recommended_items.insert(
-                    0,
-                    {
-                        "tool_name": "run_document_agent",
-                        "arguments": {"question": state.question},
-                        "reason": "This document record-set has partial coverage; rerun DocumentAgent with a tighter DocTask before compute.",
-                    },
-                )
             recommended_next_actions = tuple(recommended_items[:8])
             summary = f"Created verified binding {binding.id} as relation {binding.relation_name}."
         else:
@@ -899,6 +1017,8 @@ class CodexEvidenceController:
             f"neg={len(state.negative_scopes)};"
             f"cand={len(state.candidates)};"
             f"bind={len(state.bindings)};"
+            f"contract={bool(state.answer_contract)};"
+            f"semantic_selection={bool(state.semantic_selection)};"
             f"okcomp={sum(1 for item in state.compute_results.values() if item.ok)};"
             f"final={bool(state.final_answer)}"
         )
@@ -912,12 +1032,17 @@ class CodexEvidenceController:
             return "new_compute_result"
         if evidence.tool_name == "submit_final" and evidence.ok:
             return "final_answer_submitted"
+        if evidence.tool_name == "declare_answer_contract" and evidence.ok:
+            return "answer_contract_declared"
+        if evidence.tool_name == "select_semantic_cards" and evidence.ok:
+            return "semantic_cards_selected"
         if evidence.negative_scope is not None:
             return "new_negative_scope"
-        if evidence.ok and evidence.tool_name not in {"verify_alignment", "track_requirements"}:
+        if evidence.ok and evidence.tool_name not in {
+            "declare_answer_contract",
+            "select_semantic_cards",
+        }:
             return "new_observation"
-        if evidence.ok and evidence.tool_name == "verify_alignment":
-            return "new_verifier_decision"
         return "new_ledger_state"
 
     def _canonicalize_action(self, state: LoopState, action: ModelAction) -> ModelAction:
@@ -947,7 +1072,6 @@ class CodexEvidenceController:
     def _state_summary(self, state: LoopState) -> dict[str, Any]:
         remaining_steps = max(0, self.config.max_steps - state.step_index)
         source_coverage = source_coverage_map(state)
-        hints = recovery_hints(state, limit=1)
         budget_pressure: dict[str, Any] = {
             "step_index": state.step_index,
             "max_steps": self.config.max_steps,
@@ -970,9 +1094,9 @@ class CodexEvidenceController:
                 "recent_sources": source_coverage["sources"][-12:],
             },
             "bindings": [binding.to_dict() for binding in state.bindings.values()],
-            "requirements": requirement_coverage(state),
-            "verifier_decisions": verifier_decisions(state)[-8:],
-            "recovery_hint": hints[0].to_dict() if hints else None,
+            "answer_contract": answer_contract_view(state),
+            "semantic_selection": semantic_selection_view(state),
+            "selected_source_candidates": selected_source_candidates(state),
             "direct_final_bindings": [
                 binding.to_dict()
                 for binding in state.bindings.values()
@@ -995,33 +1119,6 @@ class CodexEvidenceController:
             "blocked_reason": state.blocked_reason,
         }
 
-    def _blocked_needs_repair(self, state: LoopState, audit: dict[str, Any]) -> bool:
-        if audit["passed"]:
-            return False
-        signature = self._blocked_repair_signature(audit)
-        if signature is None:
-            return False
-        previous = sum(
-            1 for item in state.guard_feedback if item.get("signature") == signature
-        )
-        return previous < 1
-
-    def _blocked_repair_signature(self, audit: dict[str, Any]) -> str | None:
-        for item in audit.get("recovery_hints") or []:
-            if not isinstance(item, dict):
-                continue
-            tool_name = str(item.get("tool_name") or "")
-            if not tool_name or tool_name == "blocked":
-                continue
-            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            return "blocked_audit_repair:" + json.dumps(
-                {"tool_name": tool_name, "arguments": arguments},
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )
-        return None
-
     def run(
         self,
         task: PublicTask,
@@ -1036,13 +1133,10 @@ class CodexEvidenceController:
         try:
             self._bootstrap(task, state, trace)
             transcript = TranscriptWindow(max_groups=8)
-            recovery_hint: RecoveryHint | None = None
+            recovery_hint: dict[str, Any] | None = None
             last_error: str | None = None
             self._emit(task_id=task.task_id, trace=trace, callback=trace_callback, status="running")
 
-            forced_tool_choice: str | dict[str, Any] | None = None
-            forced_tool_names: tuple[str, ...] | None = None
-            forced_recovery_attempts = 0
             for turn in range(1, self.config.max_steps + 1):
                 state.step_index = turn
                 messages, context_fragment_ids, context_truncated = self._prompt_messages(
@@ -1051,11 +1145,7 @@ class CodexEvidenceController:
                     last_error=last_error,
                     recovery_hint=recovery_hint,
                 )
-                response, tool_calls, raw = self._call_model(
-                    messages,
-                    tool_choice=forced_tool_choice,
-                    tool_names=forced_tool_names,
-                )
+                response, tool_calls, raw = self._call_model(messages)
                 transcript.add_model_response(response)
                 raw["context_fragment_ids"] = context_fragment_ids
                 raw["context_truncated"] = context_truncated
@@ -1082,58 +1172,29 @@ class CodexEvidenceController:
                         if content
                         else "model_returned_no_tool_call"
                     )
-                    forced_recovery_attempts += 1
-                    forced_tool_choice, forced_tool_names, recovery_hint = self._forced_recovery_policy(
-                        state,
-                        attempt=forced_recovery_attempts,
-                    )
-                    hint_dict = recovery_hint.to_dict() if recovery_hint else None
                     state.guard_feedback.append(
                         {
                             "turn": turn,
                             "signature": reason,
                             "reason": content[:500] or reason,
-                            "recovery_hint": hint_dict,
-                            "forced_tool_choice_next": forced_tool_choice,
-                            "forced_tool_names_next": list(forced_tool_names or []),
                         }
                     )
                     state.repeated_no_progress += 1
                     trace.add(
-                        action="codex_no_tool_repair",
-                        thought="Model response did not contain native tool calls; feed back a bounded repair instruction.",
+                        action="codex_no_tool_diagnostic",
+                        thought="Model response did not contain native tool calls; stop without post-action recovery.",
                         observation={
                             "turn": turn,
                             "reason": reason,
                             "content_preview": content[:800],
-                            "recovery_hint": hint_dict,
-                            "forced_recovery_attempts": forced_recovery_attempts,
-                            "forced_tool_choice_next": forced_tool_choice,
-                            "forced_tool_names_next": list(forced_tool_names or []),
                         },
                         ok=False,
                     )
-                    if forced_recovery_attempts >= 4:
-                        failure_reason = (
-                            "Model did not use native tool calling after forced recovery attempts."
-                        )
-                        break
-                    last_error = reason
-                    transcript.add_repair_message(
-                        HumanMessage(
-                            content=(
-                                "Your previous response was ignored because it did not contain a native tool call. "
-                                "The next request is forced to use native tool calling. "
-                                "Return exactly one native tool call. Do not answer in text. "
-                                "Use observed evidence and compact state, or call blocked with cited evidence_refs."
-                            )
-                        )
+                    failure_reason = (
+                        "Model did not use native tool calling; no post-action recovery was attempted."
                     )
-                    continue
+                    break
 
-                forced_tool_choice = None
-                forced_tool_names = None
-                forced_recovery_attempts = 0
                 recovery_hint = None
                 last_error = None
 
@@ -1168,7 +1229,7 @@ class CodexEvidenceController:
                             summary=guard.reason,
                             payload={"action": action.to_dict(), "tool_call": call},
                             negative_scope={
-                                "kind": "guard_block",
+                                "kind": "invalid_tool_action",
                                 "signature": action.signature(),
                                 "reason": guard.reason,
                             },
@@ -1242,129 +1303,18 @@ class CodexEvidenceController:
                         )
                     )
                     if action.kind == "final" and evidence.ok and state.final_answer:
-                        audit_now = _audit_final(state)
-                        if audit_now["passed"]:
-                            terminal_action = action
-                            terminal_evidence = evidence
-                            break
-                        state.guard_feedback.append(
-                            {
-                                "turn": turn,
-                                "signature": "final_audit",
-                                "action": action.to_dict(),
-                                "reason": "Final audit failed before termination: "
-                                + ", ".join(audit_now["issues"]),
-                                "audit": audit_now,
-                            }
-                        )
-                        trace.add(
-                            action="codex_final_audit_repair",
-                            thought="Final audit failed; keep the candidate final in state and feed audit gaps back for repair.",
-                            observation={"audit": audit_now},
-                            ok=False,
-                        )
-                        transcript.add_repair_message(
-                            HumanMessage(
-                                content=(
-                                    "Final audit failed, but the candidate final answer remains available in state. "
-                                    "Continue with native tool calls only. Repair projection, lineage, requirements, "
-                                    "or submit a corrected final; call blocked only if no valid repair remains:\n"
-                                    + str(_compact(audit_now, limit=20))
-                                )
-                            )
-                        )
-                        last_error = "final_audit_failed"
+                        terminal_action = action
+                        terminal_evidence = evidence
+                        break
                     elif action.kind == "blocked":
-                        audit_now = blocked_audit(
-                            state,
-                            action.reason or evidence.summary,
-                            cited_evidence_refs=action.evidence_refs,
-                        )
-                        if self._blocked_needs_repair(state, audit_now):
-                            signature = self._blocked_repair_signature(audit_now)
-                            state.guard_feedback.append(
-                                {
-                                    "turn": turn,
-                                    "signature": signature,
-                                    "action": action.to_dict(),
-                                    "reason": "Blocked audit found unresolved answer candidates or positive evidence.",
-                                    "audit": audit_now,
-                                }
-                            )
-                            state.blocked_reason = None
-                            trace.add(
-                                action="codex_blocked_audit_repair",
-                                thought="Blocked was rejected once because unresolved answer candidates or positive evidence remain.",
-                                observation={"audit": audit_now},
-                                ok=False,
-                            )
-                            transcript.add_repair_message(
-                                HumanMessage(
-                                    content=(
-                                        "Blocked audit found unresolved candidates/evidence. "
-                                        "Continue with native tool calls only. Submit a sufficient candidate, "
-                                        "bind/use the positive evidence, gather specific missing evidence, "
-                                        "or call blocked again with a reason that addresses this audit:\n"
-                                        + str(_compact(audit_now, limit=20))
-                                    )
-                                )
-                            )
-                            last_error = "blocked_audit_failed"
-                        else:
-                            terminal_action = action
-                            terminal_evidence = evidence
-                            break
+                        terminal_action = action
+                        terminal_evidence = evidence
+                        break
 
                 if turn_progressed:
                     state.repeated_no_progress = 0
                 else:
                     state.repeated_no_progress += 1
-                if terminal_action is None:
-                    trace.add(
-                        action="codex_context_refresh",
-                        thought="Refresh compact state fragments while preserving the recent AI/tool transcript window.",
-                        observation={
-                            "turn": turn,
-                            "transcript_group_count": len(transcript.groups),
-                            "state_summary": self._state_summary(state),
-                        },
-                    )
-                    if state.repeated_no_progress == 1:
-                        forced_tool_choice, forced_tool_names, recovery_hint = self._forced_recovery_policy(
-                            state,
-                            attempt=1,
-                        )
-                        hint_dict = recovery_hint.to_dict() if recovery_hint else None
-                        state.guard_feedback.append(
-                            {
-                                "turn": turn,
-                                "signature": "no_progress_repair",
-                                "reason": "Last native tool turn did not add effective progress.",
-                                "recovery_hint": hint_dict,
-                                "forced_tool_choice_next": forced_tool_choice,
-                                "forced_tool_names_next": list(forced_tool_names or []),
-                            }
-                        )
-                        trace.add(
-                            action="codex_no_progress_repair",
-                            thought="A native tool turn made no effective progress; return a recoverable tool-loop repair to the model.",
-                            observation={
-                                "turn": turn,
-                                "recovery_hint": hint_dict,
-                                "forced_tool_choice_next": forced_tool_choice,
-                                "forced_tool_names_next": list(forced_tool_names or []),
-                            },
-                            ok=False,
-                        )
-                        transcript.add_repair_message(
-                            HumanMessage(
-                                content=(
-                                    "The previous native tool turn made no effective progress. "
-                                    "Return exactly one native tool call that uses new evidence, submits a verified answer, or calls blocked."
-                                )
-                            )
-                        )
-                        last_error = "no_progress_repair"
                 self._emit(
                     task_id=task.task_id,
                     trace=trace,
@@ -1395,13 +1345,10 @@ class CodexEvidenceController:
                 answer = _answer_from_final(state)
             if answer is None and failure_reason is None:
                 failure_reason = "No final answer was submitted."
-            if answer is not None and not audit["passed"]:
-                failure_reason = "Final audit failed: " + ", ".join(audit["issues"])
-                answer = None
 
             trace.add(
                 action="codex_final_audit",
-                thought="Final answer must come from verified compute or direct evidence lineage.",
+                thought="Record final audit diagnostics without post-hoc blocking.",
                 observation={
                     "audit": audit,
                     "answer": answer.to_dict() if answer is not None else None,

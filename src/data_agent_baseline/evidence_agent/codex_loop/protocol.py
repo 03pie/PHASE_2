@@ -33,16 +33,6 @@ RequirementStatus = Literal[
     "blocked",
 ]
 
-VerifierDecision = Literal[
-    "bindable",
-    "candidate_answer",
-    "intermediate",
-    "not_applicable",
-    "needs_more_evidence",
-    "conflict",
-    "blocked_ok",
-]
-
 COMPUTABLE_BINDING_TYPES = {
     "structured_source",
     "structured_field",
@@ -73,8 +63,8 @@ class KnowledgeLookupEntry:
 class KnowledgeSemanticCard:
     id: str
     kind: str
-    canonical_table: str
-    canonical_field: str | None
+    semantic_scope: str
+    semantic_slot: str | None
     name: str
     definition: str
     aliases: tuple[str, ...] = ()
@@ -87,6 +77,22 @@ class KnowledgeSemanticCard:
     line_start: int | None = None
     line_end: int | None = None
 
+    @property
+    def semantic_id(self) -> str:
+        return self.id
+
+    @property
+    def canonical_table(self) -> str:
+        """Backward-compatible alias for the semantic scope, not a physical table."""
+
+        return self.semantic_scope
+
+    @property
+    def canonical_field(self) -> str | None:
+        """Backward-compatible alias for the semantic slot, not a physical field."""
+
+        return self.semantic_slot
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -98,10 +104,24 @@ class KnowledgeSourceMapping:
     source_path: str | None
     data_form: DataForm | str | None
     status: str
-    matched_table: str | None = None
-    matched_field: str | None = None
+    semantic_scope: str | None = None
+    semantic_slot: str | None = None
+    physical_table: str | None = None
+    physical_field: str | None = None
     match_reason: str = ""
     warnings: tuple[str, ...] = ()
+
+    @property
+    def matched_table(self) -> str | None:
+        """Backward-compatible alias for the candidate physical table."""
+
+        return self.physical_table
+
+    @property
+    def matched_field(self) -> str | None:
+        """Backward-compatible alias for the candidate physical field."""
+
+        return self.physical_field
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -190,6 +210,56 @@ class Requirement:
     binding_refs: tuple[str, ...] = ()
     compute_refs: tuple[str, ...] = ()
     note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerContract:
+    intent_summary: str = ""
+    answer_grain: str = ""
+    final_outputs: tuple[str, ...] = ()
+    requested_outputs: tuple[str, ...] = ()
+    constraints: tuple[dict[str, Any], ...] = ()
+    operations: dict[str, Any] = dataclass_field(default_factory=dict)
+    helper_fields: dict[str, tuple[str, ...]] = dataclass_field(default_factory=dict)
+    field_roles: tuple[dict[str, Any], ...] = ()
+    row_shape: str = "preserve_rows"
+    row_limit: int | None = None
+    null_policy: str = "preserve"
+    transform_intent: str = ""
+    document_policy: dict[str, Any] = dataclass_field(default_factory=dict)
+    unresolved_terms: tuple[str, ...] = ()
+    not_physical_schema: bool = True
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticSourceCandidate:
+    card_id: str
+    semantic_scope: str | None = None
+    semantic_slot: str | None = None
+    source_id: str | None = None
+    source_path: str | None = None
+    data_form: DataForm | str | None = None
+    physical_table: str | None = None
+    physical_field: str | None = None
+    candidate_kind: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticSelection:
+    card_ids: tuple[str, ...] = ()
+    selected_cards: tuple[dict[str, Any], ...] = ()
+    rationale: str = ""
+    unmapped_intents: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -357,10 +427,6 @@ class TranscriptWindow:
             self.groups[-1].append(message)
         self._trim()
 
-    def add_repair_message(self, message: Any) -> None:
-        self.groups.append([message])
-        self._trim()
-
     def messages(self) -> list[Any]:
         output: list[Any] = []
         for group in self.groups[-self.max_groups :]:
@@ -384,10 +450,14 @@ class LoopState:
     semantic_cards: list[KnowledgeSemanticCard] = dataclass_field(default_factory=list)
     matched_semantic_cards: list[KnowledgeSemanticCard] = dataclass_field(default_factory=list)
     source_mappings: list[KnowledgeSourceMapping] = dataclass_field(default_factory=list)
+    semantic_selection: SemanticSelection | None = None
+    selected_source_mappings: list[KnowledgeSourceMapping] = dataclass_field(default_factory=list)
+    semantic_selection_errors: list[str] = dataclass_field(default_factory=list)
     candidates: dict[str, CandidateRef] = dataclass_field(default_factory=dict)
     evidence: dict[str, Evidence] = dataclass_field(default_factory=dict)
     bindings: dict[str, Binding] = dataclass_field(default_factory=dict)
     requirements: dict[str, Requirement] = dataclass_field(default_factory=dict)
+    answer_contract: AnswerContract | None = None
     compute_results: dict[str, ComputeResult] = dataclass_field(default_factory=dict)
     document_record_indexes: dict[str, Any] = dataclass_field(default_factory=dict)
     document_coverage: dict[str, Any] = dataclass_field(default_factory=dict)

@@ -41,13 +41,20 @@ _LIST_FIELDS = {
     "source_refs",
     "source_candidates",
     "target_fields",
+    "final_outputs",
+    "requested_outputs",
+    "required_fields",
+    "row_indices",
     "slice_ids",
     "allowed_columns",
+    "unmapped_intents",
 }
 _INT_FIELDS = {
     "limit",
     "sample_limit",
     "max_pairs",
+    "n",
+    "row_limit",
 }
 _BINDING_TYPE_ALIASES = {
     "source": "structured_source",
@@ -138,14 +145,6 @@ def _normalize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]
     for key, value in spilled.items():
         if key not in normalized or normalized[key] in {"", None, []}:
             normalized[key] = value
-    if "requirements" in normalized and isinstance(normalized["requirements"], list):
-        fixed_requirements: list[Any] = []
-        for item in normalized["requirements"]:
-            if isinstance(item, dict):
-                fixed_requirements.append(_normalize_tool_args("track_requirements", item))
-            else:
-                fixed_requirements.append(item)
-        normalized["requirements"] = fixed_requirements
     return normalized
 
 
@@ -250,7 +249,9 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
             "description": (
                 "Delegate PDF/MD work to the bounded DocumentAgent sub-loop. It inspects "
                 "record indexes, searches/reads record slices, performs local semantic extraction, "
-                "checks coverage, and returns a compact DocEvidencePackage. It cannot compute or final-answer."
+                "checks coverage, and returns a compact DocEvidencePackage. It cannot compute or final-answer. "
+                "For follow-up extraction, pass coverage_policy.focus_slice_ids with recorded uncertain slice ids "
+                "so the sub-loop reads only those slices."
             ),
             "parameters": _object_schema(
                 {
@@ -272,7 +273,7 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
             "name": "inspect_relation",
             "description": (
                 "Inspect verified compute relations after bind: relation_name, columns, "
-                "types, row count, and sample. Use before SQL repair."
+                "types, row count, and sample. Use before changing SQL."
             ),
             "parameters": _object_schema(
                 {
@@ -303,96 +304,175 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "track_requirements",
+            "name": "declare_answer_contract",
             "description": (
-                "Declare or update generic answer requirements derived from the question, "
-                "knowledge text, or observed evidence. This is a coverage ledger only; "
-                "it does not bind data or compute answers."
+                "Declare the LLM's question understanding contract before selecting knowledge cards or physical "
+                "sources. Record the task intent, answer grain, final outputs, constraints, row operations, helper "
+                "fields, null policy, and unresolved terms. This is semantic intent only: it does not bind data, "
+                "choose physical schema, compute, or answer."
             ),
             "parameters": _object_schema(
                 {
-                    "requirements": {
+                    "intent_summary": {
+                        "type": "string",
+                        "description": "Natural-language restatement of what the question asks, in task semantics.",
+                    },
+                    "answer_grain": {
+                        "type": "string",
+                        "description": "What one final answer row represents semantically.",
+                    },
+                    "final_outputs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Final answer columns only. Exclude fields used only for filtering, sorting, "
+                            "ranking, joining, identifying records, or choosing rows."
+                        ),
+                    },
+                    "requested_outputs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Deprecated alias for final_outputs. If supplied, it must still contain final answer "
+                            "columns only."
+                        ),
+                    },
+                    "constraints": {
                         "type": "array",
                         "items": _object_schema(
                             {
-                                "id": {"type": "string"},
-                                "text": {"type": "string"},
-                                "status": {
+                                "semantic_field": {"type": "string"},
+                                "operator": {"type": "string"},
+                                "value": {},
+                                "reason": {"type": "string"},
+                            },
+                            required=["semantic_field", "operator", "reason"],
+                            additional_properties=True,
+                        ),
+                        "description": (
+                            "LLM-declared semantic filters/conditions from the question. The code stores these "
+                            "but does not interpret the operator or value."
+                        ),
+                    },
+                    "operations": {
+                        "type": "object",
+                        "properties": {
+                            "row_shape": {
+                                "type": "string",
+                                "enum": ["preserve_rows", "single_row", "top_n", "aggregate"],
+                            },
+                            "sort_by": {"type": "array", "items": {"type": "string"}},
+                            "group_by": {"type": "array", "items": {"type": "string"}},
+                            "aggregate": {"type": "array", "items": {"type": "string"}},
+                            "top_n": {"type": "integer", "minimum": 1},
+                            "reason": {"type": "string"},
+                        },
+                        "additionalProperties": True,
+                        "description": "Semantic row selection, ordering, grouping, and aggregation intent.",
+                    },
+                    "helper_fields": {
+                        "type": "object",
+                        "properties": {
+                            "filter_fields": {"type": "array", "items": {"type": "string"}},
+                            "sort_fields": {"type": "array", "items": {"type": "string"}},
+                            "join_keys": {"type": "array", "items": {"type": "string"}},
+                            "row_selection_fields": {"type": "array", "items": {"type": "string"}},
+                            "evidence_anchor_fields": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "additionalProperties": True,
+                        "description": (
+                            "Non-output semantic fields needed to filter, sort, join, select rows, or anchor "
+                            "records. These fields may be extracted/computed, but submit_final should not project "
+                            "them unless they also appear in final_outputs."
+                        ),
+                    },
+                    "field_roles": {
+                        "type": "array",
+                        "items": _object_schema(
+                            {
+                                "field": {"type": "string"},
+                                "role": {
                                     "type": "string",
                                     "enum": [
-                                        "pending",
-                                        "satisfied",
-                                        "not_applicable",
-                                        "conflict",
-                                        "blocked",
+                                        "final_output",
+                                        "filter",
+                                        "sort",
+                                        "join",
+                                        "row_selection",
+                                        "evidence_anchor",
+                                        "intermediate",
                                     ],
                                 },
-                                "source_refs": {"type": "array", "items": {"type": "string"}},
-                                "evidence_refs": {"type": "array", "items": {"type": "string"}},
-                                "binding_refs": {"type": "array", "items": {"type": "string"}},
-                                "compute_refs": {"type": "array", "items": {"type": "string"}},
-                                "note": {"type": "string"},
+                                "semantic_card_ids": {"type": "array", "items": {"type": "string"}},
+                                "semantic_field": {"type": "string"},
+                                "reason": {"type": "string"},
                             },
-                            required=["text"],
+                            required=["field", "role"],
+                            additional_properties=True,
                         ),
-                    }
+                        "description": (
+                            "LLM-declared semantic ledger for each output/helper field. Prefer citing knowledge "
+                            "semantic card ids when available. The code stores this ledger but does not interpret "
+                            "business semantics."
+                        ),
+                    },
+                    "row_shape": {
+                        "type": "string",
+                        "enum": ["preserve_rows", "single_row", "top_n", "aggregate"],
+                    },
+                    "n": {"type": "integer", "minimum": 1},
+                    "row_limit": {"type": "integer", "minimum": 1},
+                    "null_policy": {
+                        "type": "string",
+                        "enum": [
+                            "preserve",
+                            "filter_when_metric_requires",
+                            "filter_when_question_requests_non_empty",
+                        ],
+                    },
+                    "transform_intent": {"type": "string"},
+                    "document_policy": {
+                        "type": "object",
+                        "properties": {
+                            "include_missing_records": {"type": "boolean"},
+                            "required_fields": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "additionalProperties": True,
+                    },
+                    "unresolved_terms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Question terms the LLM cannot map to knowledge cards yet.",
+                    },
+                    "notes": {"type": "string"},
                 },
-                required=["requirements"],
+                required=[
+                    "intent_summary",
+                    "answer_grain",
+                    "final_outputs",
+                    "row_shape",
+                    "null_policy",
+                    "transform_intent",
+                ],
             ),
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "verify_alignment",
+            "name": "select_semantic_cards",
             "description": (
-                "Record a structured verifier decision about whether cited evidence, "
-                "bindings, or compute results align with the question and knowledge. "
-                "This tool never creates a binding or final answer by itself."
+                "Select the knowledge semantic cards the LLM intends to use for this task. "
+                "This is the semantic routing step between answer_contract and source exploration. "
+                "If no card matches an intent, put that intent in unmapped_intents and use inventory tools."
             ),
             "parameters": _object_schema(
                 {
-                    "decision": {
-                        "type": "string",
-                        "enum": [
-                            "bindable",
-                            "candidate_answer",
-                            "intermediate",
-                            "not_applicable",
-                            "needs_more_evidence",
-                            "conflict",
-                            "blocked_ok",
-                        ],
-                    },
-                    "target_kind": {
-                        "type": "string",
-                        "enum": [
-                            "source",
-                            "field",
-                            "document_window",
-                            "document_record_set",
-                            "compute_result",
-                            "direct_evidence",
-                            "alternative_source",
-                            "requirement",
-                            "blocked",
-                            "final_answer",
-                        ],
-                    },
-                    "target_refs": {"type": "array", "items": {"type": "string"}},
-                    "requirement_refs": {"type": "array", "items": {"type": "string"}},
-                    "knowledge_section_ids": {"type": "array", "items": {"type": "string"}},
-                    "evidence_refs": {"type": "array", "items": {"type": "string"}},
-                    "binding_refs": {"type": "array", "items": {"type": "string"}},
-                    "compute_refs": {"type": "array", "items": {"type": "string"}},
-                    "alignment": {"type": "string"},
-                    "limitations": {"type": "string"},
-                    "next_actions": {
-                        "type": "array",
-                        "items": {"type": "object", "additionalProperties": True},
-                    },
+                    "card_ids": {"type": "array", "items": {"type": "string"}},
+                    "rationale": {"type": "string"},
+                    "unmapped_intents": {"type": "array", "items": {"type": "string"}},
                 },
-                required=["decision", "target_kind", "alignment"],
+                required=["rationale"],
             ),
         },
     },
@@ -426,6 +506,7 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
                     "semantic_card_ids": {"type": "array", "items": {"type": "string"}},
                     "canonical_fields": {"type": "array", "items": {"type": "string"}},
                     "physical_field_mapping": {"type": "object", "additionalProperties": True},
+                    "semantic_mappings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
                     "semantic_contract": {"type": "object", "additionalProperties": True},
                     "alignment": {"type": "string"},
                     "answer": {"type": "object", "additionalProperties": True},
@@ -440,7 +521,9 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
             "name": "run_verified_compute",
             "description": (
                 "Run SQL over verified relation names from bindings only. "
-                "Use relation_name values such as rel_0001, not original file or table names."
+                "Use relation_name values such as rel_0001, not original file or table names. "
+                "Available helper: parse_date_key(value) returns a YYYYMMDD integer for common "
+                "date strings, including Chinese numeral dates, for ordering/filtering."
             ),
             "parameters": _object_schema(
                 {
@@ -456,8 +539,9 @@ MODEL_TOOL_SPECS: list[dict[str, Any]] = [
         "function": {
             "name": "submit_final",
             "description": (
-                "Submit the final answer. A compute-backed final requires a prior "
-                "verify_alignment candidate_answer decision for the compute_ref and an explicit answer.columns projection. "
+                "Submit the final answer. A compute-backed final requires an existing successful compute_ref "
+                "and an explicit answer.columns projection. "
+                "Use answer.row_indices to project explicit compute rows after the LLM has semantically judged the row choice. "
                 "For direct document/value evidence, provide answer plus binding_refs and evidence_refs. "
                 "The answer object may only project or alias values already present in the cited compute result."
             ),

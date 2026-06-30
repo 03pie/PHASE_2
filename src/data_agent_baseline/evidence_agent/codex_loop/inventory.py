@@ -41,11 +41,11 @@ def data_form_for_path(path: Path) -> DataForm:
     return "unknown_file"
 
 
-def _sqlite_tables(path: Path) -> tuple[str, ...]:
+def _sqlite_table_columns(path: Path) -> dict[str, tuple[str, ...]]:
     try:
         uri = f"file:{path.resolve().as_posix()}?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as connection:
-            rows = connection.execute(
+            table_rows = connection.execute(
                 """
                 SELECT name
                 FROM sqlite_schema
@@ -54,9 +54,14 @@ def _sqlite_tables(path: Path) -> tuple[str, ...]:
                 ORDER BY name COLLATE NOCASE
                 """
             ).fetchall()
+            output: dict[str, tuple[str, ...]] = {}
+            for row in table_rows:
+                table = str(row[0])
+                column_rows = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+                output[table] = tuple(str(column[1]) for column in column_rows if str(column[1]).strip())
     except sqlite3.Error:
-        return ()
-    return tuple(str(row[0]) for row in rows)
+        return {}
+    return output
 
 
 def _csv_columns(path: Path) -> tuple[str, ...]:
@@ -109,8 +114,13 @@ def build_inventory(context_dir: Path) -> dict[str, SourceRef]:
         columns: tuple[str, ...] = ()
         metadata: dict[str, Any] = {}
         if data_form == "sqlite_database":
-            tables = _sqlite_tables(path)
+            columns_by_table = _sqlite_table_columns(path)
+            tables = tuple(columns_by_table)
             metadata["table_count"] = len(tables)
+            metadata["columns_by_table"] = {
+                table: list(columns)
+                for table, columns in columns_by_table.items()
+            }
         elif data_form == "csv_records":
             columns = _csv_columns(path)
             metadata["column_count"] = len(columns)

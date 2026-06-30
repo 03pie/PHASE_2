@@ -20,9 +20,11 @@ from data_agent_baseline.evidence_agent.codex_loop.document_agent import (
     DocumentAgent,
 )
 from data_agent_baseline.evidence_agent.codex_loop.protocol import (
+    AnswerContract,
     Evidence,
     LoopState,
     ModelAction,
+    SemanticSelection,
     SourceRef,
     ToolSpec,
 )
@@ -211,6 +213,7 @@ def _project_compute_answer(
     *,
     compute_columns: tuple[str, ...],
     compute_rows: tuple[tuple[Any, ...], ...],
+    row_indices: tuple[int, ...] | None = None,
 ) -> tuple[list[str], list[list[Any]]] | None:
     if not isinstance(answer, dict):
         return None
@@ -222,7 +225,54 @@ def _project_compute_answer(
     if not all(column in index_by_name for column in requested):
         return None
     indexes = [index_by_name[column] for column in requested]
-    return requested, [[row[index] for index in indexes] for row in compute_rows]
+    selected_rows = (
+        tuple(compute_rows[index] for index in row_indices)
+        if row_indices is not None
+        else compute_rows
+    )
+    return requested, [[row[index] for index in indexes] for row in selected_rows]
+
+
+def _row_indices_from_answer(answer: Any, *, row_count: int) -> tuple[tuple[int, ...] | None, list[str]]:
+    if not isinstance(answer, dict) or "row_indices" not in answer:
+        return None, []
+    raw = answer.get("row_indices")
+    if not isinstance(raw, list):
+        return None, ["row_indices_not_list"]
+    if not raw:
+        return None, ["row_indices_empty"]
+    indexes: list[int] = []
+    errors: list[str] = []
+    for position, item in enumerate(raw):
+        try:
+            index = int(item)
+        except (TypeError, ValueError):
+            errors.append(f"row_index_not_integer:{position}")
+            continue
+        if index < 0 or index >= row_count:
+            errors.append(f"row_index_out_of_range:{index}")
+            continue
+        indexes.append(index)
+    if errors:
+        return None, errors
+    return tuple(indexes), []
+
+
+def _record_columns(records: Any) -> list[str]:
+    if not isinstance(records, list):
+        return []
+    columns: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for column in record:
+            text = str(column).strip()
+            if not text or text == "provenance" or text in seen:
+                continue
+            seen.add(text)
+            columns.append(text)
+    return columns
 
 
 def _source_negative_scope(
@@ -263,6 +313,75 @@ def _string_list(value: Any) -> tuple[str, ...]:
     return ()
 
 
+def _helper_fields_from_arguments(value: Any) -> dict[str, tuple[str, ...]]:
+    if not isinstance(value, dict):
+        return {}
+    helper_fields: dict[str, tuple[str, ...]] = {}
+    for role, raw_fields in value.items():
+        role_text = str(role).strip()
+        fields = _string_list(raw_fields)
+        if not role_text or not fields:
+            continue
+        helper_fields[role_text] = fields
+    return helper_fields
+
+
+def _field_roles_from_arguments(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        return ()
+    roles: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        role = str(item.get("role") or "").strip()
+        if not field or not role:
+            continue
+        roles.append(
+            {
+                **dict(item),
+                "field": field,
+                "role": role,
+                "semantic_card_ids": list(_string_list(item.get("semantic_card_ids"))),
+                "semantic_field": str(item.get("semantic_field") or "").strip(),
+                "reason": str(item.get("reason") or "").strip(),
+            }
+        )
+    return tuple(roles)
+
+
+def _contract_document_fields(contract: AnswerContract) -> tuple[str, ...]:
+    fields: list[str] = []
+    fields.extend(contract.final_outputs or contract.requested_outputs)
+    for values in contract.helper_fields.values():
+        fields.extend(values)
+    if isinstance(contract.document_policy, dict):
+        fields.extend(_string_list(contract.document_policy.get("required_fields")))
+    for item in contract.field_roles:
+        fields.extend(_string_list(item.get("semantic_field")))
+        fields.extend(_string_list(item.get("field")))
+    return tuple(dict.fromkeys(field for field in fields if str(field).strip()))
+
+
+def _compute_error_relation_samples(state: LoopState, binding_refs: tuple[str, ...], *, limit: int = 8) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for ref in binding_refs:
+        binding = state.bindings.get(ref)
+        if binding is None:
+            continue
+        metadata = binding.metadata if isinstance(binding.metadata, dict) else {}
+        records = metadata.get("records") if isinstance(metadata.get("records"), list) else []
+        samples.append(
+            {
+                "binding_ref": ref,
+                "relation_name": binding.relation_name,
+                "allowed_columns": list(binding.allowed_columns),
+                "records": records[:limit],
+            }
+        )
+    return samples
+
+
 def _source_ids_from_refs(state: LoopState, refs: tuple[str, ...]) -> tuple[str, ...]:
     source_ids: list[str] = []
     for ref in refs:
@@ -274,11 +393,11 @@ def _source_ids_from_refs(state: LoopState, refs: tuple[str, ...]) -> tuple[str,
 
 def _card_field_id(card: Any) -> str | None:
     if isinstance(card, dict):
-        table = str(card.get("canonical_table") or "").strip()
-        field = str(card.get("canonical_field") or "").strip()
+        table = str(card.get("semantic_scope") or card.get("canonical_table") or "").strip()
+        field = str(card.get("semantic_slot") or card.get("canonical_field") or "").strip()
     else:
-        table = str(getattr(card, "canonical_table", "") or "").strip()
-        field = str(getattr(card, "canonical_field", "") or "").strip()
+        table = str(getattr(card, "semantic_scope", getattr(card, "canonical_table", "")) or "").strip()
+        field = str(getattr(card, "semantic_slot", getattr(card, "canonical_field", "")) or "").strip()
     if not table or not field:
         return None
     return f"{table}.{field}".casefold()
@@ -289,6 +408,26 @@ def _enrich_document_agent_arguments(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = dict(arguments)
+    contract = state.answer_contract
+    if contract is not None:
+        contract_fields = _contract_document_fields(contract)
+        if not _string_list(normalized.get("target_fields")) and contract_fields:
+            normalized["target_fields"] = list(contract_fields)
+        policy = dict(normalized.get("coverage_policy") or {})
+        contract_policy = dict(contract.document_policy or {})
+        if "required_fields" in contract_policy and not isinstance(contract_policy.get("required_fields"), list):
+            contract_policy.pop("required_fields", None)
+        if contract_policy:
+            policy = {**contract_policy, **policy}
+        if contract.null_policy == "preserve":
+            policy.setdefault("include_missing_records", True)
+            missing_policy = dict(policy.get("missing_value_policy") or {})
+            missing_policy.setdefault("include_missing_records", True)
+            policy["missing_value_policy"] = missing_policy
+        if policy.get("include_missing_records"):
+            policy["required_fields"] = list(_string_list(contract_policy.get("required_fields")))
+        if policy:
+            normalized["coverage_policy"] = policy
     card_by_id = {card.id: card for card in state.semantic_cards}
     card_by_field: dict[str, Any] = {}
     for card in state.semantic_cards:
@@ -315,9 +454,18 @@ def _enrich_document_agent_arguments(
     source_ids = _source_ids_from_refs(state, _string_list(arguments.get("source_candidates")))
     document_field_ids: set[str] = set()
     document_card_ids: set[str] = set()
+    selected_card_ids = (
+        set(state.semantic_selection.card_ids)
+        if state.semantic_selection is not None
+        else set()
+    )
     if source_ids:
         for mapping in state.source_mappings:
-            if mapping.source_id not in source_ids or mapping.status != "document_source":
+            if selected_card_ids and mapping.card_id not in selected_card_ids:
+                continue
+            if not selected_card_ids and not raw_cards:
+                continue
+            if mapping.source_id not in source_ids or mapping.status != "unverified_document_candidate":
                 continue
             card = card_by_id.get(mapping.card_id)
             field_id = _card_field_id(card) if card is not None else None
@@ -329,18 +477,39 @@ def _enrich_document_agent_arguments(
     if document_field_ids:
         raw_target_fields = _string_list(arguments.get("target_fields"))
         allowed_field_names = {
-            str(card_by_id[card_id].canonical_field)
+            str(card_by_id[card_id].semantic_slot)
             for card_id in document_card_ids
-            if card_id in card_by_id and card_by_id[card_id].canonical_field
+            if card_id in card_by_id and card_by_id[card_id].semantic_slot
         }
         target_fields = [
             field
             for field in raw_target_fields
             if field.casefold() in {item.casefold() for item in allowed_field_names}
         ]
+        requested_card_field_names = {
+            str(
+                card.get("semantic_slot", card.get("canonical_field", ""))
+                if isinstance(card, dict)
+                else getattr(card, "semantic_slot", getattr(card, "canonical_field", ""))
+            ).strip()
+            for card in enriched_cards
+            if _card_field_id(card) in document_field_ids
+        }
+        requested_card_field_names = {field for field in requested_card_field_names if field}
         if not target_fields:
-            target_fields = sorted(allowed_field_names)
+            target_fields = sorted(requested_card_field_names or allowed_field_names)
         normalized["target_fields"] = target_fields
+
+        target_field_names = {field.casefold() for field in target_fields}
+        for card_id in document_card_ids:
+            card = card_by_id.get(card_id)
+            semantic_slot = str(getattr(card, "semantic_slot", getattr(card, "canonical_field", "")) or "")
+            if not card or semantic_slot.casefold() not in target_field_names:
+                continue
+            if card.id in seen_card_ids:
+                continue
+            seen_card_ids.add(card.id)
+            enriched_cards.append(card)
 
         filtered_cards: list[Any] = []
         seen_filtered_ids: set[str] = set()
@@ -357,6 +526,21 @@ def _enrich_document_agent_arguments(
         enriched_cards = filtered_cards
 
     if enriched_cards:
+        semantic_field_names = {
+            str(
+                card.get("semantic_slot", card.get("canonical_field", ""))
+                if isinstance(card, dict)
+                else getattr(card, "semantic_slot", getattr(card, "canonical_field", ""))
+            ).strip()
+            for card in enriched_cards
+        }
+        semantic_field_names = {field for field in semantic_field_names if field}
+        raw_target_fields = _string_list(arguments.get("target_fields"))
+        if semantic_field_names and raw_target_fields:
+            semantic_norms = {field.casefold() for field in semantic_field_names}
+            raw_norms = {field.casefold() for field in raw_target_fields}
+            if not (semantic_norms & raw_norms):
+                normalized["target_fields"] = sorted(semantic_field_names)
         normalized["semantic_cards"] = [
             card.to_dict() if hasattr(card, "to_dict") else dict(card)
             for card in enriched_cards
@@ -368,34 +552,13 @@ def _source_evidence_refs(state: LoopState, source_ids: tuple[str, ...]) -> tupl
     refs: list[str] = []
     for evidence in state.evidence.values():
         if evidence.source_id in source_ids and evidence.ok and evidence.tool_name not in {
-            "verify_alignment",
-            "track_requirements",
+            "declare_answer_contract",
+            "select_semantic_cards",
             "bind",
             "submit_final",
         }:
             refs.append(evidence.id)
     return tuple(dict.fromkeys(refs))
-
-
-def _compute_has_candidate_answer_verification(state: LoopState, compute_ref: str) -> bool:
-    for evidence in state.evidence.values():
-        if evidence.tool_name != "verify_alignment" or not evidence.ok:
-            continue
-        payload = evidence.payload or {}
-        if payload.get("decision") != "candidate_answer":
-            continue
-        if payload.get("target_kind") not in {"compute_result", "final_answer"}:
-            continue
-        refs = {
-            str(ref)
-            for ref in [
-                *(payload.get("compute_refs") or []),
-                *(payload.get("target_refs") or []),
-            ]
-        }
-        if compute_ref in refs:
-            return True
-    return False
 
 
 class EvidenceActionRegistry:
@@ -411,8 +574,8 @@ class EvidenceActionRegistry:
             "run_document_agent": self._run_document_agent,
             "inspect_relation": self._inspect_relation,
             "discover_join_paths": self._discover_join_paths,
-            "track_requirements": self._track_requirements,
-            "verify_alignment": self._verify_alignment,
+            "declare_answer_contract": self._declare_answer_contract,
+            "select_semantic_cards": self._select_semantic_cards,
             "run_verified_compute": self._run_verified_compute,
             "submit_final": self._submit_final,
             "inspect_video": self._inspect_video,
@@ -439,16 +602,16 @@ class EvidenceActionRegistry:
                 "run_document_agent", "Delegate PDF/MD evidence work to DocumentAgent."
             ),
             "inspect_relation": ToolSpec(
-                "inspect_relation", "Inspect verified relation schema/sample before compute or SQL repair."
+                "inspect_relation", "Inspect verified relation schema/sample before compute or SQL changes."
             ),
             "discover_join_paths": ToolSpec(
                 "discover_join_paths", "Inspect verified relations for generic join candidates."
             ),
-            "track_requirements": ToolSpec(
-                "track_requirements", "Maintain a generic requirement coverage ledger."
+            "declare_answer_contract": ToolSpec(
+                "declare_answer_contract", "Record the LLM-declared semantic question contract."
             ),
-            "verify_alignment": ToolSpec(
-                "verify_alignment", "Record structured verifier decisions over cited evidence."
+            "select_semantic_cards": ToolSpec(
+                "select_semantic_cards", "Record the LLM-selected semantic knowledge cards."
             ),
             "run_verified_compute": ToolSpec(
                 "run_verified_compute", "Run SQL over verified relation bindings."
@@ -503,7 +666,7 @@ class EvidenceActionRegistry:
             ok=True,
             summary=f"Observed {len(sources)} context source(s).",
             payload={"sources": sources},
-            allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source"),
+            allowed_next_tools=("declare_answer_contract", "retrieve_knowledge", "locate_sources", "inspect_source"),
         )
 
     def _retrieve_knowledge(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -596,8 +759,8 @@ class EvidenceActionRegistry:
                     "id": card.id,
                     "kind": card.kind,
                     "name": card.name,
-                    "canonical_table": card.canonical_table,
-                    "canonical_field": card.canonical_field,
+                    "semantic_scope": card.semantic_scope,
+                    "semantic_slot": card.semantic_slot,
                     "unit": card.unit,
                     "record_grain": card.record_grain,
                 }
@@ -626,8 +789,8 @@ class EvidenceActionRegistry:
                             [
                                 card.name,
                                 card.kind,
-                                card.canonical_table,
-                                card.canonical_field or "",
+                                card.semantic_scope,
+                                card.semantic_slot or "",
                                 card.definition,
                                 *card.aliases,
                             ]
@@ -649,12 +812,12 @@ class EvidenceActionRegistry:
                     "missing_card_ids": missing_card_ids,
                     "card_count": len(state.semantic_cards),
                     "usage_note": (
-                        "Semantic cards define canonical meaning, aliases, units, grain, formulas, and ambiguity rules. "
+                        "Semantic cards define meaning, aliases, units, grain, formulas, and ambiguity rules. "
                         "They do not define physical source format; use locate_sources for source candidates."
                     ),
                 },
                 negative_scope={"kind": "missing_semantic_knowledge"} if not state.semantic_cards else None,
-                allowed_next_tools=("retrieve_knowledge", "locate_sources", "inspect_source", "run_document_agent"),
+                allowed_next_tools=("select_semantic_cards", "retrieve_knowledge", "locate_sources", "inspect_source", "run_document_agent"),
             )
         if not sections:
             return state.add_evidence(
@@ -765,51 +928,41 @@ class EvidenceActionRegistry:
         query_norms = {_normalize(token) for token in tokens + [query] if _normalize(token)}
         candidates = []
         semantic_plan: list[dict[str, Any]] = []
-        matched_card_ids = {card.id for card in state.matched_semantic_cards}
+        selected_card_ids = (
+            set(state.semantic_selection.card_ids)
+            if state.semantic_selection is not None
+            else set()
+        )
         seen_semantic_candidates: set[tuple[str, str, str]] = set()
 
         for card in state.semantic_cards:
-            canonical_field = str(card.canonical_field or "").strip()
-            if not canonical_field:
+            if card.id not in selected_card_ids:
                 continue
-            canonical_id = f"{card.canonical_table}.{canonical_field}".casefold()
-            card_haystack = " ".join(
-                [
-                    card.name,
-                    card.kind,
-                    card.canonical_table,
-                    canonical_field,
-                    card.definition,
-                    *(card.aliases or ()),
-                ]
-            )
-            card_norm = _normalize(card_haystack)
-            relevant = card.id in matched_card_ids or any(
-                token and token in card_norm for token in query_norms
-            )
-            if not relevant:
+            semantic_slot = str(card.semantic_slot or "").strip()
+            if not semantic_slot:
                 continue
+            semantic_slot_id = f"{card.semantic_scope}.{semantic_slot}".casefold()
             mappings = [mapping for mapping in state.source_mappings if mapping.card_id == card.id]
             if not mappings:
                 continue
             mapping_payloads: list[dict[str, Any]] = []
             for mapping in mappings:
-                preferred = mapping.status in {"exact_structured_source", "document_source"}
+                preferred = mapping.status in {"unverified_structured_candidate", "unverified_document_candidate"}
                 mapping_payload = {
                     **mapping.to_dict(),
-                    "canonical_field": canonical_id,
-                    "binding_priority": "preferred" if preferred else "fallback_only",
+                    "semantic_slot_id": semantic_slot_id,
+                    "binding_priority": "grounding_candidate" if preferred else "lexical_candidate",
                     "recommended_tool": (
                         "run_document_agent"
-                        if mapping.status == "document_source"
+                        if mapping.status == "unverified_document_candidate"
                         else "inspect_source"
-                        if mapping.status == "exact_structured_source"
+                        if mapping.status == "unverified_structured_candidate"
                         else "retrieve_knowledge"
                     ),
                     "usage_note": (
-                        "Preferred mapping for this canonical field."
+                        "Grounding candidate for this semantic field; inspect/sample or extract before binding."
                         if preferred
-                        else "Fallback candidates are lexical hints only; do not bind as this canonical field without explicit semantic_contract proof."
+                        else "Lexical candidate only; bind it as this canonical field only after the LLM declares semantic/grain alignment from observed evidence."
                     ),
                 }
                 mapping_payloads.append(mapping_payload)
@@ -826,15 +979,15 @@ class EvidenceActionRegistry:
                     data_form=mapping.data_form or (source.data_form if source else "unknown_file"),
                     match_reason=f"semantic_{mapping.status}: {mapping.match_reason}",
                     path=mapping.source_path,
-                    table=mapping.matched_table,
-                    field=mapping.matched_field,
+                    table=mapping.physical_table,
+                    field=mapping.physical_field,
                 ).to_dict()
                 candidate.update(
                     {
                         "semantic_card_id": card.id,
-                        "canonical_field": canonical_id,
+                        "semantic_slot_id": semantic_slot_id,
                         "mapping_status": mapping.status,
-                        "binding_priority": "preferred" if preferred else "fallback_only",
+                        "binding_priority": "grounding_candidate" if preferred else "lexical_candidate",
                         "recommended_tool": mapping_payload["recommended_tool"],
                         "usage_note": mapping_payload["usage_note"],
                     }
@@ -843,12 +996,12 @@ class EvidenceActionRegistry:
             semantic_plan.append(
                 {
                     "card_id": card.id,
-                    "canonical_field": canonical_id,
-                    "canonical_table": card.canonical_table,
-                    "field": canonical_field,
+                    "semantic_slot_id": semantic_slot_id,
+                    "semantic_scope": card.semantic_scope,
+                    "semantic_slot": semantic_slot,
                     "unit": card.unit,
                     "record_grain": card.record_grain,
-                    "source_mappings": mapping_payloads,
+                    "grounding_candidates": mapping_payloads,
                 }
             )
 
@@ -901,8 +1054,8 @@ class EvidenceActionRegistry:
             tool_name="locate_sources",
             ok=True,
             summary=(
-                f"Located {len(candidates)} candidate(s). Semantic preferred mappings are listed "
-                "before lexical candidates; candidates are not bindings."
+                f"Located {len(candidates)} candidate(s). Semantic grounding candidates are listed "
+                "before lexical inventory candidates; candidates are not bindings."
             ),
             payload={
                 "query": query,
@@ -910,9 +1063,10 @@ class EvidenceActionRegistry:
                 "semantic_source_plan": semantic_plan[:24],
                 "candidates": candidates[:80],
                 "usage_note": (
-                    "Use semantic_source_plan preferred mappings for knowledge-defined fields before "
-                    "substituting similarly named tables/columns. Fallback candidates require explicit "
-                    "semantic_contract proof."
+                    "Use semantic_source_plan as grounding candidates for knowledge-defined fields. "
+                    "Before bind/compute, inspect/sample structured candidates or run DocumentAgent for "
+                    "document candidates. Lexical candidates can be bound only after observed evidence "
+                    "and explicit LLM-declared semantic mappings."
                 ),
             },
             negative_scope=(
@@ -1218,7 +1372,6 @@ class EvidenceActionRegistry:
                 "inspect_source",
                 "sample_records",
                 "search_values",
-                "verify_alignment",
                 "bind",
                 "locate_sources",
             ),
@@ -1234,13 +1387,42 @@ class EvidenceActionRegistry:
         source_refs = payload.get("source_refs") if isinstance(payload.get("source_refs"), list) else []
         source_id = str(source_refs[0]) if len(source_refs) == 1 else None
         source = state.sources.get(source_id or "")
-        partial_coverage = bool(payload.get("remaining_risks")) or bool(payload.get("ambiguous_slice_ids"))
+        coverage = payload.get("coverage_summary") if isinstance(payload.get("coverage_summary"), dict) else {}
+        partial_coverage = (
+            int(coverage.get("processed_slice_count") or 0)
+            < int(coverage.get("total_slice_count") or 0)
+            if coverage.get("total_slice_count") is not None
+            else False
+        )
+        remaining_risks = payload.get("remaining_risks") if isinstance(payload.get("remaining_risks"), list) else []
+        unresolved_doc_risks = {
+            "partial_document_coverage",
+            "unresolved_candidate_document_slices",
+            "ambiguous_document_slices",
+            "document_scan_validation_failed",
+        }
+        partial_coverage = partial_coverage or any(str(risk) in unresolved_doc_risks for risk in remaining_risks)
         payload["partial_coverage"] = partial_coverage
         payload["doc_task"] = task.to_dict()
+        payload["record_fields"] = list(_record_columns(records))
+        payload["provenance"] = [
+            record.get("provenance")
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("provenance"), dict)
+        ]
+        payload["processed_slice_count"] = coverage.get("processed_slice_count")
+        payload["total_slice_count"] = coverage.get("total_slice_count")
+        payload["unresolved_slices"] = payload.get("uncertain_slices") or []
+        payload["coverage_notes"] = {
+            "remaining_risks": payload.get("remaining_risks") or [],
+            "validation_warnings": payload.get("validation_warnings") or [],
+        }
         evidence_ref = f"ev_{state._evidence_seq + 1:04d}"
+        uncertain_slices = payload.get("uncertain_slices") if isinstance(payload.get("uncertain_slices"), list) else []
         summary = (
             f"DocumentAgent returned {len(records)} validated record(s) "
-            f"from {len(source_refs)} document source(s)."
+            f"from {len(source_refs)} document source(s)"
+            f" with {len(uncertain_slices)} uncertain slice(s)."
         )
         return state.add_evidence(
             tool_name="run_document_agent",
@@ -1257,14 +1439,14 @@ class EvidenceActionRegistry:
                 if payload.get("remaining_risks")
                 else None
             ),
-            allowed_next_tools=("verify_alignment", "bind", "run_document_agent", "locate_sources", "blocked"),
+            allowed_next_tools=("bind", "run_document_agent", "locate_sources", "blocked"),
             recommended_next_actions=(
                 {
                     "tool_name": "bind",
                     "arguments": {
                         "binding_type": "document_record_set",
                         "evidence_refs": [evidence_ref],
-                        "allowed_columns": list((records[0] or {}).keys()) if records else [],
+                        "allowed_columns": _record_columns(records),
                         "alignment": "Bind validated DocumentAgent records if they satisfy the target semantic fields.",
                     },
                     "reason": "Bind the document record set only when records and coverage are sufficient.",
@@ -1274,404 +1456,184 @@ class EvidenceActionRegistry:
             else (),
         )
 
-    def _track_requirements(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        raw_requirements = arguments.get("requirements")
-        if not isinstance(raw_requirements, list) or not raw_requirements:
-            return state.add_evidence(
-                tool_name="track_requirements",
-                ok=False,
-                summary="track_requirements requires at least one requirement item.",
-                payload={"arguments": arguments},
-                negative_scope={"kind": "invalid_tool_arguments", "tool": "track_requirements"},
-                allowed_next_tools=("track_requirements", "retrieve_knowledge", "locate_sources"),
+    def _declare_answer_contract(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        intent_summary = str(arguments.get("intent_summary") or "").strip()
+        answer_grain = str(arguments.get("answer_grain") or "").strip()
+        final_outputs = tuple(
+            str(item).strip()
+            for item in (
+                _string_list(arguments.get("final_outputs"))
+                or _string_list(arguments.get("requested_outputs"))
             )
-
-        upserted = []
-        invalid_refs: list[dict[str, Any]] = []
-        valid_statuses = {"pending", "satisfied", "not_applicable", "conflict", "blocked"}
-        for raw in raw_requirements:
-            if not isinstance(raw, dict):
-                invalid_refs.append({"item": raw, "error": "requirement_item_not_object"})
-                continue
-            text = str(raw.get("text") or "").strip()
-            if not text:
-                invalid_refs.append({"item": raw, "error": "missing_text"})
-                continue
-            requirement_id = str(raw.get("id") or "").strip() or None
-            status = str(raw.get("status") or "pending").strip()
-            if status not in valid_statuses:
-                invalid_refs.append({"item": raw, "error": f"invalid_status:{status}"})
-                continue
-            source_refs = _string_list(raw.get("source_refs"))
-            evidence_refs = _string_list(raw.get("evidence_refs"))
-            binding_refs = _string_list(raw.get("binding_refs"))
-            compute_refs = _string_list(raw.get("compute_refs"))
-
-            known_section_ids = {section.id for section in state.knowledge_sections}
-            unknown_sources = [
-                ref for ref in source_refs
-                if (
-                    (ref.startswith("src_") and ref not in state.sources)
-                    or (ref.startswith("sec_") and ref not in known_section_ids)
-                )
-            ]
-            unknown_evidence = [ref for ref in evidence_refs if ref not in state.evidence]
-            unknown_bindings = [ref for ref in binding_refs if ref not in state.bindings]
-            unknown_computes = [ref for ref in compute_refs if ref not in state.compute_results]
-            if unknown_sources or unknown_evidence or unknown_bindings or unknown_computes:
-                invalid_refs.append(
-                    {
-                        "requirement_id": requirement_id,
-                        "text": text,
-                        "unknown_sources": unknown_sources,
-                        "unknown_evidence": unknown_evidence,
-                        "unknown_bindings": unknown_bindings,
-                        "unknown_computes": unknown_computes,
-                    }
-                )
-                continue
-            if status == "satisfied" and not (evidence_refs or binding_refs or compute_refs):
-                invalid_refs.append(
-                    {
-                        "requirement_id": requirement_id,
-                        "text": text,
-                        "error": "satisfied_requirement_needs_lineage",
-                    }
-                )
-                continue
-
-            requirement = state.upsert_requirement(
-                requirement_id=requirement_id,
-                text=text,
-                status=status,
-                source_refs=source_refs,
-                evidence_refs=evidence_refs,
-                binding_refs=binding_refs,
-                compute_refs=compute_refs,
-                note=str(raw.get("note") or ""),
-            )
-            upserted.append(requirement.to_dict())
-
-        if invalid_refs:
-            return state.add_evidence(
-                tool_name="track_requirements",
-                ok=False,
-                summary="track_requirements rejected invalid requirement items or references.",
-                payload={
-                    "updated_requirements": upserted,
-                    "invalid_items": invalid_refs,
-                    "requirements": [item.to_dict() for item in state.requirements.values()],
-                },
-                negative_scope={
-                    "kind": "invalid_requirement_update",
-                    "invalid_count": len(invalid_refs),
-                },
-                allowed_next_tools=("track_requirements", "retrieve_knowledge", "locate_sources"),
-            )
-
-        return state.add_evidence(
-            tool_name="track_requirements",
-            ok=True,
-            summary=f"Updated {len(upserted)} requirement(s).",
-            payload={
-                "updated_requirements": upserted,
-                "requirements": [item.to_dict() for item in state.requirements.values()],
-            },
-            allowed_next_tools=(
-                "retrieve_knowledge",
-                "locate_sources",
-                "inspect_source",
-                "run_document_agent",
-                "verify_alignment",
-                "bind",
-                "run_verified_compute",
-                "submit_final",
-                "blocked",
-            ),
+            if str(item).strip()
         )
-
-    def _verify_alignment(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
-        decision = str(arguments.get("decision") or "").strip()
-        target_kind = str(arguments.get("target_kind") or "").strip()
-        alignment = str(arguments.get("alignment") or "").strip()
-        evidence_refs = _string_list(arguments.get("evidence_refs"))
-        binding_refs = _string_list(arguments.get("binding_refs"))
-        compute_refs = _string_list(arguments.get("compute_refs"))
-        requirement_refs = _string_list(arguments.get("requirement_refs"))
-        knowledge_section_ids = _string_list(arguments.get("knowledge_section_ids"))
-        target_refs = _string_list(arguments.get("target_refs"))
-        limitations = str(arguments.get("limitations") or "").strip()
-        next_actions = arguments.get("next_actions")
-        if not isinstance(next_actions, list):
-            next_actions = []
-
-        evidence_refs = tuple(
-            dict.fromkeys(
-                [
-                    *evidence_refs,
-                    *(ref for ref in target_refs if ref in state.evidence),
-                ]
-            )
-        )
-        binding_refs = tuple(
-            dict.fromkeys(
-                [
-                    *binding_refs,
-                    *(ref for ref in target_refs if ref in state.bindings),
-                ]
-            )
-        )
-        compute_refs = tuple(
-            dict.fromkeys(
-                [
-                    *compute_refs,
-                    *(ref for ref in target_refs if ref in state.compute_results),
-                ]
-            )
-        )
-        requirement_refs = tuple(
-            dict.fromkeys(
-                [
-                    *requirement_refs,
-                    *(ref for ref in target_refs if ref in state.requirements),
-                ]
-            )
-        )
-        knowledge_section_ids = tuple(
-            dict.fromkeys(
-                [
-                    *knowledge_section_ids,
-                    *(
-                        ref
-                        for ref in target_refs
-                        if any(section.id == ref for section in state.knowledge_sections)
-                    ),
-                ]
-            )
-        )
-        if decision in {"bindable", "candidate_answer"} and not evidence_refs:
-            source_refs = tuple(ref for ref in target_refs if ref in state.sources)
-            if source_refs:
-                evidence_refs = _source_evidence_refs(state, source_refs)
-
-        valid_decisions = {
-            "bindable",
-            "candidate_answer",
-            "intermediate",
-            "not_applicable",
-            "needs_more_evidence",
-            "conflict",
-            "blocked_ok",
-        }
-        valid_target_kinds = {
-            "source",
-            "field",
-            "document_window",
-            "document_record_set",
-            "compute_result",
-            "direct_evidence",
-            "alternative_source",
-            "requirement",
-            "blocked",
-            "final_answer",
+        requested_outputs = final_outputs
+        raw_constraints = arguments.get("constraints")
+        constraints = tuple(
+            dict(item)
+            for item in raw_constraints
+            if isinstance(item, dict)
+        ) if isinstance(raw_constraints, list) else ()
+        operations = dict(arguments.get("operations")) if isinstance(arguments.get("operations"), dict) else {}
+        helper_fields = _helper_fields_from_arguments(arguments.get("helper_fields"))
+        field_roles = _field_roles_from_arguments(arguments.get("field_roles"))
+        row_shape = str(arguments.get("row_shape") or operations.get("row_shape") or "preserve_rows").strip()
+        null_policy = str(arguments.get("null_policy") or "preserve").strip()
+        unresolved_terms = _string_list(arguments.get("unresolved_terms"))
+        valid_row_shapes = {"preserve_rows", "single_row", "top_n", "aggregate"}
+        valid_null_policies = {
+            "preserve",
+            "filter_when_metric_requires",
+            "filter_when_question_requests_non_empty",
         }
         invalid: list[str] = []
-        if decision not in valid_decisions:
-            invalid.append(f"invalid_decision:{decision}")
-        if target_kind not in valid_target_kinds:
-            invalid.append(f"invalid_target_kind:{target_kind}")
-        if not alignment:
-            invalid.append("missing_alignment")
-
-        unknown_evidence = [ref for ref in evidence_refs if ref not in state.evidence]
-        unknown_bindings = [ref for ref in binding_refs if ref not in state.bindings]
-        unknown_computes = [ref for ref in compute_refs if ref not in state.compute_results]
-        unknown_requirements = [ref for ref in requirement_refs if ref not in state.requirements]
-        unknown_sections = [
-            ref for ref in knowledge_section_ids
-            if not any(section.id == ref for section in state.knowledge_sections)
-        ]
-        if unknown_evidence:
-            invalid.append("unknown_evidence:" + ",".join(unknown_evidence))
-        if unknown_bindings:
-            invalid.append("unknown_bindings:" + ",".join(unknown_bindings))
-        if unknown_computes:
-            invalid.append("unknown_computes:" + ",".join(unknown_computes))
-        if unknown_requirements:
-            invalid.append("unknown_requirements:" + ",".join(unknown_requirements))
-        if unknown_sections:
-            invalid.append("unknown_knowledge_sections:" + ",".join(unknown_sections))
-
-        failed_evidence = [
-            ref for ref in evidence_refs
-            if ref in state.evidence and not state.evidence[ref].ok
-        ]
-        failed_computes = [
-            ref for ref in compute_refs
-            if ref in state.compute_results and not state.compute_results[ref].ok
-        ]
-        if decision in {"bindable", "candidate_answer"}:
-            if not (evidence_refs or binding_refs or compute_refs):
-                invalid.append("positive_verification_needs_lineage")
-            if failed_evidence:
-                invalid.append("positive_verification_cites_failed_evidence:" + ",".join(failed_evidence))
-            if failed_computes:
-                invalid.append("positive_verification_cites_failed_compute:" + ",".join(failed_computes))
-        if decision == "candidate_answer":
-            empty_computes = [
-                ref for ref in compute_refs
-                if ref in state.compute_results and not state.compute_results[ref].rows
-            ]
-            if empty_computes:
-                invalid.append("candidate_answer_cites_empty_compute:" + ",".join(empty_computes))
-        if decision == "blocked_ok" and not (evidence_refs or limitations or state.negative_scopes):
-            invalid.append("blocked_ok_needs_evidence_limitations_or_negative_scope")
-
-        recommended_actions = [
-            action for action in next_actions if isinstance(action, dict)
-        ][:8]
-        if decision == "candidate_answer" and compute_refs:
-            recommended_actions.append(
-                _recommend(
-                    "submit_final",
-                    {"compute_ref": compute_refs[0]},
-                    "Submit this verified compute candidate if it is the final requested answer.",
-                )
-            )
-        elif decision == "candidate_answer" and binding_refs:
-            binding = state.bindings.get(binding_refs[0])
-            recommended_actions.append(
-                _recommend(
-                    "submit_final",
-                    {
-                        "binding_refs": [binding_refs[0]],
-                        "evidence_refs": list(binding.evidence_refs) if binding else list(evidence_refs),
-                        "answer": {},
-                    },
-                    "Submit a direct answer table only if the verified binding fully supports the answer.",
-                )
-            )
-        elif decision == "bindable" and evidence_refs:
-            recommended_actions.append(
-                _recommend(
-                    "bind",
-                    {"evidence_refs": list(evidence_refs), "alignment": alignment},
-                    "Create a binding with the appropriate generic binding_type if this evidence is ready to execute or finalize.",
-                )
-            )
-        elif decision in {"intermediate", "needs_more_evidence"}:
-            if target_kind in {"document_window", "direct_evidence"} and evidence_refs:
-                recommended_actions.append(
-                    _recommend(
-                        "run_document_agent",
-                        {"question": state.question},
-                        "Delegate remaining PDF/MD evidence work to DocumentAgent instead of extracting records in the main loop.",
-                    )
-                )
-            if requirement_refs:
-                recommended_actions.append(
-                    _recommend(
-                        "track_requirements",
-                        {
-                            "requirements": [
-                                {
-                                    "id": ref,
-                                    "text": state.requirements[ref].text,
-                                    "status": "pending",
-                                    "note": limitations or alignment,
-                                }
-                                for ref in requirement_refs
-                                if ref in state.requirements
-                            ]
-                        },
-                        "Keep unresolved requirements explicit before gathering more evidence.",
-                    )
-                )
-            recommended_actions.append(
-                _recommend(
-                    "locate_sources",
-                    {"query": state.question},
-                    "Search for alternative observed sources when current evidence is only intermediate.",
-                )
-            )
-        elif decision == "blocked_ok":
-            recommended_actions.append(
-                _recommend(
-                    "blocked",
-                    {"reason": alignment, "evidence_refs": list(evidence_refs)},
-                    "Stop with cited evidence if no valid evidence path remains.",
-                )
-            )
-        elif decision in {"not_applicable", "conflict"}:
-            recommended_actions.append(
-                _recommend(
-                    "locate_sources",
-                    {"query": state.question},
-                    "Switch to alternative sources or evidence after rejecting this target.",
-                )
-            )
-
-        payload = {
-            "decision": decision,
-            "target_kind": target_kind,
-            "target_refs": list(target_refs),
-            "requirement_refs": list(requirement_refs),
-            "knowledge_section_ids": list(knowledge_section_ids),
-            "evidence_refs": list(evidence_refs),
-            "binding_refs": list(binding_refs),
-            "compute_refs": list(compute_refs),
-            "alignment": alignment,
-            "limitations": limitations,
-            "next_actions": recommended_actions,
-        }
+        if not intent_summary:
+            invalid.append("intent_summary")
+        if not answer_grain:
+            invalid.append("answer_grain")
+        if not final_outputs:
+            invalid.append("final_outputs")
+        if raw_constraints is not None and not isinstance(raw_constraints, list):
+            invalid.append("constraints")
+        if "operations" in arguments and not isinstance(arguments.get("operations"), dict):
+            invalid.append("operations")
+        if row_shape not in valid_row_shapes:
+            invalid.append(f"row_shape:{row_shape}")
+        if null_policy not in valid_null_policies:
+            invalid.append(f"null_policy:{null_policy}")
+        document_policy = (
+            dict(arguments.get("document_policy"))
+            if isinstance(arguments.get("document_policy"), dict)
+            else {}
+        )
+        if "required_fields" in document_policy and not isinstance(document_policy.get("required_fields"), list):
+            document_policy.pop("required_fields", None)
         if invalid:
             return state.add_evidence(
-                tool_name="verify_alignment",
+                tool_name="declare_answer_contract",
                 ok=False,
-                summary="Verifier decision rejected: " + "; ".join(invalid),
-                payload={**payload, "invalid": invalid},
+                summary="declare_answer_contract rejected invalid or incomplete contract fields.",
+                payload={"arguments": arguments, "invalid_fields": invalid},
                 negative_scope={
-                    "kind": "invalid_verifier_decision",
-                    "decision": decision,
-                    "target_kind": target_kind,
-                    "invalid": invalid,
+                    "kind": "invalid_answer_contract",
+                    "invalid_fields": invalid,
                 },
-                allowed_next_tools=(
-                    "verify_alignment",
-                    "track_requirements",
-                    "inspect_relation",
-                    "run_verified_compute",
-                    "blocked",
-                ),
+                allowed_next_tools=("declare_answer_contract", "retrieve_knowledge", "locate_sources"),
             )
-
-        negative_scope = None
-        if decision in {"not_applicable", "conflict", "blocked_ok"}:
-            negative_scope = {
-                "kind": f"verifier_{decision}",
-                "target_kind": target_kind,
-                "target_refs": list(target_refs),
-                "evidence_refs": list(evidence_refs),
-                "binding_refs": list(binding_refs),
-                "compute_refs": list(compute_refs),
-            }
+        raw_limit = arguments.get("n", arguments.get("row_limit"))
+        if raw_limit in {None, ""}:
+            raw_limit = operations.get("top_n")
+        row_limit: int | None = None
+        if raw_limit not in {None, ""}:
+            try:
+                row_limit = int(raw_limit)
+            except (TypeError, ValueError):
+                row_limit = None
+            if row_limit is not None and row_limit < 1:
+                row_limit = None
+        contract = AnswerContract(
+            intent_summary=intent_summary,
+            answer_grain=answer_grain,
+            final_outputs=final_outputs,
+            requested_outputs=requested_outputs,
+            constraints=constraints,
+            operations=operations,
+            helper_fields=helper_fields,
+            field_roles=field_roles,
+            row_shape=row_shape,
+            row_limit=row_limit,
+            null_policy=null_policy,
+            transform_intent=str(arguments.get("transform_intent") or "").strip(),
+            document_policy=document_policy,
+            unresolved_terms=unresolved_terms,
+            notes=str(arguments.get("notes") or "").strip(),
+        )
+        state.answer_contract = contract
         return state.add_evidence(
-            tool_name="verify_alignment",
+            tool_name="declare_answer_contract",
             ok=True,
-            summary=f"Verifier marked {target_kind} as {decision}.",
-            payload=payload,
-            negative_scope=negative_scope,
+            summary="Recorded LLM-declared semantic question contract.",
+            payload={"answer_contract": contract.to_dict()},
             allowed_next_tools=(
+                "retrieve_knowledge",
+                "select_semantic_cards",
+                "locate_sources",
+                "inspect_source",
+                "sample_records",
+                "run_document_agent",
                 "bind",
-                "track_requirements",
-                "inspect_relation",
                 "run_verified_compute",
                 "submit_final",
-                "locate_sources",
-                "run_document_agent",
                 "blocked",
             ),
-            recommended_next_actions=tuple(recommended_actions[:8]),
+        )
+
+    def _select_semantic_cards(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
+        raw_card_ids = _string_list(arguments.get("card_ids"))
+        rationale = str(arguments.get("rationale") or "").strip()
+        unmapped_intents = tuple(
+            str(item).strip()
+            for item in _string_list(arguments.get("unmapped_intents"))
+            if str(item).strip()
+        )
+        card_by_id = {card.id: card for card in state.semantic_cards}
+        selected_cards = [card_by_id[card_id] for card_id in raw_card_ids if card_id in card_by_id]
+        missing_card_ids = [card_id for card_id in raw_card_ids if card_id not in card_by_id]
+        if not selected_cards and not unmapped_intents:
+            state.semantic_selection_errors.append("select_semantic_cards requires card_ids or unmapped_intents")
+            return state.add_evidence(
+                tool_name="select_semantic_cards",
+                ok=False,
+                summary="select_semantic_cards requires at least one known card_id or unmapped_intents.",
+                payload={
+                    "arguments": arguments,
+                    "missing_card_ids": missing_card_ids,
+                },
+                negative_scope={
+                    "kind": "invalid_semantic_selection",
+                    "missing_card_ids": missing_card_ids,
+                },
+                allowed_next_tools=("retrieve_knowledge", "select_semantic_cards", "locate_sources"),
+            )
+        selected_ids = tuple(card.id for card in selected_cards)
+        selected_mappings = [
+            mapping for mapping in state.source_mappings if mapping.card_id in selected_ids
+        ]
+        state.semantic_selection = SemanticSelection(
+            card_ids=selected_ids,
+            selected_cards=tuple(card.to_dict() for card in selected_cards),
+            rationale=rationale,
+            unmapped_intents=unmapped_intents,
+        )
+        state.selected_source_mappings = selected_mappings
+        payload = {
+            "semantic_selection": state.semantic_selection.to_dict(),
+            "missing_card_ids": missing_card_ids,
+            "selected_source_mappings": [mapping.to_dict() for mapping in selected_mappings],
+            "usage_note": (
+                "Only these selected cards are eligible for automatic source candidate expansion. "
+                "For unmapped intents, use locate_sources/search_values over observed inventory."
+            ),
+        }
+        return state.add_evidence(
+            tool_name="select_semantic_cards",
+            ok=True,
+            summary=(
+                f"Selected {len(selected_cards)} semantic card(s) and "
+                f"{len(selected_mappings)} source candidate mapping(s)."
+            ),
+            payload=payload,
+            allowed_next_tools=(
+                "locate_sources",
+                "inspect_source",
+                "sample_records",
+                "search_values",
+                "run_document_agent",
+                "bind",
+                "run_verified_compute",
+                "submit_final",
+                "blocked",
+            ),
         )
 
     def _inspect_relation(self, state: LoopState, arguments: dict[str, Any]) -> Evidence:
@@ -1768,6 +1730,12 @@ class EvidenceActionRegistry:
                 "types": {str(column): str(dtype) for column, dtype in frame.dtypes.items()},
                 "row_count": int(len(frame)),
                 "sample": sample,
+                "compute_helpers": {
+                    "parse_date_key(value)": (
+                        "Returns a YYYYMMDD integer or NULL for common date strings, "
+                        "including Chinese numeral dates."
+                    ),
+                },
             },
             source_id=binding.source_id,
             allowed_next_tools=("run_verified_compute", "bind", "blocked"),
@@ -1935,7 +1903,7 @@ class EvidenceActionRegistry:
                 if not candidates
                 else None
             ),
-            allowed_next_tools=("run_verified_compute", "inspect_relation", "verify_alignment", "blocked"),
+            allowed_next_tools=("run_verified_compute", "inspect_relation", "blocked"),
             recommended_next_actions=(
                 _recommend(
                     "run_verified_compute",
@@ -1993,12 +1961,13 @@ class EvidenceActionRegistry:
                         "available_relations": [
                             {
                                 "binding_ref": item.id,
-                            "relation_name": item.relation_name,
-                            "columns": list(item.allowed_columns),
-                        }
-                        for item in state.bindings.values()
-                        if item.relation_name
-                    ],
+                                "relation_name": item.relation_name,
+                                "columns": list(item.allowed_columns),
+                            }
+                            for item in state.bindings.values()
+                            if item.relation_name
+                        ],
+                        "relation_samples": _compute_error_relation_samples(state, binding_refs),
                     },
                     "sql": sql,
                 },
@@ -2010,6 +1979,14 @@ class EvidenceActionRegistry:
                 },
                 allowed_next_tools=("inspect_relation", "run_verified_compute", "blocked"),
                 recommended_next_actions=(
+                    _recommend(
+                        "run_verified_compute",
+                        {
+                            "binding_refs": list(binding_refs),
+                            "sql": "<rewrite SQL using explicit casts/string operations chosen from observed relation_samples>",
+                        },
+                        "Retry SQL using only observed relation columns and explicit transformations chosen by the LLM from the sample values.",
+                    ),
                     _recommend(
                         "inspect_relation",
                         {"binding_ref": binding_refs[0]} if binding_refs else {},
@@ -2037,26 +2014,12 @@ class EvidenceActionRegistry:
                     ),
                 )
             )
-        recommended_actions.append(
-            _recommend(
-                "verify_alignment",
-                {
-                    "decision": "candidate_answer",
-                    "target_kind": "compute_result",
-                    "compute_refs": [compute_result.id],
-                    "evidence_refs": list(evidence_refs),
-                    "binding_refs": list(binding_refs),
-                    "alignment": "<explain why this exact compute result satisfies the question and knowledge>",
-                },
-                "Classify this compute result before submit_final; final submission also requires explicit answer.columns.",
-            )
-        )
         return state.add_evidence(
             tool_name="run_verified_compute",
             ok=True,
             summary=f"Verified compute produced {len(rows)} row(s) and {len(columns)} column(s).",
             payload={"compute_ref": compute_result.id, "columns": columns, "rows": rows[:50], "sql": sql},
-            allowed_next_tools=("verify_alignment", "submit_final", "run_verified_compute", "inspect_relation"),
+            allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation"),
             recommended_next_actions=tuple(recommended_actions),
         )
 
@@ -2082,40 +2045,50 @@ class EvidenceActionRegistry:
                     negative_scope={"kind": "empty_final_compute_ref", "compute_ref": compute_ref},
                     allowed_next_tools=("run_verified_compute", "inspect_relation", "blocked"),
                 )
-            if not _compute_has_candidate_answer_verification(state, compute_ref):
+            answer_payload = arguments.get("answer")
+            row_indices, row_index_errors = _row_indices_from_answer(
+                answer_payload,
+                row_count=len(compute_result.rows),
+            )
+            if row_index_errors:
                 return state.add_evidence(
                     tool_name="submit_final",
                     ok=False,
-                    summary="Compute-backed submit_final requires a candidate_answer verify_alignment decision for this compute_ref.",
+                    summary="Compute-backed final answer has invalid row_indices.",
                     payload={
                         "compute_ref": compute_ref,
-                        "columns": list(compute_result.columns),
+                        "row_count": len(compute_result.rows),
+                        "row_index_errors": row_index_errors,
+                        "answer": answer_payload,
                     },
                     negative_scope={
-                        "kind": "unverified_compute_final",
+                        "kind": "invalid_final_row_indices",
                         "compute_ref": compute_ref,
+                        "row_index_errors": row_index_errors,
                     },
-                    allowed_next_tools=("verify_alignment", "run_verified_compute", "inspect_relation", "blocked"),
+                    allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation", "blocked"),
                     recommended_next_actions=(
                         _recommend(
-                            "verify_alignment",
+                            "submit_final",
                             {
-                                "decision": "candidate_answer",
-                                "target_kind": "compute_result",
-                                "compute_refs": [compute_ref],
-                                "evidence_refs": list(compute_result.evidence_refs),
-                                "binding_refs": list(compute_result.binding_refs),
-                                "alignment": "<explain why this exact compute result satisfies the question and knowledge>",
+                                "compute_ref": compute_ref,
+                                "answer": {
+                                    "columns": [],
+                                    "row_indices": [],
+                                },
+                                "available_columns": list(compute_result.columns),
+                                "row_count": len(compute_result.rows),
+                                "instruction": "Fill columns and zero-based row_indices from this compute result only.",
                             },
-                            "Classify this compute result before final submission.",
+                            "Retry with row_indices that exist in the cited compute result, or recompute the desired row.",
                         ),
                     ),
                 )
-            answer_payload = arguments.get("answer")
             normalized_answer = _project_compute_answer(
                 answer_payload,
                 compute_columns=compute_result.columns,
                 compute_rows=compute_result.rows,
+                row_indices=row_indices,
             )
             if normalized_answer is None and (
                 isinstance(answer_payload, list)
@@ -2128,6 +2101,23 @@ class EvidenceActionRegistry:
                 normalized_answer = _answer_table_from_payload(answer_payload)
             if normalized_answer is not None:
                 columns, rows = normalized_answer
+                if not rows:
+                    return state.add_evidence(
+                        tool_name="submit_final",
+                        ok=False,
+                        summary="Compute-backed final answer projection produced no rows.",
+                        payload={
+                            "compute_ref": compute_ref,
+                            "answer": arguments.get("answer"),
+                            "available_columns": list(compute_result.columns),
+                            "row_count": len(compute_result.rows),
+                        },
+                        negative_scope={
+                            "kind": "empty_final_projection",
+                            "compute_ref": compute_ref,
+                        },
+                        allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation", "blocked"),
+                    )
                 supported, unsupported_values = _projection_values_supported(
                     rows,
                     compute_result.rows,
@@ -2153,6 +2143,7 @@ class EvidenceActionRegistry:
                     "columns": columns,
                     "rows": rows,
                     "compute_ref": compute_ref,
+                    "row_indices": list(row_indices) if row_indices is not None else None,
                     "binding_refs": list(compute_result.binding_refs),
                     "evidence_refs": list(compute_result.evidence_refs),
                     "alignment": str(arguments.get("alignment") or ""),
@@ -2180,8 +2171,13 @@ class EvidenceActionRegistry:
                 recommended_next_actions=(
                     _recommend(
                         "submit_final",
-                        {"compute_ref": compute_ref, "answer": {"columns": list(compute_result.columns)}},
-                        "Choose the final output columns explicitly from the compute result.",
+                        {
+                            "compute_ref": compute_ref,
+                            "answer": {"columns": []},
+                            "available_columns": list(compute_result.columns),
+                            "instruction": "Fill answer.columns with requested output columns only.",
+                        },
+                        "Choose the final output columns explicitly from the compute result; do not submit all columns by default.",
                     ),
                 ),
             )

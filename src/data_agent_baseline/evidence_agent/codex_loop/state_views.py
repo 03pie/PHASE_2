@@ -1,76 +1,319 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from data_agent_baseline.evidence_agent.codex_loop.protocol import LoopState, RecoveryHint
-
-DIRECT_FINAL_BINDING_TYPES = {"document_window", "value", "operation", "answer_candidate"}
-META_EVIDENCE_TOOLS = {"verify_alignment", "track_requirements", "bind", "submit_final"}
+from data_agent_baseline.evidence_agent.codex_loop.lineage import DIRECT_FINAL_BINDING_TYPES
+from data_agent_baseline.evidence_agent.codex_loop.protocol import LoopState
 
 
-def verifier_decisions(state: LoopState) -> list[dict[str, Any]]:
-    decisions: list[dict[str, Any]] = []
-    for evidence in state.evidence.values():
-        if evidence.tool_name != "verify_alignment" or not evidence.ok:
-            continue
-        payload = evidence.payload or {}
-        decisions.append(
+def _normalize(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
+
+
+def answer_contract_view(state: LoopState) -> dict[str, Any]:
+    contract = state.answer_contract
+    if contract is None:
+        return {
+            "present": False,
+            "instruction": (
+                "No LLM-declared question contract yet. The next useful action is "
+                "declare_answer_contract with intent_summary, answer_grain, final_outputs, "
+                "constraints, operations, helper_fields, field_roles, row_shape, null_policy, "
+                "transform_intent, document_policy, and unresolved_terms. This is semantic "
+                "intent only, not a physical schema or source choice."
+            ),
+        }
+    return {
+        "present": True,
+        "contract": contract.to_dict(),
+        "instruction": (
+            "Use this as the per-turn semantic answer contract. It does not prove any "
+            "physical field/source; inspect, extract, bind, and compute from observed evidence."
+        ),
+    }
+
+
+def semantic_selection_view(state: LoopState) -> dict[str, Any]:
+    if state.semantic_selection is None:
+        return {
+            "present": False,
+            "candidate_cards": [
+                {
+                    "id": card.id,
+                    "kind": card.kind,
+                    "name": card.name,
+                    "semantic_scope": card.semantic_scope,
+                    "semantic_slot": card.semantic_slot,
+                    "definition_preview": str(card.definition or "")[:240],
+                    "unit": card.unit,
+                    "record_grain": card.record_grain,
+                }
+                for card in state.matched_semantic_cards[:12]
+            ],
+            "instruction": (
+                "No LLM semantic card selection yet. Select only knowledge cards that the "
+                "LLM judges relevant to this question; put unmatched intents in unmapped_intents."
+            ),
+            "errors": list(state.semantic_selection_errors[-5:]),
+        }
+    return {
+        "present": True,
+        "selection": state.semantic_selection.to_dict(),
+        "selected_source_mapping_count": len(state.selected_source_mappings),
+        "instruction": (
+            "Only selected cards are eligible for automatic source candidate expansion. "
+            "Use unmapped_intents with inventory/search tools."
+        ),
+    }
+
+
+def selected_source_candidates(state: LoopState) -> dict[str, Any]:
+    mappings = state.selected_source_mappings if state.semantic_selection is not None else []
+    candidates: list[dict[str, Any]] = []
+    for mapping in mappings:
+        source_status = _source_observation_status(state, mapping.source_id)
+        candidate_kind = str(mapping.status or "")
+        candidates.append(
             {
-                "evidence_ref": evidence.id,
-                "decision": payload.get("decision"),
-                "target_kind": payload.get("target_kind"),
-                "target_refs": payload.get("target_refs") or [],
-                "requirement_refs": payload.get("requirement_refs") or [],
-                "evidence_refs": payload.get("evidence_refs") or [],
-                "binding_refs": payload.get("binding_refs") or [],
-                "compute_refs": payload.get("compute_refs") or [],
-                "alignment": payload.get("alignment") or "",
-                "limitations": payload.get("limitations") or "",
+                "card_id": mapping.card_id,
+                "semantic_scope": mapping.semantic_scope,
+                "semantic_slot": mapping.semantic_slot,
+                "source_id": mapping.source_id,
+                "source_path": mapping.source_path,
+                "data_form": mapping.data_form,
+                "physical_table": mapping.physical_table,
+                "physical_field": mapping.physical_field,
+                "candidate_kind": candidate_kind,
+                "recommended_tool": (
+                    "run_document_agent"
+                    if candidate_kind == "unverified_document_candidate"
+                    else "inspect_source"
+                    if candidate_kind == "unverified_structured_candidate"
+                    else "locate_sources"
+                ),
+                **source_status,
             }
         )
-    return decisions
-
-
-def compute_result_classifications(state: LoopState) -> dict[str, dict[str, Any]]:
-    classifications: dict[str, dict[str, Any]] = {}
-    for decision in verifier_decisions(state):
-        if decision.get("target_kind") != "compute_result":
-            continue
-        refs = [str(ref) for ref in decision.get("compute_refs") or []]
-        refs.extend(
-            str(ref)
-            for ref in decision.get("target_refs") or []
-            if str(ref).startswith("comp_")
-        )
-        for compute_ref in refs:
-            classifications[compute_ref] = decision
-    return classifications
-
-
-def requirement_coverage(state: LoopState) -> dict[str, Any]:
-    requirements = [requirement.to_dict() for requirement in state.requirements.values()]
-    pending = [item for item in requirements if item.get("status") in {"pending", "", None}]
-    satisfied = [item for item in requirements if item.get("status") == "satisfied"]
-    conflicts = [item for item in requirements if item.get("status") == "conflict"]
-    blocked = [item for item in requirements if item.get("status") == "blocked"]
-    weak_satisfied = [
-        item
-        for item in satisfied
-        if not (item.get("evidence_refs") or item.get("binding_refs") or item.get("compute_refs"))
-    ]
-    return {
-        "declared_count": len(requirements),
-        "satisfied_count": len(satisfied),
-        "pending_count": len(pending),
-        "conflict_count": len(conflicts),
-        "blocked_count": len(blocked),
-        "requirements": requirements,
-        "pending_requirements": pending,
-        "conflict_requirements": conflicts,
-        "blocked_requirements": blocked,
-        "weak_satisfied_requirements": weak_satisfied,
-        "passed": not pending and not conflicts and not blocked and not weak_satisfied,
+    priority = {
+        "unverified_structured_candidate": 0,
+        "unverified_document_candidate": 1,
+        "unverified_lexical_candidate": 2,
+        "unresolved_grounding": 3,
     }
+    candidates.sort(
+        key=lambda item: (
+            item.get("coverage_status") != "unseen",
+            priority.get(str(item.get("candidate_kind") or ""), 9),
+            str(item.get("source_path") or ""),
+            str(item.get("physical_table") or ""),
+            str(item.get("physical_field") or ""),
+        )
+    )
+    return {
+        "instruction": (
+            "Selected-card source candidates only. They are grounding candidates, not proof. "
+            "Observe them with inspect_source/sample_records or run_document_agent before bind."
+        ),
+        "candidates": candidates,
+    }
+
+
+def _source_observation_status(state: LoopState, source_id: str | None) -> dict[str, Any]:
+    if not source_id:
+        return {"coverage_status": "missing_source", "evidence_refs": [], "binding_refs": []}
+    evidence_refs = [
+        evidence.id
+        for evidence in state.evidence.values()
+        if evidence.source_id == source_id and evidence.ok
+    ]
+    binding_refs = [
+        binding.id
+        for binding in state.bindings.values()
+        if binding.source_id == source_id
+    ]
+    if binding_refs:
+        status = "bound"
+    elif evidence_refs:
+        status = "observed"
+    else:
+        status = "unseen"
+    return {"coverage_status": status, "evidence_refs": evidence_refs, "binding_refs": binding_refs}
+
+
+def primary_next_action(state: LoopState) -> dict[str, Any]:
+    if state.answer_contract is None:
+        return {
+            "tool_name": "declare_answer_contract",
+            "arguments": {
+                "intent_summary": "<restate what the question asks in semantic terms>",
+                "answer_grain": "<what one answer row represents>",
+                "final_outputs": [],
+                "constraints": [
+                    {
+                        "semantic_field": "<semantic field used by a question condition>",
+                        "operator": "<semantic operator from the question>",
+                        "value": "<question value, if any>",
+                        "reason": "<why this condition is required>",
+                    }
+                ],
+                "operations": {
+                    "row_shape": "preserve_rows",
+                    "sort_by": [],
+                    "group_by": [],
+                    "aggregate": [],
+                    "top_n": None,
+                    "reason": "<semantic row operation intent>",
+                },
+                "helper_fields": {
+                    "filter_fields": [],
+                    "sort_fields": [],
+                    "join_keys": [],
+                    "row_selection_fields": [],
+                    "evidence_anchor_fields": [],
+                },
+                "field_roles": [],
+                "row_shape": "preserve_rows",
+                "null_policy": "preserve",
+                "transform_intent": (
+                    "<state semantic filters/sort/aggregation/join intent; do not put helper "
+                    "fields in final_outputs>"
+                ),
+                "document_policy": {
+                    "include_missing_records": True,
+                    "required_fields": [],
+                },
+                "unresolved_terms": [],
+            },
+            "reason": (
+                "Declare the question understanding contract before choosing knowledge cards or physical sources. "
+                "This is not a physical schema binding."
+            ),
+        }
+    if state.semantic_selection is None:
+        if state.semantic_cards:
+            return {
+                "tool_name": "select_semantic_cards",
+                "arguments": {
+                    "card_ids": [],
+                    "rationale": "<choose relevant knowledge semantic cards for this question>",
+                    "unmapped_intents": [],
+                },
+                "reason": (
+                    "Select the business semantic cards before expanding source candidates. "
+                    "Do not choose physical sources from the full knowledge catalog."
+                ),
+            }
+        return {
+            "tool_name": "locate_sources",
+            "arguments": {"query": state.question},
+            "reason": "No semantic knowledge cards are available; use observed inventory search.",
+        }
+    candidates = selected_source_candidates(state).get("candidates", [])
+    for candidate in candidates:
+        if candidate.get("coverage_status") != "unseen" or not candidate.get("source_id"):
+            continue
+        tool_name = str(candidate.get("recommended_tool") or "inspect_source")
+        if tool_name == "run_document_agent":
+            return {
+                "tool_name": "run_document_agent",
+                "arguments": {
+                    "question": state.question,
+                    "source_candidates": [candidate.get("source_id")],
+                    "target_fields": [
+                        candidate.get("semantic_slot") or candidate.get("semantic_scope") or ""
+                    ],
+                    "semantic_cards": [
+                        card
+                        for card in (
+                            state.semantic_selection.selected_cards
+                            if state.semantic_selection is not None
+                            else ()
+                        )
+                        if card.get("id") == candidate.get("card_id")
+                    ],
+                },
+                "reason": "Observe the next selected document candidate before binding.",
+            }
+        if tool_name == "inspect_source":
+            args: dict[str, Any] = {"source_ref": candidate.get("source_id")}
+            if candidate.get("physical_table"):
+                args["table"] = candidate.get("physical_table")
+            return {
+                "tool_name": "inspect_source",
+                "arguments": args,
+                "reason": "Inspect the next selected structured source candidate before binding.",
+            }
+    if state.bindings and not any(result.ok and result.rows for result in state.compute_results.values()):
+        relation_bindings = [
+            binding for binding in state.bindings.values() if binding.relation_name
+        ]
+        return {
+            "tool_name": "run_verified_compute" if relation_bindings else "submit_final",
+            "arguments": (
+                {
+                    "binding_refs": [binding.id for binding in relation_bindings],
+                    "sql": "<write SQL over relation names from verified bindings>",
+                }
+                if relation_bindings
+                else {
+                    "binding_refs": list(state.bindings),
+                    "evidence_refs": [
+                        ref
+                        for binding in state.bindings.values()
+                        for ref in binding.evidence_refs
+                    ],
+                    "answer": {"columns": [], "rows": []},
+                }
+            ),
+            "reason": "Verified bindings exist; compute or direct-final from those bindings.",
+        }
+    successful = [result for result in state.compute_results.values() if result.ok and result.rows]
+    if successful:
+        latest = successful[-1]
+        return {
+            "tool_name": "submit_final",
+            "arguments": {
+                "compute_ref": latest.id,
+                "answer": {"columns": []},
+            },
+            "reason": "A successful compute exists; submit an explicit projection or recompute if it is not the answer.",
+        }
+    return {
+        "tool_name": "locate_sources",
+        "arguments": {"query": state.question},
+        "reason": "No selected candidate remains unobserved; use inventory search for unmapped intents or block with evidence.",
+    }
+
+
+def _slot_from_field_ref(value: Any) -> str | None:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return None
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    normalized = _normalize(text)
+    return normalized or None
+
+
+def _binding_semantic_slots(binding: Any) -> set[str]:
+    slots: set[str] = set()
+    metadata = getattr(binding, "metadata", {}) or {}
+    contract = metadata.get("semantic_contract") if isinstance(metadata, dict) else None
+    if isinstance(contract, dict):
+        raw_fields = contract.get("canonical_fields")
+        if isinstance(raw_fields, list):
+            slots.update(slot for item in raw_fields if (slot := _slot_from_field_ref(item)))
+        raw_mapping = contract.get("physical_field_mapping")
+        if isinstance(raw_mapping, dict):
+            slots.update(slot for key in raw_mapping if (slot := _slot_from_field_ref(key)))
+        raw_field_mappings = contract.get("field_mappings")
+        if isinstance(raw_field_mappings, list):
+            for item in raw_field_mappings:
+                if isinstance(item, dict):
+                    slots.update(slot for key in ("canonical", "semantic", "field") if (slot := _slot_from_field_ref(item.get(key))))
+    slots.update(slot for column in getattr(binding, "allowed_columns", ()) if (slot := _slot_from_field_ref(column)))
+    return slots
 
 
 def source_coverage_map(state: LoopState) -> dict[str, Any]:
@@ -136,13 +379,6 @@ def final_output_contract(state: LoopState) -> dict[str, Any]:
             raw_rows = answer.get("rows")
             columns = raw_columns if isinstance(raw_columns, list) else list(compute.columns)
             rows = raw_rows if isinstance(raw_rows, list) else [list(row) for row in compute.rows]
-            classification = compute_result_classifications(state).get(compute_ref)
-            if classification is None:
-                issues.append("compute_result_unverified_as_final_candidate")
-            else:
-                decision = str(classification.get("decision") or "")
-                if decision in {"intermediate", "not_applicable", "needs_more_evidence", "conflict"}:
-                    issues.append(f"compute_result_classified_non_answer:{decision}")
     else:
         raw_columns = answer.get("columns")
         raw_rows = answer.get("rows")
@@ -197,11 +433,9 @@ def final_output_contract(state: LoopState) -> dict[str, Any]:
 
 def answer_candidates(state: LoopState) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    classifications = compute_result_classifications(state)
     for result in state.compute_results.values():
         if not result.ok or not result.rows:
             continue
-        classification = classifications.get(result.id)
         candidates.append(
             {
                 "kind": "compute_result",
@@ -212,7 +446,6 @@ def answer_candidates(state: LoopState) -> list[dict[str, Any]]:
                 "binding_refs": list(result.binding_refs),
                 "evidence_refs": list(result.evidence_refs),
                 "sql": result.sql,
-                "classification": classification,
             }
         )
     for binding in state.bindings.values():
@@ -271,179 +504,3 @@ def exhaustion_status(state: LoopState) -> dict[str, Any]:
     }
 
 
-def _positive_unbound_evidence(state: LoopState) -> list[dict[str, Any]]:
-    bound_evidence = {
-        evidence_ref
-        for binding in state.bindings.values()
-        for evidence_ref in binding.evidence_refs
-    }
-    output: list[dict[str, Any]] = []
-    for evidence in state.evidence.values():
-        if (
-            evidence.tool_name in META_EVIDENCE_TOOLS
-            or not evidence.ok
-            or evidence.id in bound_evidence
-            or evidence.negative_scope is not None
-        ):
-            continue
-        payload = evidence.payload or {}
-        positive = any(
-            isinstance(payload.get(key), list) and bool(payload.get(key))
-            for key in ("sample", "hits", "matches", "slice_matches", "slice_catalog", "records", "columns")
-        ) or (isinstance(payload.get("text"), str) and bool(payload["text"].strip()))
-        if positive:
-            output.append(
-                {
-                    "evidence_ref": evidence.id,
-                    "tool_name": evidence.tool_name,
-                    "summary": evidence.summary,
-                    "source_id": evidence.source_id,
-                    "data_form": evidence.data_form,
-                }
-            )
-    return output
-
-
-def recovery_hints(state: LoopState, *, limit: int = 1) -> list[RecoveryHint]:
-    hints: list[RecoveryHint] = []
-    classifications = compute_result_classifications(state)
-    for result in reversed(list(state.compute_results.values())):
-        if result.ok and result.rows:
-            if result.id in classifications and classifications[result.id].get("decision") == "candidate_answer":
-                hints.append(
-                    RecoveryHint(
-                        tool_name="submit_final",
-                        arguments={"compute_ref": result.id, "answer": {"columns": list(result.columns)}},
-                        reason="A compute result was verified as a candidate answer; submit it with explicit final columns if the columns are exactly the requested output.",
-                        source="verified_compute_candidate",
-                        priority=100,
-                    )
-                )
-            else:
-                hints.append(
-                    RecoveryHint(
-                        tool_name="verify_alignment",
-                        arguments={
-                            "decision": "candidate_answer",
-                            "target_kind": "compute_result",
-                            "compute_refs": [result.id],
-                            "binding_refs": list(result.binding_refs),
-                            "evidence_refs": list(result.evidence_refs),
-                            "alignment": "<explain whether this exact compute result satisfies the question and knowledge>",
-                        },
-                        reason="A successful compute result exists but is not verified as final; classify it before submit_final.",
-                        source="unverified_compute",
-                        priority=95,
-                    )
-                )
-            break
-    if not hints:
-        for binding in reversed(list(state.bindings.values())):
-            if binding.binding_type in DIRECT_FINAL_BINDING_TYPES:
-                hints.append(
-                    RecoveryHint(
-                        tool_name="submit_final",
-                        arguments={
-                            "binding_refs": [binding.id],
-                            "evidence_refs": list(binding.evidence_refs),
-                            "answer": {},
-                        },
-                        reason="A direct evidence binding exists; submit an explicit answer if fully supported.",
-                        source="direct_evidence_binding",
-                        priority=90,
-                    )
-                )
-                break
-    return hints[:limit]
-
-
-def _is_negative_like_evidence(state: LoopState, evidence_ref: str) -> bool:
-    evidence = state.evidence.get(evidence_ref)
-    if evidence is None:
-        return False
-    if not evidence.ok or evidence.negative_scope is not None:
-        return True
-    payload = evidence.payload or {}
-    if evidence.tool_name == "search_values" and isinstance(payload.get("hits"), list):
-        return len(payload["hits"]) == 0
-    if evidence.tool_name == "run_document_agent" and isinstance(payload.get("records"), list):
-        return len(payload["records"]) == 0
-    if evidence.tool_name == "run_verified_compute" and isinstance(payload.get("rows"), (list, tuple)):
-        return len(payload["rows"]) == 0
-    if evidence.tool_name == "verify_alignment":
-        return payload.get("decision") in {"not_applicable", "conflict", "blocked_ok"}
-    return False
-
-
-def blocked_audit(
-    state: LoopState,
-    reason: str,
-    *,
-    cited_evidence_refs: tuple[str, ...] = (),
-) -> dict[str, Any]:
-    candidates = answer_candidates(state)
-    issues: list[str] = []
-    recommendations: list[dict[str, Any]] = []
-    cited = {ref for ref in cited_evidence_refs if ref in state.evidence}
-    unknown_cited = [ref for ref in cited_evidence_refs if ref not in state.evidence]
-    cited_negative = sorted(ref for ref in cited if _is_negative_like_evidence(state, ref))
-    has_negative_context = bool(cited_negative or state.negative_scopes)
-
-    compute_candidates = [item for item in candidates if item["kind"] == "compute_result"]
-    direct_candidates = [item for item in candidates if item["kind"] == "direct_evidence_binding"]
-    if compute_candidates:
-        issues.append("successful_compute_available")
-        recommendations.extend(
-            {
-                "tool_name": "submit_final",
-                "arguments": {"compute_ref": item["compute_ref"]},
-                "reason": "Submit this compute_ref if it answers the task.",
-            }
-            for item in compute_candidates[-3:]
-        )
-    if direct_candidates:
-        issues.append("direct_evidence_binding_available")
-        recommendations.extend(
-            {
-                "tool_name": "submit_final",
-                "arguments": {
-                    "binding_refs": [item["binding_ref"]],
-                    "evidence_refs": item.get("evidence_refs") or [],
-                    "answer": {},
-                },
-                "reason": "Submit a direct answer if the verified evidence binding fully supports it.",
-            }
-            for item in direct_candidates[-3:]
-        )
-
-    positive_unbound = _positive_unbound_evidence(state)
-    uncited_positive = [
-        item for item in positive_unbound if item["evidence_ref"] not in cited
-    ]
-    if uncited_positive and not candidates and not has_negative_context:
-        issues.append("positive_unbound_evidence_available")
-
-    if unknown_cited:
-        issues.append("blocked_cites_unknown_evidence")
-    if not cited and state.evidence:
-        issues.append("blocked_without_cited_evidence")
-    if cited and not has_negative_context and not candidates:
-        issues.append("blocked_without_negative_evidence")
-    if not cited and not state.negative_scopes and not candidates and not positive_unbound:
-        issues.append("blocked_without_evidence_or_negative_scope")
-
-    return {
-        "passed": not issues,
-        "reason": reason,
-        "issues": issues,
-        "cited_evidence_refs": sorted(cited),
-        "cited_negative_evidence_refs": cited_negative,
-        "unknown_cited_evidence_refs": unknown_cited,
-        "answer_candidates": candidates[-10:],
-        "positive_unbound_evidence": positive_unbound[-10:],
-        "uncited_positive_unbound_evidence": uncited_positive[-10:],
-        "exhaustion_status": exhaustion_status(state),
-        "recovery_hints": [hint.to_dict() for hint in recovery_hints(state, limit=3)],
-        "recommended_next_actions": recommendations[:8],
-        "audit_key": "|".join(issues + sorted(cited) + unknown_cited),
-    }

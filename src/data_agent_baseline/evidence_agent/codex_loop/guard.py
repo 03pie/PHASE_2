@@ -10,12 +10,14 @@ from data_agent_baseline.evidence_agent.codex_loop.protocol import (
     ModelAction,
 )
 from data_agent_baseline.evidence_agent.codex_loop.registry import EvidenceActionRegistry
+from data_agent_baseline.evidence_agent.codex_loop.lineage import (
+    DIRECT_FINAL_BINDING_TYPES,
+    META_EVIDENCE_TOOLS,
+)
 
 _STRUCTURED_FORMS = {"sqlite_database", "csv_records", "json_records"}
 _DOCUMENT_FORMS = {"pdf_document", "markdown_document"}
-_DIRECT_FINAL_BINDING_TYPES = {"document_window", "value", "operation", "answer_candidate"}
-_BINDING_TYPES = COMPUTABLE_BINDING_TYPES | _DIRECT_FINAL_BINDING_TYPES
-_META_EVIDENCE_TOOLS = {"verify_alignment", "track_requirements", "bind", "submit_final"}
+_BINDING_TYPES = COMPUTABLE_BINDING_TYPES | set(DIRECT_FINAL_BINDING_TYPES)
 _RELATION_PATTERN = re.compile(r'\b(?:from|join)\s+("([^"]+)"|[A-Za-z_][\w]*)', re.IGNORECASE)
 _QUOTED_IDENTIFIER_PATTERN = re.compile(r'"([^"]+)"')
 
@@ -56,174 +58,116 @@ def _inspect_relation_recommendation() -> tuple[dict[str, object], ...]:
     )
 
 
-def _compute_has_candidate_answer_verification(state: LoopState, compute_ref: str) -> bool:
-    for evidence in state.evidence.values():
-        if evidence.tool_name != "verify_alignment" or not evidence.ok:
+def _document_focus_rerun_recommendation(state: LoopState, evidence_items: list[Any]) -> tuple[dict[str, object], ...]:
+    for evidence in evidence_items:
+        if evidence.tool_name != "run_document_agent":
             continue
-        payload = evidence.payload or {}
-        if payload.get("decision") != "candidate_answer":
-            continue
-        if payload.get("target_kind") not in {"compute_result", "final_answer"}:
-            continue
-        refs = {
-            str(ref)
-            for ref in [
-                *(payload.get("compute_refs") or []),
-                *(payload.get("target_refs") or []),
-            ]
+        payload = evidence.payload if isinstance(evidence.payload, dict) else {}
+        uncertain = payload.get("uncertain_slices") if isinstance(payload.get("uncertain_slices"), list) else []
+        slice_ids = [
+            str(item.get("slice_id") or "").strip()
+            for item in uncertain
+            if isinstance(item, dict) and str(item.get("slice_id") or "").strip()
+        ][:24]
+        doc_task = payload.get("doc_task") if isinstance(payload.get("doc_task"), dict) else {}
+        coverage_policy = dict(doc_task.get("coverage_policy") or {})
+        if slice_ids:
+            coverage_policy["focus_slice_ids"] = slice_ids
+            coverage_policy["scan_batch_size"] = min(max(len(slice_ids), 1), 24)
+        source_candidates = (
+            doc_task.get("source_candidates")
+            if isinstance(doc_task.get("source_candidates"), list)
+            else payload.get("source_refs")
+        )
+        target_fields = doc_task.get("target_fields") if isinstance(doc_task.get("target_fields"), list) else []
+        semantic_cards = doc_task.get("semantic_cards") if isinstance(doc_task.get("semantic_cards"), list) else []
+        arguments = {
+            "question": doc_task.get("question") or state.question,
+            "source_candidates": source_candidates or ([evidence.source_id] if evidence.source_id else []),
+            "target_fields": target_fields,
+            "semantic_cards": semantic_cards,
+            "required_record_grain": doc_task.get("required_record_grain") or "",
+            "coverage_policy": coverage_policy,
         }
-        if compute_ref in refs:
-            return True
-    return False
-
-
-def _semantic_field_id(card: Any) -> str | None:
-    table = str(getattr(card, "canonical_table", "") or "").strip()
-    field = str(getattr(card, "canonical_field", "") or "").strip()
-    if not table or not field:
-        return None
-    return f"{table}.{field}".casefold()
-
-
-def _semantic_refs_from_definition(definition: str) -> set[str]:
-    refs = {f"{left}.{right}".casefold() for left, right in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", definition)}
-    alias_to_table: dict[str, str] = {}
-    relation_pattern = re.compile(
-        r"\b(?:from|join)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?(?:\s+(?:as\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?",
-        re.IGNORECASE,
+        return (
+            {
+                "tool_name": "run_document_agent",
+                "arguments": arguments,
+                "reason": (
+                    "Resolve the unresolved document slices before binding; use focus_slice_ids "
+                    "so DocumentAgent reads only the recorded uncertain slices."
+                ),
+            },
+        )
+    return (
+        {
+            "tool_name": "run_document_agent",
+            "arguments": {"question": state.question},
+            "reason": "Rerun DocumentAgent before binding partial document evidence.",
+        },
     )
-    for match in relation_pattern.finditer(definition):
-        table = match.group(1)
-        alias = match.group(2)
-        if alias:
-            alias_to_table[alias.casefold()] = table.casefold()
-    for left, field in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", definition):
-        table = alias_to_table.get(left.casefold())
-        if table:
-            refs.add(f"{table}.{field.casefold()}")
-    return refs
 
 
-def _active_required_semantic_cards(state: LoopState) -> list[Any]:
-    if not state.matched_semantic_cards:
+def _semantic_field_variants(field_id: str) -> set[str]:
+    text = str(field_id or "").casefold()
+    variants = {text}
+    if "." in text:
+        variants.add(text.rsplit(".", 1)[-1])
+    return {item for item in variants if item}
+
+
+def _physical_columns_from_mapping(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, dict):
         return []
-    top_card = state.matched_semantic_cards[0]
-    if getattr(top_card, "canonical_field", None):
-        candidates = [top_card]
-    else:
-        refs = _semantic_refs_from_definition(str(getattr(top_card, "definition", "") or ""))
-        candidates = [
-            card for card in state.semantic_cards
-            if _semantic_field_id(card) in refs and getattr(card, "kind", "") in {"field", "metric"}
-        ]
-    mapped_cards: list[Any] = []
-    for card in candidates:
-        if any(
-            mapping.card_id == card.id
-            and mapping.source_id
-            and mapping.status in {"exact_structured_source", "document_source"}
-            for mapping in state.source_mappings
-        ):
-            mapped_cards.append(card)
-    return mapped_cards
+    columns: list[str] = []
+    for key in ("source_field", "source_column", "field", "column", "physical_field", "physical_column"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            columns.append(raw)
+    return columns
 
 
-def _contract_covers_field(binding: Any, field_id: str) -> bool:
+def _binding_contract_physical_mismatches(binding: Any) -> list[str]:
     metadata = getattr(binding, "metadata", {}) or {}
     contract = metadata.get("semantic_contract")
-    canonical_fields: list[str] = []
-    if isinstance(contract, dict):
-        raw = contract.get("canonical_fields")
-        if isinstance(raw, list):
-            canonical_fields.extend(str(item).casefold() for item in raw)
-        raw_mapping = contract.get("physical_field_mapping")
-        if isinstance(raw_mapping, dict):
-            canonical_fields.extend(str(key).casefold() for key in raw_mapping)
-    raw = metadata.get("canonical_fields")
-    if isinstance(raw, list):
-        canonical_fields.extend(str(item).casefold() for item in raw)
-    return field_id.casefold() in set(canonical_fields)
-
-
-def _binding_covers_semantic_card(state: LoopState, binding: Any, card: Any) -> bool:
-    field_id = _semantic_field_id(card)
-    if not field_id:
-        return False
-    if _contract_covers_field(binding, field_id):
-        return True
-    field_norm = _normalize(str(getattr(card, "canonical_field", "") or ""))
-    table_norm = _normalize(str(getattr(card, "canonical_table", "") or ""))
-    allowed_columns = {_normalize(column) for column in getattr(binding, "allowed_columns", ())}
-    binding_table = _normalize(str(getattr(binding, "table", "") or ""))
-    for mapping in state.source_mappings:
-        if mapping.card_id != card.id or mapping.source_id != getattr(binding, "source_id", None):
-            continue
-        if mapping.status == "exact_structured_source" and getattr(binding, "binding_type", "") in {"structured_source", "structured_field"}:
-            if field_norm and field_norm not in allowed_columns:
-                continue
-            mapped_table = _normalize(str(mapping.matched_table or ""))
-            if binding_table and mapped_table and binding_table != mapped_table:
-                continue
-            if table_norm and binding_table and table_norm != binding_table:
-                continue
-            return True
-        if mapping.status == "document_source" and getattr(binding, "binding_type", "") == "document_record_set":
-            return not field_norm or field_norm in allowed_columns
-    return False
-
-
-def _missing_semantic_compute_requirements(state: LoopState, binding_refs: tuple[str, ...]) -> list[str]:
-    if not binding_refs:
+    if not isinstance(contract, dict):
         return []
-    bindings = [state.bindings[ref] for ref in binding_refs if ref in state.bindings]
-    missing: list[str] = []
-    for card in _active_required_semantic_cards(state):
-        field_id = _semantic_field_id(card)
-        if not field_id:
-            continue
-        if not any(_binding_covers_semantic_card(state, binding, card) for binding in bindings):
-            missing.append(field_id)
-    return sorted(set(missing))
+    allowed_columns = {_normalize(column) for column in getattr(binding, "allowed_columns", ())}
+    if not allowed_columns:
+        return []
+    mismatches: list[str] = []
+    raw_mapping = contract.get("physical_field_mapping")
+    mapped_fields: set[str] = set()
+    if isinstance(raw_mapping, dict):
+        for key, value in raw_mapping.items():
+            field_id = str(key).casefold()
+            mapped_fields.add(field_id)
+            physical_columns = _physical_columns_from_mapping(value)
+            if not physical_columns or not any(_normalize(column) in allowed_columns for column in physical_columns):
+                mismatches.append(field_id)
+    raw = contract.get("canonical_fields")
+    if isinstance(raw, list):
+        for item in raw:
+            field_id = str(item).casefold()
+            if field_id in mapped_fields:
+                continue
+            variants = _semantic_field_variants(field_id)
+            if not any(_normalize(variant) in allowed_columns for variant in variants):
+                mismatches.append(field_id)
+    return sorted(set(mismatches))
 
 
-def _semantic_requirement_recommendations(state: LoopState, missing_fields: list[str]) -> tuple[dict[str, object], ...]:
-    recommendations: list[dict[str, object]] = []
-    cards_by_field = {
-        _semantic_field_id(card): card
-        for card in state.semantic_cards
-        if _semantic_field_id(card)
-    }
-    for field_id in missing_fields[:4]:
-        card = cards_by_field.get(field_id)
-        if card is None:
+def _binding_contract_mismatches(state: LoopState, binding_refs: tuple[str, ...]) -> list[str]:
+    problems: list[str] = []
+    for ref in binding_refs:
+        binding = state.bindings.get(ref)
+        if binding is None:
             continue
-        mappings = [mapping for mapping in state.source_mappings if mapping.card_id == card.id]
-        document_sources = [mapping.source_id for mapping in mappings if mapping.status == "document_source" and mapping.source_id]
-        if document_sources:
-            recommendations.append(
-                {
-                    "tool_name": "run_document_agent",
-                    "arguments": {
-                        "question": state.question,
-                        "target_fields": [str(getattr(card, "canonical_field", "") or "")],
-                        "semantic_cards": [card.to_dict()],
-                        "source_candidates": document_sources[:4],
-                        "required_record_grain": str(getattr(card, "record_grain", "") or ""),
-                    },
-                    "reason": f"Collect verified document records for canonical field {field_id}.",
-                }
-            )
-            continue
-        structured_sources = [mapping.source_id for mapping in mappings if mapping.status == "exact_structured_source" and mapping.source_id]
-        if structured_sources:
-            recommendations.append(
-                {
-                    "tool_name": "inspect_source",
-                    "arguments": {"source_ref": structured_sources[0]},
-                    "reason": f"Observe the mapped source for canonical field {field_id} before compute.",
-                }
-            )
-    return tuple(recommendations[:6])
+        for field_id in _binding_contract_physical_mismatches(binding):
+            problems.append(f"{ref}:{field_id}")
+    return sorted(set(problems))
 
 
 def _compute_final_answer_columns(action: ModelAction) -> list[str]:
@@ -486,39 +430,12 @@ def guard_action(
     if action.kind not in {"tool_call", "bind", "compute", "final", "blocked"}:
         return GuardDecision(False, f"Unknown action kind: {action.kind}")
 
-    signature = action.signature()
-    repeated = sum(1 for feedback in state.guard_feedback[-6:] if feedback.get("signature") == signature)
-    if repeated >= 2:
-        return GuardDecision(
-            False,
-            "Repeated identical action without effective progress.",
-            allowed_next_tools=(
-                "list_inventory",
-                "retrieve_knowledge",
-                "locate_sources",
-                "inspect_source",
-                "sample_records",
-                "search_values",
-                "run_document_agent",
-                "inspect_relation",
-                "discover_join_paths",
-                "run_verified_compute",
-                "submit_final",
-                "blocked",
-            ),
-            recommended_next_actions=(),
-        )
-
     if action.kind == "blocked":
         return GuardDecision(True, "Model reported blocked/conflict.")
 
     if action.kind == "tool_call":
         if not action.tool_name or registry.spec(action.tool_name) is None:
-            return GuardDecision(
-                False,
-                f"Unknown tool: {action.tool_name}",
-                allowed_next_tools=registry.tool_names,
-            )
+            return GuardDecision(False, f"Unknown tool: {action.tool_name}")
         if action.tool_name in {"run_verified_compute", "submit_final"}:
             return GuardDecision(False, f"Use action kind for {action.tool_name}, not tool_call.")
         path = action.arguments.get("path")
@@ -528,30 +445,6 @@ def guard_action(
             return GuardDecision(False, "Tool references a path that is not in observed inventory.")
         if source_ref and not source_ref_valid:
             return GuardDecision(False, "Tool references an unknown source_ref.")
-        if action.tool_name in {"inspect_source", "sample_records"}:
-            source_id = str(source_ref or state.source_by_path.get(str(path)) or "")
-            source = state.sources.get(source_id)
-            if source is not None and source.data_form in _DOCUMENT_FORMS | {"video"}:
-                allowed = ("inspect_video", "blocked") if source.data_form == "video" else ("run_document_agent", "blocked")
-                recommended = (
-                    {
-                        "tool_name": "inspect_video",
-                        "arguments": {"source_ref": source.id},
-                        "reason": "Inspect unsupported video metadata instead of treating it as a table.",
-                    },
-                ) if source.data_form == "video" else (
-                    {
-                        "tool_name": "run_document_agent",
-                        "arguments": {"question": state.question, "source_candidates": [source.id]},
-                        "reason": "Delegate PDF/MD search, record reading, extraction, and coverage to DocumentAgent.",
-                    },
-                )
-                return GuardDecision(
-                    False,
-                    f"{source.data_form} cannot be inspected as a structured table; use a document/video tool.",
-                    allowed_next_tools=allowed,
-                    recommended_next_actions=recommended,
-                )
         if action.tool_name == "inspect_relation":
             relation_name = str(action.arguments.get("relation_name") or "").strip()
             binding_ref = str(action.arguments.get("binding_ref") or "").strip()
@@ -560,9 +453,6 @@ def guard_action(
                 return GuardDecision(False, f"Unknown verified relation: {relation_name}")
             if binding_ref and binding_ref not in state.bindings:
                 return GuardDecision(False, f"Unknown binding_ref: {binding_ref}")
-        repeated_observation = _guard_repeated_observation(state, action)
-        if repeated_observation is not None:
-            return repeated_observation
         return GuardDecision(True, "Tool call allowed.")
 
     if action.kind == "bind":
@@ -575,10 +465,10 @@ def guard_action(
         evidence_items = [state.evidence[ref] for ref in action.evidence_refs]
         if not all(item.ok for item in evidence_items):
             return GuardDecision(False, "Binding cannot cite failed evidence.")
-        if not any(item.tool_name not in _META_EVIDENCE_TOOLS for item in evidence_items):
+        if not any(item.tool_name not in META_EVIDENCE_TOOLS for item in evidence_items):
             return GuardDecision(
                 False,
-                "Binding requires at least one successful observed evidence item, not only verifier or ledger evidence.",
+                "Binding requires at least one successful observed evidence item, not only ledger evidence.",
                 allowed_next_tools=(
                     "inspect_source",
                     "sample_records",
@@ -593,30 +483,6 @@ def guard_action(
                 return GuardDecision(False, "Structured binding requires an observed source.")
             if source.data_form not in _STRUCTURED_FORMS:
                 return GuardDecision(False, f"{source.data_form} cannot be bound as structured data.")
-            table = str(action.arguments.get("table") or "").strip() or None
-            existing = _equivalent_structured_binding(state, source_id=source_id, table=table)
-            if existing is not None:
-                relation_name = str(getattr(existing, "relation_name", "") or "")
-                binding_ref = str(getattr(existing, "id", "") or "")
-                return GuardDecision(
-                    False,
-                    "Equivalent structured source is already bound; do not create duplicate relation bindings.",
-                    allowed_next_tools=("inspect_relation", "run_verified_compute", "blocked"),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "inspect_relation",
-                            "arguments": {"binding_ref": binding_ref},
-                            "reason": "Inspect the existing verified relation instead of binding the same source again.",
-                        },
-                        {
-                            "tool_name": "run_verified_compute",
-                            "arguments": {"binding_refs": [binding_ref]},
-                            "reason": "Use the existing verified relation for targeted SQL written from the question and inspected columns.",
-                        },
-                    )
-                    if binding_ref and relation_name
-                    else _inspect_relation_recommendation(),
-                )
             if action.binding_type == "structured_field" and not (
                 action.arguments.get("field") or action.arguments.get("allowed_columns")
             ):
@@ -640,36 +506,7 @@ def guard_action(
     if action.kind == "compute":
         if not action.sql:
             return GuardDecision(False, "Compute requires SQL.")
-        refs = action.binding_refs or tuple(state.bindings)
-        ok_computes = [result for result in state.compute_results.values() if result.ok]
-        previously_computed_refs = {
-            binding_ref
-            for result in ok_computes
-            for binding_ref in result.binding_refs
-        }
-        if len(ok_computes) >= 10 and set(refs).issubset(previously_computed_refs):
-            return GuardDecision(
-                False,
-                "Multiple successful compute results already exist; choose a final result, gather non-compute evidence for a specific gap, or block instead of continuing exploratory compute.",
-                allowed_next_tools=("submit_final", "inspect_relation", "bind", "blocked"),
-                recommended_next_actions=tuple(
-                    {
-                        "tool_name": "submit_final",
-                        "arguments": {"compute_ref": result.id},
-                        "reason": "Submit this successful compute if it answers the question.",
-                    }
-                    for result in ok_computes[-3:]
-                )
-                + (
-                    {
-                        "tool_name": "blocked",
-                        "arguments": {
-                            "reason": "Successful computes do not satisfy the requested evidence requirements."
-                        },
-                        "reason": "Stop only if no successful compute satisfies the question.",
-                    },
-                ),
-            )
+        refs = action.binding_refs
         if not refs:
             return GuardDecision(False, "Compute requires verified bindings.")
         if not all(ref in state.bindings for ref in refs):
@@ -692,31 +529,13 @@ def guard_action(
                     },
                 ),
             )
-        partial_document_sets = [
-            ref for ref in refs
-            if (
-                state.bindings[ref].binding_type == "document_record_set"
-                and state.bindings[ref].metadata.get("partial_coverage")
-            )
-        ]
-        if partial_document_sets:
+        contract_mismatches = _binding_contract_mismatches(state, refs)
+        if contract_mismatches:
             return GuardDecision(
                 False,
-                "Compute cannot use partial document record-set bindings; rerun DocumentAgent for a complete record set first: "
-                + ", ".join(partial_document_sets),
-                allowed_next_tools=("run_document_agent", "bind", "blocked"),
-                recommended_next_actions=(
-                    {
-                        "tool_name": "run_document_agent",
-                        "arguments": {"question": state.question},
-                        "reason": "Let DocumentAgent search/read/extract additional record slices before recomputing.",
-                    },
-                ),
+                "Binding semantic_contract physical_field_mapping references fields not present in observed binding columns: "
+                + ", ".join(contract_mismatches),
             )
-        # Canonical semantic source selection is surfaced before the model chooses
-        # sources (source_resolution.source_plan and locate_sources). The compute
-        # guard stays focused on executable safety instead of acting as a strict
-        # post-hoc semantic interceptor.
         preflight = _check_sql_preflight(state, action)
         if preflight is not None:
             return preflight
@@ -732,59 +551,10 @@ def guard_action(
             if not compute.binding_refs:
                 return GuardDecision(False, "Final compute result has no binding lineage.")
             if not compute.rows:
-                return GuardDecision(
-                    False,
-                    "Final compute result has no output rows; use more evidence, a different compute, or blocked.",
-                    allowed_next_tools=("run_verified_compute", "inspect_relation", "blocked"),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "blocked",
-                            "arguments": {
-                                "reason": "Verified compute returned no output rows for the requested answer."
-                            },
-                            "reason": "Use blocked if the empty result proves the requested data is absent.",
-                        },
-                    ),
-                )
-            if not _compute_has_candidate_answer_verification(state, action.compute_ref):
-                return GuardDecision(
-                    False,
-                    "Compute-backed final requires verify_alignment(decision='candidate_answer', target_kind='compute_result') for this compute_ref before submit_final.",
-                    allowed_next_tools=("verify_alignment", "run_verified_compute", "inspect_relation", "blocked"),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "verify_alignment",
-                            "arguments": {
-                                "decision": "candidate_answer",
-                                "target_kind": "compute_result",
-                                "compute_refs": [action.compute_ref],
-                                "evidence_refs": list(compute.evidence_refs),
-                                "binding_refs": list(compute.binding_refs),
-                                "alignment": "<explain why this exact compute result satisfies the question and knowledge>",
-                            },
-                            "reason": "Classify the compute result before final submission, or compute a different result.",
-                        },
-                    ),
-                )
+                return GuardDecision(False, "Final compute result has no output rows.")
             final_columns = _compute_final_answer_columns(action)
             if not final_columns:
-                return GuardDecision(
-                    False,
-                    "Compute-backed final requires an explicit answer.columns projection; do not submit all compute columns by default.",
-                    allowed_next_tools=("submit_final", "inspect_relation", "run_verified_compute", "blocked"),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "submit_final",
-                            "arguments": {
-                                "compute_ref": action.compute_ref,
-                                "answer": {
-                                    "columns": list(compute.columns),
-                                },
-                            },
-                            "reason": "Choose the final output columns explicitly from this compute result, removing helper columns unless they are requested.",
-                        },
-                    ),
-                )
+                return GuardDecision(False, "Compute-backed final requires an explicit answer.columns projection.")
             unknown_final_columns = [
                 column for column in final_columns
                 if column not in {str(item) for item in compute.columns}
@@ -794,14 +564,6 @@ def guard_action(
                     False,
                     "Final answer.columns must be a subset of the compute result columns: "
                     + ", ".join(unknown_final_columns),
-                    allowed_next_tools=("submit_final", "run_verified_compute", "inspect_relation", "blocked"),
-                    recommended_next_actions=(
-                        {
-                            "tool_name": "inspect_relation",
-                            "arguments": {},
-                            "reason": "Inspect verified relation columns before computing or projecting final columns.",
-                        },
-                    ),
                 )
             return GuardDecision(True, "Final allowed from verified and explicitly projected compute result.")
 
@@ -816,13 +578,6 @@ def guard_action(
             return GuardDecision(False, "Direct final references unknown binding_refs.")
         if not all(ref in state.evidence for ref in action.evidence_refs):
             return GuardDecision(False, "Direct final references unknown evidence_refs.")
-        direct_bindings = [state.bindings[ref] for ref in action.binding_refs]
-        if not any(binding.binding_type in _DIRECT_FINAL_BINDING_TYPES for binding in direct_bindings):
-            return GuardDecision(
-                False,
-                "Direct final requires a value/document/operation/answer_candidate binding; use compute_ref for relation outputs.",
-                allowed_next_tools=("run_verified_compute", "bind", "inspect_relation"),
-            )
         evidence_items = [state.evidence[ref] for ref in action.evidence_refs]
         if not all(item.ok for item in evidence_items):
             return GuardDecision(False, "Direct final cannot cite failed evidence.")

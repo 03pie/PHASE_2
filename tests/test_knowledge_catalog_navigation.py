@@ -127,8 +127,103 @@ def test_semantic_cards_parse_three_column_field_tables() -> None:
     by_name = {card.name: card for card in state.semantic_cards}
 
     assert "mf_netvalueperformancehis.rrintenyear" in by_name
-    assert by_name["mf_netvalueperformancehis.rrintenyear"].canonical_field == "rrintenyear"
+    assert by_name["mf_netvalueperformancehis.rrintenyear"].semantic_slot == "rrintenyear"
     assert "mf_netvalueperformancehis.mf_netvalueperformancehis" not in by_name
+
+
+def test_semantic_cards_do_not_promote_ambiguity_tables_to_physical_fields() -> None:
+    state = _state_for_task(
+        "task_18",
+        "我能看一下基金的十年回报率数据吗",
+    )
+
+    by_name = {card.name: card for card in state.semantic_cards}
+
+    assert "mf_netvalueperformancehis.rrintenyear" in by_name
+    assert "rrsincethisyear.rrintenyear" not in by_name
+    assert "rrsincethisyear.annualizedrrsincestart" not in by_name
+
+
+def test_semantic_units_require_explicit_unit_markers() -> None:
+    state = _state_for_task(
+        "task_32",
+        "Help me check these data. Show the trading volume data for each trading day of 601908.",
+    )
+    turnover = next(card for card in state.semantic_cards if card.name == "qt_dailyquote.turnoverdeals")
+
+    assert turnover.unit is None
+
+
+def test_semantic_units_strip_markdown_punctuation_noise() -> None:
+    state = _state_for_task(
+        "task_3",
+        "管理基金规模超过100亿的基金经理最高学历分布情况",
+    )
+    total = next(card for card in state.semantic_cards if card.name == "mf_fmscaleanalysisn.totalfundnv")
+
+    assert total.unit == "亿元"
+
+
+def test_source_mapping_does_not_infer_physical_fields_from_semantic_text_overlap() -> None:
+    state = _state_for_task(
+        "task_3",
+        "管理基金规模超过100亿的基金经理最高学历分布情况",
+    )
+    total = next(card for card in state.semantic_cards if card.name == "mf_fmscaleanalysisn.totalfundnv")
+
+    mappings = [mapping for mapping in state.source_mappings if mapping.card_id == total.id]
+
+    assert any(
+        mapping.status == "unverified_document_candidate"
+        and mapping.source_path == "/context/doc/mf_fmscaleanalysisn.pdf"
+        and mapping.physical_field is None
+        for mapping in mappings
+    )
+    assert not any("semantic_term_overlap" in mapping.match_reason for mapping in mappings)
+    assert not any(mapping.physical_field == "TotalAUM" for mapping in mappings)
+
+
+def test_sqlite_source_mapping_uses_table_columns_for_field_grounding() -> None:
+    state = _state_for_task(
+        "task_40",
+        "给咱们搜一下2005年以后，国内信贷和外币存款的数据 感谢",
+    )
+    domestic = next(
+        card
+        for card in state.semantic_cards
+        if card.name == "ed_chinamoneyandbanking.domesticloans"
+    )
+
+    mappings = [mapping for mapping in state.source_mappings if mapping.card_id == domestic.id]
+
+    assert any(
+        mapping.status == "unverified_structured_candidate"
+        and mapping.source_path == "/context/db/sub_db.sqlite"
+        and mapping.physical_field == "DomesticLoans"
+        for mapping in mappings
+    )
+
+
+def test_document_source_mapping_is_table_level_until_extracted() -> None:
+    state = _state_for_task(
+        "task_38",
+        "给咱们搜一下2005年以后，国内信贷和外币存款的数据 感谢",
+    )
+    domestic = next(
+        card
+        for card in state.semantic_cards
+        if card.name == "ed_chinamoneyandbanking.domesticloans"
+    )
+
+    mappings = [mapping for mapping in state.source_mappings if mapping.card_id == domestic.id]
+
+    assert any(
+        mapping.status == "unverified_document_candidate"
+        and mapping.source_path == "/context/doc/ed_chinamoneyandbanking.pdf"
+        and mapping.physical_field is None
+        and "document_mapping_requires_extraction_plan" in mapping.warnings
+        for mapping in mappings
+    )
 
 
 def test_semantic_source_mapping_distinguishes_rules_structured_and_documents() -> None:
@@ -147,8 +242,8 @@ def test_semantic_source_mapping_distinguishes_rules_structured_and_documents() 
     qdii_mappings = [m for m in state.source_mappings if m.card_id == qdii_card.id]
 
     assert any(mapping.status == "semantic_only" for mapping in business_mappings)
-    assert any(mapping.status == "exact_structured_source" for mapping in education_mappings)
-    assert any(mapping.status == "document_source" for mapping in qdii_mappings)
+    assert any(mapping.status == "unverified_structured_candidate" for mapping in education_mappings)
+    assert any(mapping.status == "unverified_document_candidate" for mapping in qdii_mappings)
 
 
 def test_retrieve_knowledge_semantic_returns_pure_cards_without_source_mappings() -> None:
@@ -184,7 +279,24 @@ def test_loop_context_exposes_semantic_knowledge_as_primary_fragment() -> None:
     assert "data_form" not in semantic_fragment.text
     assert "semantic cards" in semantic_fragment.text
     assert "source_plan" in source_resolution_fragment.text
-    assert "document_source" in source_resolution_fragment.text
+    assert "selection_required" in source_resolution_fragment.text
+    assert "unverified_document_candidate" not in source_resolution_fragment.text
+
+    qdii_card = next(card for card in state.semantic_cards if card.name == "mf_fmscaleanalysisn.qdiinv")
+    EvidenceActionRegistry().dispatch(
+        state,
+        ModelAction(
+            kind="tool_call",
+            tool_name="select_semantic_cards",
+            arguments={"card_ids": [qdii_card.id], "rationale": "QDII scale is the relevant semantic field."},
+        ),
+    )
+    selected_fragments = build_context_fragments(state)
+    selected_resolution = next(fragment for fragment in selected_fragments if fragment.kind == "source_resolution")
+    selected_candidates = next(fragment for fragment in selected_fragments if fragment.kind == "selected_source_candidates")
+    assert "unverified_document_candidate" in selected_resolution.text
+    assert "mf_fmscaleanalysisn" in selected_candidates.text
+    assert "qdiinv" in selected_candidates.text
 
 
 def test_retrieve_knowledge_token_returns_complete_task40_slice() -> None:
